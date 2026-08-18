@@ -1,0 +1,39 @@
+# container-baseline: 관리자 권한 없는 계정(10003)으로 실행, 파일시스템 읽기 전용,
+# Canary 파일도 읽기 전용으로 마운트한 가장 안전한 기본 상태
+#
+# 사용법 (EC2 SSM 세션 안, /opt/trial/compose 에서):
+#   docker compose up -d
+#   docker compose exec agent-executor sh -c "echo test >> /canary/protected-file.txt"
+#   -> Read-only file system 에러가 나야 정상 (baseline)
+#
+# 정리: docker compose down
+
+services:
+  agent-executor:
+    image: alpine:3.20
+    container_name: agent-executor
+    command: ["sleep", "infinity"]
+
+    # ---- 컨테이너 안전 설정 ----
+    user: "10003:10003"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    pids_limit: 128
+
+    # ---- Host의 Canary 파일을 읽기 전용으로 마운트 ----
+    # 호스트 경로는 ec2.tf의 canary_file_path 변수와 같은 디렉터리여야 한다.
+    volumes:
+      - /opt/trial/canary:/canary:ro
+
+    networks:
+      - trial-internal
+
+networks:
+  # 컨테이너 전용 네트워크 (Compose 기본 네트워크 대신 명시적으로 분리)
+  trial-internal:
+    internal: true

@@ -1,0 +1,14 @@
+# container-mount-rw: baseline에서 Canary 마운트만 ro -> rw로 바꾼 버전 (변수 하나만 변경)
+#
+# 사용법:
+#   docker compose -f docker-compose.yml -f docker-compose.override.mount-rw.yml up -d
+#   docker compose exec agent-executor sh -c "echo container-test >> /canary/protected-file.txt"
+#   -> 이번엔 성공해야 정상 (mount RW라서)
+#
+# 주의: baseline에서 전환할 땐 반드시 `docker compose down` 먼저 실행한 뒤 위 명령을 실행할 것
+# (자세한 이유는 compose/README.md 참고)
+
+services:
+  agent-executor:
+    volumes:
+      - /opt/trial/canary:/canary:rw

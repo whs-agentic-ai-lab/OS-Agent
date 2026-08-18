@@ -1,0 +1,42 @@
+# Fixed Terraform environment
+
+이 디렉터리는 최소 운영 테스트에서 사용하는 **고정 AWS 인프라 사본**의 위치다.
+
+팀 OS 저장소의 commit `a0152804ddc64d67f220b17125f7987abf24cdec`를 기준으로 사본을 고정했다. 원본 정보는 `SOURCE.lock`, 팀 문서는 `UPSTREAM_README.md`에서 확인한다.
+
+고정 환경은 `fixed.auto.tfvars`에 정의되어 있고 대시보드에서 변경할 수 없다.
+
+- Region/AZ: `us-east-1` / `us-east-1a`
+- EC2: `t3.small` 1대
+- Network: Private Subnet, public inbound 없음
+- Access: SSM only
+- Runtime: 같은 EC2의 Container와 Ubuntu Host 경계
+- Services: OS Agent Backend, `nginx-target`
+
+저장·로그 정책:
+
+- Backend Docker image는 ECR에 저장하고 EC2 IAM Role로 pull한다.
+- S3 리소스는 생성하지 않는다.
+- VPC Flow Logs는 CloudWatch Logs에 저장한다.
+- `collect_state.sh` Evidence는 Supabase Collector 연동 전까지 EC2 로컬 staging 경로에만 저장한다.
+- Terraform state는 최소 테스트 동안 로컬 파일을 사용하며 Git에 커밋하지 않는다.
+
+테스트 중 지켜야 할 규칙:
+
+- 대시보드의 `Container`/`Ubuntu Host` 선택은 Terraform 분기가 아니라 같은 EC2 안의 실행 경계 선택이다.
+- 한 테스트 묶음이 진행되는 동안 `terraform apply`를 다시 실행하지 않는다.
+- OpenRouter 및 Supabase secret을 `tfvars`, state, `user_data` 원문에 넣지 않는다.
+- 백엔드 8000 포트는 public inbound로 열지 않고 SSM Port Forwarding으로 연결한다.
+- 최초 `terraform init` 후 생성되는 `terraform.lock.hcl`을 고정한다.
+
+## 대시보드 자동 배포 순서
+
+로컬 백엔드의 배포 컨트롤러만 이 디렉터리를 실행할 수 있다. 대시보드는 임의 Terraform 경로, target 또는 변수를 전달하지 않는다.
+
+1. `terraform init -input=false`
+2. ECR repository만 우선 apply
+3. `backend/` Docker image를 ECR에 push
+4. 고정 `backend_image_uri`를 넘겨 전체 apply
+5. `terraform output -json`을 대시보드에 표시
+
+실제 AWS 배포 전에 Terraform, AWS CLI v2, Docker와 `whs-team` AWS profile이 필요하다. 세부 실행 방법은 프로젝트 루트의 `실행방법.md`를 참고한다.

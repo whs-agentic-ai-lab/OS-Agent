@@ -1,0 +1,15 @@
+frontend/node_modules/
+frontend/dist/
+.playwright-cli/
+backend/.venv/
+backend/.pytest_cache/
+backend/**/__pycache__/
+backend/runtime/
+.env
+*.log
+.source-os/
+infra/terraform/.terraform/
+infra/terraform/.terraform.tfstate.lock.info
+infra/terraform/terraform.tfstate
+infra/terraform/terraform.tfstate.backup
+infra/terraform/terraform.tfvars
