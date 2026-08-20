@@ -5,6 +5,8 @@ interface DeploymentPanelProps {
   actionError: string | null;
   isStarting: boolean;
   onDeploy: () => void;
+  onDestroy: () => void;
+  onInitialize: () => void;
 }
 
 const statusLabels: Record<DeploymentState, string> = {
@@ -23,13 +25,40 @@ const prerequisiteLabels: Record<string, string> = {
   terraform_files: "고정 Terraform",
 };
 
-export function DeploymentPanel({ deployment, actionError, isStarting, onDeploy }: DeploymentPanelProps) {
+function statusLabel(deployment: DeploymentStatus | null): string {
+  if (!deployment) return statusLabels.not_ready;
+  if (deployment.status === "running") {
+    if (deployment.operation === "initialize") return "초기화 중";
+    if (deployment.operation === "destroy") return "삭제 중";
+  }
+  if (deployment.status === "succeeded") {
+    if (deployment.operation === "initialize") return "초기화 완료";
+    if (deployment.operation === "destroy") return "삭제 완료";
+  }
+  return statusLabels[deployment.status];
+}
+
+export function DeploymentPanel({ deployment, actionError, isStarting, onDeploy, onDestroy, onInitialize }: DeploymentPanelProps) {
   const status = deployment?.status ?? "not_ready";
+  const prerequisites = deployment?.prerequisites ?? {};
+  const isBusy = status === "running" || isStarting;
   const canDeploy = Boolean(
     deployment?.enabled &&
-      Object.values(deployment.prerequisites).every(Boolean) &&
-      status !== "running" &&
-      !isStarting,
+      Object.values(prerequisites).every(Boolean) &&
+      !isBusy,
+  );
+  const canInitialize = Boolean(
+    deployment?.enabled &&
+      prerequisites.terraform &&
+      prerequisites.terraform_files &&
+      !isBusy,
+  );
+  const canDestroy = Boolean(
+    deployment?.enabled &&
+      prerequisites.terraform &&
+      prerequisites.aws_cli &&
+      prerequisites.terraform_files &&
+      !isBusy,
   );
   const environment = deployment?.fixed_environment;
   const outputs = Object.entries(deployment?.outputs ?? {});
@@ -42,7 +71,7 @@ export function DeploymentPanel({ deployment, actionError, isStarting, onDeploy 
           <h2 id="deployment-title">고정 환경 배포</h2>
           <p>AWS 콘솔 작업 없이 승인된 Terraform과 백엔드 이미지를 한 번에 배포합니다.</p>
         </div>
-        <span className={`deployment-status is-${status}`}>{statusLabels[status]}</span>
+        <span className={`deployment-status is-${status}`}>{statusLabel(deployment)}</span>
       </div>
 
       <div className="deployment-body">
@@ -62,10 +91,17 @@ export function DeploymentPanel({ deployment, actionError, isStarting, onDeploy 
               </span>
             ))}
           </div>
-          <button className="deploy-button" disabled={!canDeploy} onClick={onDeploy} type="button">
-            <span>{status === "running" || isStarting ? "AWS 환경 배포 중" : "AWS 환경 배포"}</span>
-            <span aria-hidden="true">↗</span>
-          </button>
+          <div className="infrastructure-actions">
+            <button className="infrastructure-button is-secondary" disabled={!canInitialize} onClick={onInitialize} type="button">
+              Terraform 초기화
+            </button>
+            <button className="infrastructure-button is-primary" disabled={!canDeploy} onClick={onDeploy} type="button">
+              AWS 환경 배포
+            </button>
+            <button className="infrastructure-button is-danger" disabled={!canDestroy} onClick={onDestroy} type="button">
+              AWS 환경 삭제
+            </button>
+          </div>
           {!deployment?.enabled ? (
             <p className="deployment-notice">
               로컬 백엔드에서 <code>DEPLOYMENT_ENABLED=true</code>를 설정하면 배포 버튼이 활성화됩니다.

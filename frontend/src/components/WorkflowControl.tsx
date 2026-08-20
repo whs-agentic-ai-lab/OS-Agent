@@ -1,10 +1,13 @@
 import { useMemo, useState } from "react";
 
-import type { DeploymentStatus, RunRecord, WorkflowNode, WorkflowNodeStatus } from "../types";
+import type { DeploymentStatus, RunRecord, TunnelStatus, WorkflowNode, WorkflowNodeStatus } from "../types";
 
 interface WorkflowControlProps {
   deployment: DeploymentStatus | null;
   deploymentActionError: string | null;
+  tunnelActionError: string | null;
+  tunnel: TunnelStatus | null;
+  isStartingTunnel: boolean;
   isLoadingBackend: boolean;
   isRunningTest: boolean;
   isStartingDeployment: boolean;
@@ -13,6 +16,8 @@ interface WorkflowControlProps {
   run: RunRecord | null;
   runError: string | null;
   onDeploy: () => void;
+  onStartTunnel: () => void;
+  onStopTunnel: () => void;
   onFocusExperiment: () => void;
 }
 
@@ -55,6 +60,26 @@ function deploymentNodes(deployment: DeploymentStatus | null, actionError: strin
     ];
   }
 
+  if (deployment.operation === "initialize") {
+    if (deployment.status === "running") {
+      return [empty, { status: "running", error: null }, empty];
+    }
+    if (deployment.status === "failed") {
+      return [empty, { status: "failed", error: deployment.error ?? actionError ?? "Terraform 초기화 중 오류가 발생했습니다." }, empty];
+    }
+    return [empty, empty, empty];
+  }
+
+  if (deployment.operation === "destroy") {
+    if (deployment.status === "running") {
+      return [empty, { status: "running", error: null }, empty];
+    }
+    if (deployment.status === "failed") {
+      return [empty, { status: "failed", error: deployment.error ?? actionError ?? "Terraform 삭제 중 오류가 발생했습니다." }, empty];
+    }
+    return [empty, empty, empty];
+  }
+
   if (deployment.status === "idle") return [empty, empty, empty];
   if (deployment.status === "succeeded") {
     return [
@@ -91,6 +116,9 @@ function deploymentNodes(deployment: DeploymentStatus | null, actionError: strin
 export function WorkflowControl({
   deployment,
   deploymentActionError,
+  tunnelActionError,
+  tunnel,
+  isStartingTunnel,
   isLoadingBackend,
   isRunningTest,
   isStartingDeployment,
@@ -99,6 +127,8 @@ export function WorkflowControl({
   run,
   runError,
   onDeploy,
+  onStartTunnel,
+  onStopTunnel,
   onFocusExperiment,
 }: WorkflowControlProps) {
   const [overrides, setOverrides] = useState<WorkflowOverrides>(loadOverrides);
@@ -107,6 +137,15 @@ export function WorkflowControl({
 
   const nodes = useMemo(() => {
     const [image, terraform, runtime] = deploymentNodes(deployment, deploymentActionError);
+    const tunnelNode: Pick<WorkflowNode, "status" | "error"> = tunnelActionError
+      ? { status: "failed", error: tunnelActionError }
+      : tunnel?.status === "connected"
+      ? { status: "succeeded", error: null }
+      : tunnel?.status === "installing" || tunnel?.status === "starting"
+        ? { status: "running", error: null }
+        : tunnel?.status === "failed"
+          ? { status: "failed", error: tunnel.error }
+          : { status: "pending", error: tunnel?.error ?? null };
     const automaticNodes: WorkflowNode[] = [
       {
         id: "local",
@@ -145,10 +184,9 @@ export function WorkflowControl({
         id: "tunnel",
         step: 5,
         title: "SSM 포트 포워딩",
-        summary: "로컬 대시보드를 EC2 백엔드 8000 포트에 연결",
-        status: "pending",
-        error: null,
-        automatic: false,
+        summary: "로컬 8001 포트를 EC2 백엔드 8000 포트에 연결",
+        ...tunnelNode,
+        automatic: true,
       },
       {
         id: "test",
@@ -171,10 +209,10 @@ export function WorkflowControl({
     ];
 
     return automaticNodes.map((node) => {
-      const override = overrides[node.id];
+      const override = node.id === "tunnel" ? undefined : overrides[node.id];
       return override ? { ...node, ...override } : node;
     });
-  }, [backendError, deployment, deploymentActionError, isLoadingBackend, isRunningTest, optionsReady, overrides, run, runError]);
+  }, [backendError, deployment, deploymentActionError, isLoadingBackend, isRunningTest, optionsReady, overrides, run, runError, tunnel, tunnelActionError]);
 
   const selected = nodes.find((node) => node.id === selectedId) ?? nodes[0];
   const completedCount = nodes.filter((node) => node.status === "succeeded").length;
@@ -289,7 +327,15 @@ export function WorkflowControl({
             </button>
           ) : null}
           {selected.id === "test" ? <button onClick={onFocusExperiment} type="button">실험 구성으로 이동</button> : null}
-          {selected.id === "tunnel" ? <p>Terraform output의 <code>backend_ssm_port_forward_commands</code>를 실행한 뒤 완료 처리합니다.</p> : null}
+          {selected.id === "tunnel" ? (
+            tunnel?.status === "connected" ? (
+              <button disabled={isStartingTunnel} onClick={onStopTunnel} type="button">SSM 연결 종료</button>
+            ) : (
+              <button disabled={isStartingTunnel || tunnel?.status === "installing" || tunnel?.status === "starting"} onClick={onStartTunnel} type="button">
+                {tunnel?.status === "installing" ? "플러그인 설치 중" : tunnel?.status === "starting" ? "SSM 연결 중" : "SSM 자동 연결"}
+              </button>
+            )
+          ) : null}
           {selected.id === "teardown" ? <p>삭제는 대시보드에서 자동 실행하지 않습니다. 리소스를 확인한 뒤 Terraform CLI에서 수행합니다.</p> : null}
         </div>
       </div>

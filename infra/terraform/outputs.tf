@@ -41,9 +41,9 @@ output "backend_local_port" {
 }
 
 output "backend_ssm_port_forward_commands" {
-  description = "로컬 백엔드 종료 후 원격 백엔드를 localhost:8000으로 연결하는 명령"
+  description = "로컬 제어 백엔드를 유지한 채 원격 백엔드를 localhost:8001로 연결하는 명령"
   value = [
     for id in aws_instance.trial[*].id :
-    "aws ssm start-session --target ${id} --document-name AWS-StartPortForwardingSession --parameters portNumber=8000,localPortNumber=8000 --region ${var.aws_region} --profile whs-team"
+    "aws ssm start-session --target ${id} --document-name AWS-StartPortForwardingSession --parameters portNumber=8000,localPortNumber=8001 --region ${var.aws_region} --profile whs-team"
   ]
 }

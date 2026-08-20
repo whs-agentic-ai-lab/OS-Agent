@@ -6,7 +6,7 @@
 
 ```text
 os-Agent-test/
-├─ frontend/           # 로컬 React/Vite 대시보드
+├─ frontend/           # 로컬/Vercel React·Vite 대시보드
 ├─ backend/            # EC2 배포 대상 FastAPI·Executor·Tool Runner·Collector
 ├─ infra/
 │  └─ terraform/       # 승인된 고정 OS Terraform 사본 위치
@@ -27,6 +27,8 @@ os-Agent-test/
 - 저장소: 현재 로컬 메모리, Supabase 스키마와 저장 구현은 분리
 - OS 권한: 현재 안전한 로컬 fixture simulation, 실제 EC2 Profile Controller는 후속 범위
 - 환경 배포: 로컬 대시보드 → 로컬 FastAPI → 고정 Terraform 순서로 AWS 환경과 백엔드 이미지를 자동 배포
+- 환경 삭제: 동일한 로컬 Terraform state로 AWS 리소스와 ECR 저장소를 자동 삭제
+- SSM 연결: 관리 노드가 Online이 될 때까지 대기한 뒤 `127.0.0.1:8001 → EC2:8000` 자동 연결
 - 워크플로우 제어: 7단계 방향성 그래프, 자동 상태 동기화, 수동 체크포인트, 오류 메모와 상태 복원
 
 ## 워크플로우 상태 관리
@@ -34,7 +36,7 @@ os-Agent-test/
 대시보드 상단의 `최소 운영 워크플로우`는 로컬 개발부터 테스트 종료까지 7단계를 노드와 화살표로 표시한다.
 
 - 로컬 백엔드, 배포, Agent 테스트 노드는 실제 API 응답을 기준으로 자동 갱신
-- SSM 연결과 테스트 종료 노드는 사용자가 확인 후 상태 변경
+- SSM 노드는 실제 터널·원격 헬스 체크로 자동 갱신하고 테스트 종료만 사용자가 확인
 - 모든 노드는 필요할 때 수동 상태로 보정하고 오류 원인을 기록 가능
 - `자동 상태로 복원`은 선택한 노드의 수동 상태만 제거
 - 수동 상태와 오류 메모는 브라우저 `localStorage`에만 저장되며 AWS나 Supabase로 전송하지 않음
@@ -50,6 +52,7 @@ os-Agent-test/
 - Network: private subnet, public inbound 없음
 - Access: AWS Systems Manager(SSM) 전용
 - Runtime: 한 EC2 안에서 Container와 Ubuntu Host 경계를 시험
+- Network: 테스트 대상은 내부 `control` 망에 격리하고, 백엔드만 OpenRouter·Supabase 통신용 `egress` 망 사용
 
 배포 버튼은 Terraform으로 ECR을 준비하고, 백엔드 Docker 이미지를 push한 다음 전체 인프라를 apply한다. NAT Gateway, EC2, VPC Endpoint와 CloudWatch Logs 등 **비용이 발생할 수 있는 AWS 리소스**를 만든다.
 
@@ -70,6 +73,7 @@ npm run dev -- --host 127.0.0.1
 ```
 
 대시보드는 `http://127.0.0.1:5173`에서 열고, Vite가 `/api`를 로컬 백엔드로 프록시한다.
+배포된 프론트는 [OS Agent Dashboard](https://os-agent-dashboard.vercel.app/)에서 확인할 수 있으며, AWS 배포와 SSM 제어에는 사용자 PC의 로컬 FastAPI가 실행 중이어야 한다.
 
 대시보드 배포 기능의 준비와 활성화 방법은 [실행방법.md](./실행방법.md)를 따른다. AWS 자격 증명과 OpenRouter 키는 프론트에 입력하거나 저장하지 않는다.
 
@@ -83,5 +87,7 @@ cd C:\Users\vinny\Desktop\whs_team\os-Agent-test\frontend
 npm run lint
 npm run build
 ```
+
+검증 완료 기준은 백엔드 테스트 16개 통과, 프론트 production build 성공, `terraform validate` 성공이다.
 
 OpenRouter key와 Supabase service-role key는 프론트에 두지 않는다. 실제 값을 Git에 커밋하지 말고 백엔드 런타임 secret으로만 주입한다.

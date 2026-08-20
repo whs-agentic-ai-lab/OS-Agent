@@ -1,14 +1,15 @@
 # OS 최소 환경 테스트 계획
 
-- 상태: Draft
+- 상태: 최소 운영 테스트 구현 및 AWS E2E 검증 완료
 - 작성일: 2026-08-18
+- 최종 검증일: 2026-08-21
 - 테스트 대상: `whs-agentic-ai-lab/OS` Terraform 구성을 이 프로젝트 내부에 복제한 Ubuntu EC2 환경
 - 작업 경계: `C:\Users\vinny\Desktop\whs_team\os-Agent-test` 아래 파일만 생성·수정
 - 목적: 공통 AI Agent 제어패널이 완성되기 전에 로컬 대시보드와 OS 백엔드만으로 최소 권한 실험 흐름을 검증한다.
 
 ## 1. 핵심 결론
 
-이번 테스트에서는 로컬 PC에 간단한 대시보드를 실행하고, Terraform이 만든 AWS EC2 안에는 OS 백엔드를 배포한다. 사용자는 대시보드에서 Prompt, 실행 환경과 권한을 선택한다. 백엔드는 OpenRouter를 호출하고, 모델이 요청한 세 가지 허용 Tool 중 하나를 검증·실행한 뒤 로그와 실제 효과를 Supabase에 저장한다. 대시보드는 백엔드가 제공하는 결과와 로그만 조회한다.
+이번 테스트에서는 로컬 PC에 대시보드와 배포 제어용 FastAPI를 실행하고, Terraform이 만든 AWS EC2 안에는 OS 백엔드를 배포한다. 사용자는 대시보드에서 Prompt, 실행 환경과 권한을 선택한다. 백엔드는 OpenRouter 또는 로컬 규칙 플래너가 요청한 세 가지 허용 Tool 중 하나를 검증·실행하고 이벤트를 수집한다. 현재 실행 기록은 백엔드 메모리에 저장하며 Supabase는 스키마와 환경변수 자리만 준비했다.
 
 ```text
 로컬 PC
@@ -29,9 +30,8 @@ AWS Private EC2 — OS Terraform 환경
    └─ Log Collector / Verifier
           │
           ▼
-Supabase
-├─ runs
-└─ run_events
+현재 저장소: Backend In-Memory Repository
+후속 저장소: Supabase runs / run_events
 ```
 
 ## 2. 이번 테스트 범위
@@ -49,7 +49,7 @@ Supabase
 - Ubuntu Host 경계 권한 테스트 3개: 소유자 쓰기, 그룹 쓰기, 제한된 sudo helper
 - 각 권한 항목의 OFF/ON 고정 Profile
 - Executor 실행 결과, Canary hash와 관련 auditd 로그 수집
-- 실행 상태와 로그를 Supabase에 저장
+- 실행 상태와 로그를 백엔드 메모리에 저장하고 Supabase 스키마를 후속 연결용으로 유지
 - SSM Port Forwarding을 이용한 로컬 대시보드 연결
 
 ### 제외
@@ -70,12 +70,12 @@ Supabase
 | 영역 | 기술 |
 | --- | --- |
 | 로컬 프론트 | React, Vite, TypeScript |
-| EC2 백엔드 | Python 3.12, FastAPI, Uvicorn |
+| EC2 백엔드 | Python 3.10, FastAPI, Uvicorn |
 | 요청·Tool 검증 | Pydantic v2 |
-| LLM | OpenRouter Python SDK, Tool Calling |
+| LLM | OpenRouter Chat Completions API(httpx), Tool Calling |
 | Tool 실행 | 직접 구현한 Tool Registry와 Executor |
 | 실행 환경 | Docker Compose |
-| 로그·결과 저장 | Supabase PostgreSQL |
+| 로그·결과 저장 | 현재 In-Memory, 후속 Supabase PostgreSQL |
 | 인프라 | 프로젝트 내부 `infra/terraform`의 OS Terraform 사본 |
 | 테스트 | pytest, FastAPI TestClient |
 
@@ -254,17 +254,17 @@ C:/Users/vinny/Desktop/whs_team/os-Agent-test/   # 유일한 작업 루트
 - 실행 요청 수신
 - `run_id` 생성
 - `subject_mode`와 권한 조합 검증
-- 고정 Profile 적용 요청
-- 실제 적용 Profile 확인
+- 승인된 고정 Profile ID 선택
+- 실제 OS Profile 적용·재확인은 후속 단계
 - OpenRouter 호출
 - Tool Runner 호출
-- Collector와 Verifier 결과 취합
-- Supabase 저장
+- Tool Runner와 Verifier 이벤트 취합
+- 현재 메모리 저장, 후속 Supabase 저장
 - 대시보드용 조회 API 제공
 
 ### 4.3 Profile Controller
 
-UI에서 선택한 경계·권한 항목·OFF/ON 값을 실제 Docker Compose 또는 Host Profile로 변환한다.
+UI에서 선택한 경계·권한 항목·OFF/ON 값을 승인된 Profile ID로 변환한다. 현재 최소 구현은 로컬 fixture로 효과를 검증하며, 실제 Docker Compose 또는 Host Profile 적용기는 후속 범위다.
 
 ```text
 subject_mode=container + permission_id=mount_write + permission_enabled=false
@@ -368,9 +368,9 @@ Verifier는 Agent 응답이나 exit code만으로 성공을 판정하지 않고 
 6. OpenRouter가 Prompt에 맞는 Tool Call 제안
 7. Tool Runner가 Tool, 인자와 Resource ID 검증
 8. Executor가 파일 조회·쓰기 또는 Nginx 상태 조회 실행
-9. Collector가 실행 로그, auditd, hash와 서비스 상태 수집
-10. Verifier가 실제 파일 변화 또는 서비스 상태 판정
-11. 백엔드가 runs와 run_events에 저장
+9. Collector가 실행 이벤트와 hash를 수집
+10. Verifier가 fixture 파일 변화 또는 서비스 상태 판정
+11. 백엔드가 In-Memory Repository에 Run과 Event를 저장
 12. 대시보드가 결과와 로그 조회
 ```
 
@@ -378,7 +378,7 @@ OpenRouter 데이터 흐름은 반드시 백엔드를 경유한다.
 
 ```text
 대시보드 → 백엔드 → OpenRouter → 백엔드 → Tool Runner → Executor
-대시보드 ← 백엔드 ← Supabase/Collector
+대시보드 ← 백엔드 ← In-Memory Repository/Collector
 ```
 
 ## 6. 대시보드 최소 UI
@@ -428,7 +428,7 @@ OpenRouter 데이터 흐름은 반드시 백엔드를 경유한다.
 
 ### `GET /api/health`
 
-백엔드, Supabase와 필수 Runtime 상태를 반환한다.
+백엔드, Planner와 현재 저장 방식 상태를 반환한다.
 
 ### `GET /api/options`
 
@@ -515,7 +515,9 @@ RECEIVED
 
 각 상태 변경은 `run_events`에 append한다.
 
-## 9. Supabase 최소 스키마
+## 9. 후속 Supabase 최소 스키마
+
+현재 실행 코드는 `InMemoryRunRepository`를 사용한다. 아래 스키마는 `data/schema.sql`에 준비된 후속 영구 저장 계약이며 아직 런타임과 연결되지 않았다.
 
 ### `runs`
 
@@ -751,8 +753,9 @@ OpenRouter API Key와 Supabase secret은 Git, `terraform.tfvars`, Terraform stat
 
 ```text
 React/Vite: http://127.0.0.1:5173
-SSM Tunnel: 127.0.0.1:8000 → EC2:8000
-Vite Proxy: /api → http://127.0.0.1:8000
+Local Control API: 127.0.0.1:8000
+SSM Tunnel: 127.0.0.1:8001 → EC2:8000
+Agent Gateway: Local Control API → SSM Tunnel
 ```
 
 EC2 Security Group에 백엔드 inbound port를 추가하지 않는다.
@@ -777,25 +780,31 @@ EC2 Security Group에 백엔드 inbound port를 추가하지 않는다.
 
 ## 16. 완료 조건
 
-- [ ] 로컬 대시보드에서 Prompt를 입력할 수 있다.
-- [ ] 대시보드에서 Container와 Ubuntu Host 경계를 선택할 수 있다.
-- [ ] 선택한 경계에 맞는 권한 항목 3개만 표시된다.
-- [ ] 한 Trial에서 권한 항목 하나와 OFF/ON 값 하나만 선택할 수 있다.
-- [ ] UI 값이 승인된 고정 Profile로만 변환된다.
+현재 체크는 2026-08-21 최소 운영 테스트 기준이다. 로컬 fixture로 검증한 항목과 실제 OS 권한 경계에서 추가 검증할 항목을 구분한다.
+
+- [x] 로컬 대시보드에서 Prompt를 입력할 수 있다.
+- [x] 대시보드에서 Container와 Ubuntu Host 경계를 선택할 수 있다.
+- [x] 선택한 경계에 맞는 권한 항목 3개만 표시된다.
+- [x] 한 Trial에서 권한 항목 하나와 OFF/ON 값 하나만 선택할 수 있다.
+- [x] UI 값이 승인된 고정 Profile ID로만 변환된다.
 - [ ] Profile 적용 후 실제 mount, UID/GID, capability, 파일 모드 또는 sudo 상태가 해당 시나리오에 맞게 재확인된다.
-- [ ] OpenRouter API Key가 프론트와 로그에 노출되지 않는다.
-- [ ] 모델에는 `file_read`, `file_write`, `service_status` 세 Tool만 제공된다.
-- [ ] 임의 Tool, path, Shell 명령과 Profile 변경 요청이 거부된다.
-- [ ] 세 가지 대표 Prompt에서 기대한 Tool이 선택되고 올바른 Executor 함수로 라우팅된다.
-- [ ] `file_read`가 등록 Resource의 제한된 내용만 반환한다.
-- [ ] `nginx-target`이 고정된 Compose Target Service로 기동된다.
+- [x] OpenRouter API Key가 프론트에 포함되지 않는다.
+- [x] 모델에는 `file_read`, `file_write`, `service_status` 세 Tool만 제공된다.
+- [x] 임의 Tool, Resource ID와 경계 밖 권한 조합이 거부된다.
+- [x] 대표 Prompt에서 기대한 Tool이 선택되고 고정 Tool Runner로 라우팅된다.
+- [x] `file_read`가 등록 Resource의 제한된 내용만 반환한다.
+- [x] `nginx-target`이 고정된 Compose Target Service로 기동된다.
 - [ ] `service_status`가 `nginx-target`의 상태만 조회하고 변경하지 않는다.
 - [ ] 여섯 권한 항목 모두 OFF에서 쓰기가 거부되고 Canary hash가 유지된다.
 - [ ] 여섯 권한 항목 모두 ON에서 쓰기가 성공하고 Canary hash가 변경된다.
-- [ ] Profile, Model, Tool Runner, Executor, auditd와 Verifier 로그가 동일 `run_id`로 조회된다.
+- [x] Profile, Model, Tool Runner, Executor와 Verifier 이벤트가 동일 `run_id`로 조회된다.
+- [ ] 실제 auditd 이벤트가 동일 `run_id`에 연결된다.
 - [ ] 로그에서 API Key, Credential과 Authorization Header가 제거된다.
 - [ ] 결과가 Supabase에 저장되고 대시보드에서 다시 조회된다.
-- [ ] 백엔드 port가 인터넷에 공개되지 않고 SSM 터널로 접속된다.
+- [x] 백엔드 port가 인터넷에 공개되지 않고 SSM 터널로 접속된다.
+- [x] 대시보드에서 ECR build/push와 Terraform apply를 자동 실행한다.
+- [x] EC2의 Docker 백엔드가 기동되고 원격 헬스 체크가 성공한다.
+- [x] 대시보드에서 Terraform destroy로 고정 AWS 환경을 삭제한다.
 - [ ] 동일 조건 3회 반복에서 기대 결과가 재현된다.
 
 ## 17. 후속 확장

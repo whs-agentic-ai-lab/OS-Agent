@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import shutil
+import re
 import subprocess
 from threading import Lock, Thread
 from typing import Literal
@@ -10,6 +10,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from .config import Settings
+from .executables import find_working_executable
 
 
 def utc_now() -> datetime:
@@ -18,6 +19,15 @@ def utc_now() -> datetime:
 
 class DeploymentRequest(BaseModel):
     confirmation: Literal["DEPLOY_FIXED_OS_ENVIRONMENT"]
+
+
+class InitializeRequest(BaseModel):
+    confirmation: Literal["INITIALIZE_FIXED_TERRAFORM"]
+
+
+class DestroyRequest(BaseModel):
+    confirmation: Literal["DESTROY_FIXED_OS_ENVIRONMENT"]
+    environment_name: Literal["os-agent-test"]
 
 
 class DeploymentLog(BaseModel):
@@ -29,6 +39,7 @@ class DeploymentLog(BaseModel):
 
 class DeploymentStatus(BaseModel):
     status: Literal["disabled", "not_ready", "idle", "running", "succeeded", "failed"]
+    operation: Literal["none", "initialize", "deploy", "destroy"] = "none"
     enabled: bool
     prerequisites: dict[str, bool]
     fixed_environment: dict[str, str | int]
@@ -41,6 +52,9 @@ class DeploymentStatus(BaseModel):
 
 class DeploymentManager:
     """로컬에서 고정 Terraform만 실행하는 단일 배포 컨트롤러."""
+
+    FLOW_LOG_GROUP_NAME = "/os-agent-test/vpc-flow-logs"
+    FLOW_LOG_GROUP_ADDRESS = "aws_cloudwatch_log_group.vpc_flow_logs[0]"
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -82,26 +96,140 @@ class DeploymentManager:
         with self._lock:
             return self._status.model_copy(deep=True)
 
+    def get_trial_instance_id(self) -> str:
+        with self._lock:
+            if self._status.status == "running":
+                raise RuntimeError("인프라 작업이 끝난 뒤 SSM 터널을 시작하세요.")
+            output_ids = self._status.outputs.get("trial_ec2_instance_ids", [])
+        if isinstance(output_ids, list) and output_ids:
+            return str(output_ids[0])
+
+        terraform = self._required_executable("terraform")
+        try:
+            raw = self._capture(
+                [terraform, "output", "-json", "trial_ec2_instance_ids"],
+                self.settings.terraform_dir,
+                log_output=False,
+            )
+            instance_ids = json.loads(raw or "[]")
+            if isinstance(instance_ids, list) and instance_ids:
+                return str(instance_ids[0])
+        except (RuntimeError, json.JSONDecodeError):
+            pass
+
+        aws = self._required_executable("aws")
+        raw = self._capture(
+            [
+                aws,
+                "ec2",
+                "describe-instances",
+                "--filters",
+                "Name=tag:Name,Values=os-agent-test-ec2-*",
+                "Name=instance-state-name,Values=pending,running",
+                "--query",
+                "Reservations[].Instances[].InstanceId",
+                "--output",
+                "json",
+                "--region",
+                self.settings.aws_region,
+                "--profile",
+                self.settings.aws_profile,
+            ],
+            self.settings.backend_context,
+            log_output=False,
+        )
+        instance_ids = json.loads(raw or "[]")
+        if not isinstance(instance_ids, list) or not instance_ids:
+            raise RuntimeError("실행 중인 os-agent-test EC2가 없습니다. AWS 환경을 먼저 배포하세요.")
+        return str(instance_ids[0])
+
     def start(self) -> DeploymentStatus:
+        snapshot = self._begin(
+            operation="deploy",
+            required=("terraform", "aws_cli", "docker", "terraform_files"),
+            message="고정 OS 환경 배포를 시작합니다.",
+        )
+        Thread(target=self._deploy, name="fixed-os-deployment", daemon=True).start()
+        return snapshot
+
+    def initialize(self) -> DeploymentStatus:
+        snapshot = self._begin(
+            operation="initialize",
+            required=("terraform", "terraform_files"),
+            message="고정 Terraform 작업 디렉터리 초기화를 시작합니다.",
+        )
+        Thread(target=self._initialize, name="fixed-os-initialize", daemon=True).start()
+        return snapshot
+
+    def destroy(self) -> DeploymentStatus:
+        snapshot = self._begin(
+            operation="destroy",
+            required=("terraform", "aws_cli", "terraform_files"),
+            message="고정 OS 환경 삭제를 시작합니다.",
+        )
+        Thread(target=self._destroy, name="fixed-os-destroy", daemon=True).start()
+        return snapshot
+
+    def _begin(
+        self,
+        operation: Literal["initialize", "deploy", "destroy"],
+        required: tuple[str, ...],
+        message: str,
+    ) -> DeploymentStatus:
         current = self.refresh_prerequisites()
         if not current.enabled:
             raise RuntimeError("로컬 백엔드의 DEPLOYMENT_ENABLED를 true로 설정해야 합니다.")
-        if not all(current.prerequisites.values()):
-            missing = ", ".join(key for key, value in current.prerequisites.items() if not value)
-            raise RuntimeError(f"배포 사전 요구사항이 준비되지 않았습니다: {missing}")
+        missing = [key for key in required if not current.prerequisites.get(key, False)]
+        if missing:
+            raise RuntimeError(f"작업 사전 요구사항이 준비되지 않았습니다: {', '.join(missing)}")
         with self._lock:
             if self._status.status == "running":
-                raise RuntimeError("이미 환경 배포가 진행 중입니다.")
+                raise RuntimeError("이미 다른 인프라 작업이 진행 중입니다.")
             self._status.status = "running"
+            self._status.operation = operation
             self._status.logs = []
             self._status.outputs = {}
             self._status.error = None
             self._status.started_at = utc_now()
             self._status.completed_at = None
-            self._append_locked("고정 OS 환경 배포를 시작합니다.")
-            snapshot = self._status.model_copy(deep=True)
-        Thread(target=self._deploy, name="fixed-os-deployment", daemon=True).start()
-        return snapshot
+            self._append_locked(message)
+            return self._status.model_copy(deep=True)
+
+    def _initialize(self) -> None:
+        try:
+            terraform = self._required_executable("terraform")
+            self._command(
+                [terraform, "init", "-input=false"],
+                self.settings.terraform_dir,
+            )
+            self._succeed("고정 Terraform 작업 디렉터리 초기화가 완료되었습니다.")
+        except Exception as exc:
+            self._fail(exc)
+
+    def _destroy(self) -> None:
+        try:
+            terraform = self._required_executable("terraform")
+            aws = self._required_executable("aws")
+            terraform_dir = self.settings.terraform_dir
+            placeholder_image = (
+                f"000000000000.dkr.ecr.{self.settings.aws_region}.amazonaws.com/"
+                "os-agent-test-backend:destroy"
+            )
+            self._command([terraform, "init", "-input=false"], terraform_dir)
+            self._command(
+                [
+                    terraform,
+                    "destroy",
+                    "-auto-approve",
+                    "-input=false",
+                    f"-var=backend_image_uri={placeholder_image}",
+                ],
+                terraform_dir,
+            )
+            self._delete_orphaned_flow_log_group(aws)
+            self._succeed("고정 OS 환경 삭제가 완료되었습니다.")
+        except Exception as exc:
+            self._fail(exc)
 
     def _deploy(self) -> None:
         try:
@@ -111,6 +239,7 @@ class DeploymentManager:
             terraform_dir = self.settings.terraform_dir
 
             self._command([terraform, "init", "-input=false"], terraform_dir)
+            self._reconcile_flow_log_group(terraform, aws, terraform_dir)
             self._command(
                 [
                     terraform,
@@ -177,11 +306,20 @@ class DeploymentManager:
                 self._status.completed_at = utc_now()
                 self._append_locked("고정 OS 환경 배포가 완료되었습니다.")
         except Exception as exc:
-            with self._lock:
-                self._status.status = "failed"
-                self._status.error = str(exc)
-                self._status.completed_at = utc_now()
-                self._append_locked(str(exc), level="error")
+            self._fail(exc)
+
+    def _succeed(self, message: str) -> None:
+        with self._lock:
+            self._status.status = "succeeded"
+            self._status.completed_at = utc_now()
+            self._append_locked(message)
+
+    def _fail(self, exc: Exception) -> None:
+        with self._lock:
+            self._status.status = "failed"
+            self._status.error = str(exc)
+            self._status.completed_at = utc_now()
+            self._append_locked(str(exc), level="error")
 
     def _command(
         self,
@@ -209,7 +347,9 @@ class DeploymentManager:
             for line in combined.splitlines()[-120:]:
                 self._append(line[:1000])
         if completed.returncode != 0:
-            raise RuntimeError(f"명령이 실패했습니다. exit code={completed.returncode}")
+            detail = self._command_error_detail(combined)
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(f"명령이 실패했습니다. exit code={completed.returncode}{suffix}")
 
     def _capture(self, args: list[str], cwd: Path, log_output: bool = True) -> str:
         completed = subprocess.run(
@@ -226,8 +366,92 @@ class DeploymentManager:
         if completed.returncode != 0:
             if log_output:
                 self._append((completed.stderr or completed.stdout)[-1000:], level="error")
-            raise RuntimeError(f"명령이 실패했습니다. exit code={completed.returncode}")
+            detail = self._command_error_detail("\n".join((completed.stdout, completed.stderr)))
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(f"명령이 실패했습니다. exit code={completed.returncode}{suffix}")
         return completed.stdout
+
+    def _reconcile_flow_log_group(self, terraform: str, aws: str, terraform_dir: Path) -> None:
+        """이전 삭제에서 남은 고정 로그 그룹을 현재 Terraform state에 다시 연결한다."""
+        state = self._capture(
+            [terraform, "state", "list"],
+            terraform_dir,
+            log_output=False,
+        ).splitlines()
+        if self.FLOW_LOG_GROUP_ADDRESS in state:
+            return
+        if not self._flow_log_group_exists(aws):
+            return
+
+        self._append(
+            f"기존 CloudWatch 로그 그룹 {self.FLOW_LOG_GROUP_NAME}을 Terraform state로 편입합니다."
+        )
+        self._command(
+            [
+                terraform,
+                "import",
+                "-input=false",
+                self.FLOW_LOG_GROUP_ADDRESS,
+                self.FLOW_LOG_GROUP_NAME,
+            ],
+            terraform_dir,
+        )
+
+    def _delete_orphaned_flow_log_group(self, aws: str) -> None:
+        """Flow Log 제거 뒤 AWS가 남겨 둔 고정 로그 그룹까지 정리한다."""
+        if not self._flow_log_group_exists(aws):
+            return
+        self._append(f"잔여 CloudWatch 로그 그룹 {self.FLOW_LOG_GROUP_NAME}을 삭제합니다.")
+        self._command(
+            [
+                aws,
+                "logs",
+                "delete-log-group",
+                "--log-group-name",
+                self.FLOW_LOG_GROUP_NAME,
+                "--region",
+                self.settings.aws_region,
+                "--profile",
+                self.settings.aws_profile,
+            ],
+            self.settings.backend_context,
+        )
+
+    def _flow_log_group_exists(self, aws: str) -> bool:
+        raw = self._capture(
+            [
+                aws,
+                "logs",
+                "describe-log-groups",
+                "--log-group-name-prefix",
+                self.FLOW_LOG_GROUP_NAME,
+                "--region",
+                self.settings.aws_region,
+                "--profile",
+                self.settings.aws_profile,
+                "--output",
+                "json",
+            ],
+            self.settings.backend_context,
+            log_output=False,
+        )
+        payload = json.loads(raw or "{}")
+        return any(
+            group.get("logGroupName") == self.FLOW_LOG_GROUP_NAME
+            for group in payload.get("logGroups", [])
+        )
+
+    @staticmethod
+    def _command_error_detail(output: str) -> str | None:
+        ansi_escape = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+        lines = [ansi_escape.sub("", line).strip(" │╷╵") for line in output.splitlines()]
+        for line in reversed(lines):
+            if "Error:" in line:
+                return line.split("Error:", 1)[1].strip()[:500]
+        for line in reversed(lines):
+            if line:
+                return line[:500]
+        return None
 
     def _environment(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -237,20 +461,9 @@ class DeploymentManager:
         return env
 
     def _find_working_executable(self, name: str, version_args: list[str]) -> bool:
-        executable = shutil.which(name)
+        executable = find_working_executable(name, version_args)
         self._executables[name] = executable
-        if executable is None:
-            return False
-        try:
-            completed = subprocess.run(
-                [executable, *version_args],
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-            return completed.returncode == 0
-        except (OSError, subprocess.SubprocessError):
-            return False
+        return executable is not None
 
     def _required_executable(self, name: str) -> str:
         executable = self._executables.get(name)

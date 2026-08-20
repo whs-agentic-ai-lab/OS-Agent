@@ -3,9 +3,14 @@ import { useEffect, useState } from 'react'
 import {
   createDeployment,
   createRun,
+  destroyInfrastructure,
   getDeployment,
   getHealth,
   getOptions,
+  getTunnel,
+  initializeInfrastructure,
+  startTunnel,
+  stopTunnel,
 } from './api'
 import {
   ConnectionStatus,
@@ -23,6 +28,7 @@ import type {
   OptionsResponse,
   RunRecord,
   SubjectModeId,
+  TunnelStatus,
 } from './types'
 
 const DEFAULT_PROMPT = 'Canary 파일에 test를 기록해줘'
@@ -30,6 +36,7 @@ const DEFAULT_PROMPT = 'Canary 파일에 test를 기록해줘'
 export default function App() {
   const [options, setOptions] = useState<OptionsResponse | null>(null)
   const [deployment, setDeployment] = useState<DeploymentStatus | null>(null)
+  const [tunnel, setTunnel] = useState<TunnelStatus | null>(null)
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [healthChecked, setHealthChecked] = useState(false)
   const [subjectMode, setSubjectMode] = useState<SubjectModeId>('container')
@@ -42,26 +49,41 @@ export default function App() {
   const [deploymentActionError, setDeploymentActionError] = useState<
     string | null
   >(null)
+  const [tunnelActionError, setTunnelActionError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isRunning, setIsRunning] = useState(false)
   const [isStartingDeployment, setIsStartingDeployment] = useState(false)
+  const [isStartingTunnel, setIsStartingTunnel] = useState(false)
 
   useEffect(() => {
     let isActive = true
-    Promise.allSettled([getOptions(), getDeployment()])
-      .then(([optionsResult, deploymentResult]) => {
+    Promise.allSettled([getDeployment(), getTunnel()])
+      .then(([deploymentResult, tunnelResult]) => {
         if (!isActive) return
-        if (optionsResult.status === 'fulfilled')
-          setOptions(optionsResult.value)
         if (deploymentResult.status === 'fulfilled')
           setDeployment(deploymentResult.value)
-        if (optionsResult.status === 'rejected') {
-          setBackendError(
-            optionsResult.reason instanceof Error
-              ? optionsResult.reason.message
-              : '옵션을 불러오지 못했습니다.',
-          )
-        }
+        if (tunnelResult.status === 'fulfilled') setTunnel(tunnelResult.value)
+      })
+    return () => {
+      isActive = false
+    }
+  }, [])
+
+  const agentRemote = tunnel?.status === 'connected'
+
+  useEffect(() => {
+    let isActive = true
+    getOptions(agentRemote)
+      .then((response) => {
+        if (!isActive) return
+        setOptions(response)
+        setBackendError(null)
+      })
+      .catch((reason) => {
+        if (!isActive) return
+        setBackendError(
+          reason instanceof Error ? reason.message : '옵션을 불러오지 못했습니다.',
+        )
       })
       .finally(() => {
         if (isActive) setIsLoading(false)
@@ -69,13 +91,13 @@ export default function App() {
     return () => {
       isActive = false
     }
-  }, [])
+  }, [agentRemote])
 
   useEffect(() => {
     let isActive = true
 
     const refreshHealth = () => {
-      getHealth()
+      getHealth(agentRemote)
         .then((response) => {
           if (isActive) setHealth(response)
         })
@@ -93,6 +115,13 @@ export default function App() {
       isActive = false
       window.clearInterval(timer)
     }
+  }, [agentRemote])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      getTunnel().then(setTunnel).catch(() => undefined)
+    }, 2000)
+    return () => window.clearInterval(timer)
   }, [])
 
   useEffect(() => {
@@ -169,12 +198,15 @@ export default function App() {
     setIsRunning(true)
     setRunError(null)
     try {
-      const result = await createRun({
-        prompt: prompt.trim(),
-        subject_mode: subjectMode,
-        permission_id: permissionId,
-        permission_enabled: permissionEnabled,
-      })
+      const result = await createRun(
+        {
+          prompt: prompt.trim(),
+          subject_mode: subjectMode,
+          permission_id: permissionId,
+          permission_enabled: permissionEnabled,
+        },
+        agentRemote,
+      )
       setRun(result)
     } catch (reason) {
       setRunError(
@@ -202,6 +234,83 @@ export default function App() {
       )
     } finally {
       setIsStartingDeployment(false)
+    }
+  }
+
+  async function initializeTerraform() {
+    const confirmed = window.confirm(
+      '고정 Terraform 작업 디렉터리를 초기화합니다. 계속할까요?',
+    )
+    if (!confirmed) return
+    setIsStartingDeployment(true)
+    setDeploymentActionError(null)
+    try {
+      setDeployment(await initializeInfrastructure())
+    } catch (reason) {
+      setDeploymentActionError(
+        reason instanceof Error ? reason.message : 'Terraform 초기화를 시작하지 못했습니다.',
+      )
+    } finally {
+      setIsStartingDeployment(false)
+    }
+  }
+
+  async function destroyEnvironment() {
+    const environmentName = window.prompt(
+      'AWS 환경을 삭제하려면 환경 이름 os-agent-test를 입력하세요.',
+    )
+    if (environmentName !== 'os-agent-test') {
+      if (environmentName !== null) {
+        setDeploymentActionError('환경 이름이 일치하지 않아 삭제를 취소했습니다.')
+      }
+      return
+    }
+    const confirmed = window.confirm(
+      'EC2, NAT Gateway, ECR 등 Terraform이 관리하는 AWS 리소스를 삭제합니다. 계속할까요?',
+    )
+    if (!confirmed) return
+    setIsStartingDeployment(true)
+    setDeploymentActionError(null)
+    try {
+      setDeployment(await destroyInfrastructure())
+    } catch (reason) {
+      setDeploymentActionError(
+        reason instanceof Error ? reason.message : 'AWS 환경 삭제를 시작하지 못했습니다.',
+      )
+    } finally {
+      setIsStartingDeployment(false)
+    }
+  }
+
+  async function connectSsmTunnel() {
+    const confirmed = window.confirm(
+      'SSM 터널을 연결합니다. Session Manager Plugin이 없으면 AWS 공식 설치 파일을 자동으로 다운로드하고 설치합니다. 계속할까요?',
+    )
+    if (!confirmed) return
+    setIsStartingTunnel(true)
+    setTunnelActionError(null)
+    try {
+      setTunnel(await startTunnel())
+    } catch (reason) {
+      setTunnelActionError(
+        reason instanceof Error ? reason.message : 'SSM 터널을 시작하지 못했습니다.',
+      )
+    } finally {
+      setIsStartingTunnel(false)
+    }
+  }
+
+  async function disconnectSsmTunnel() {
+    setIsStartingTunnel(true)
+    setTunnelActionError(null)
+    try {
+      setTunnel(await stopTunnel())
+    } catch (reason) {
+      setTunnelActionError(
+        reason instanceof Error ? reason.message : 'SSM 터널을 종료하지 못했습니다.',
+      )
+    } finally {
+      setIsStartingTunnel(false)
     }
   }
 
@@ -257,7 +366,10 @@ export default function App() {
           isLoadingBackend={isLoading}
           isRunningTest={isRunning}
           isStartingDeployment={isStartingDeployment}
+          isStartingTunnel={isStartingTunnel}
           onDeploy={deployEnvironment}
+          onStartTunnel={connectSsmTunnel}
+          onStopTunnel={disconnectSsmTunnel}
           onFocusExperiment={() =>
             document
               .getElementById('control-title')
@@ -266,6 +378,8 @@ export default function App() {
           optionsReady={Boolean(options)}
           run={run}
           runError={runError}
+          tunnel={tunnel}
+          tunnelActionError={tunnelActionError}
         />
 
         <DeploymentPanel
@@ -273,6 +387,8 @@ export default function App() {
           deployment={deployment}
           isStarting={isStartingDeployment}
           onDeploy={deployEnvironment}
+          onDestroy={destroyEnvironment}
+          onInitialize={initializeTerraform}
         />
 
         <div className="workspace-grid">

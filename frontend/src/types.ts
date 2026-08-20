@@ -80,6 +80,7 @@ export interface DeploymentLog {
 
 export interface DeploymentStatus {
   status: DeploymentState;
+  operation: "none" | "initialize" | "deploy" | "destroy";
   enabled: boolean;
   prerequisites: Record<string, boolean>;
   fixed_environment: {
@@ -94,6 +95,17 @@ export interface DeploymentStatus {
   error: string | null;
   started_at: string | null;
   completed_at: string | null;
+}
+
+export type TunnelState = "not_ready" | "installing" | "idle" | "starting" | "connected" | "failed";
+
+export interface TunnelStatus {
+  status: TunnelState;
+  target_instance_id: string | null;
+  local_port: number;
+  remote_port: number;
+  error: string | null;
+  logs: string[];
 }
 
 export type WorkflowNodeStatus = "pending" | "running" | "succeeded" | "failed" | "blocked";

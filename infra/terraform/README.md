@@ -12,6 +12,7 @@
 - Access: SSM only
 - Runtime: 같은 EC2의 Container와 Ubuntu Host 경계
 - Services: OS Agent Backend, `nginx-target`
+- Runtime Network: `nginx-target`은 내부 `control` 망에만 연결하고, Backend는 호스트 loopback 게시와 외부 API 호출을 위해 별도 `egress` 망에도 연결
 
 저장·로그 정책:
 
@@ -38,5 +39,8 @@
 3. `backend/` Docker image를 ECR에 push
 4. 고정 `backend_image_uri`를 넘겨 전체 apply
 5. `terraform output -json`을 대시보드에 표시
+6. SSM 관리 노드가 Online이 되면 로컬 `8001`에서 EC2 Backend `8000`으로 터널 연결
+
+대시보드의 `AWS 환경 삭제`는 동일한 로컬 state로 `terraform destroy`를 실행하고, 필요하면 남은 고정 CloudWatch Log Group도 정리한다. EC2만 정지하면 NAT Gateway, VPC Endpoint와 EBS 비용은 남을 수 있으므로 장기간 사용하지 않을 때는 전체 환경을 삭제한다.
 
 실제 AWS 배포 전에 Terraform, AWS CLI v2, Docker와 `whs-team` AWS profile이 필요하다. 세부 실행 방법은 프로젝트 루트의 `실행방법.md`를 참고한다.

@@ -7,10 +7,12 @@ services:
       - "127.0.0.1:8000:8000"
     environment:
       DEPLOYMENT_ENABLED: "false"
+      ALLOWED_ORIGINS: "https://os-agent-dashboard.vercel.app"
     volumes:
       - /opt/trial/runtime/data:/app/runtime
     networks:
       - control
+      - egress
 
   nginx-target:
     image: nginx:1.27-alpine
@@ -26,3 +28,7 @@ services:
 networks:
   control:
     internal: true
+  # Backend는 SSM으로 게시된 호스트 포트와 OpenRouter/Supabase outbound가 필요하다.
+  # 실험 대상 nginx는 control 내부망에만 남겨 외부 연결을 허용하지 않는다.
+  egress:
+    driver: bridge
