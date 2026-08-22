@@ -30,29 +30,29 @@ resource "aws_instance" "trial" {
   root_block_device {
     encrypted             = true
     delete_on_termination = true
-    volume_size            = 20
-    volume_type            = "gp3"
+    volume_size           = 20
+    volume_type           = "gp3"
   }
 
   metadata_options {
     http_tokens                 = "required" # IMDSv2 강제 (메타데이터 탈취 방지)
-    http_endpoint                = "enabled"
-    http_put_response_hop_limit = 1     # 컨테이너 등 한 홉 너머로 메타데이터 응답이 전달되지 않도록 제한
-    instance_metadata_tags       = "disabled"
+    http_endpoint               = "enabled"
+    http_put_response_hop_limit = 1 # 컨테이너 등 한 홉 너머로 메타데이터 응답이 전달되지 않도록 제한
+    instance_metadata_tags      = "disabled"
   }
 
   # EC2가 처음 부팅될 때 자동 실행되는 스크립트.
   # Docker/auditd 설치 + 권한 감시 규칙 등록 + Canary 파일 생성까지 여기서 끝낸다.
   user_data = templatefile("${path.module}/user_data.sh.tpl", {
-    canary_file_path      = var.canary_file_path
-    aws_region            = var.aws_region
-    backend_image_uri     = var.backend_image_uri
-    ecr_registry          = split("/", aws_ecr_repository.agent_backend.repository_url)[0]
-    runtime_compose_b64   = base64encode(templatefile("${path.module}/runtime-compose.yml.tpl", {
+    canary_file_path  = var.canary_file_path
+    aws_region        = var.aws_region
+    backend_image_uri = var.backend_image_uri
+    ecr_registry      = split("/", aws_ecr_repository.agent_backend.repository_url)[0]
+    runtime_compose_b64 = base64encode(templatefile("${path.module}/runtime-compose.yml.tpl", {
       backend_image_uri = var.backend_image_uri
     }))
-    baseline_compose_b64  = base64encode(file("${path.module}/compose/docker-compose.yml"))
-    mount_rw_compose_b64  = base64encode(file("${path.module}/compose/docker-compose.override.mount-rw.yml"))
+    baseline_compose_b64 = base64encode(file("${path.module}/compose/docker-compose.yml"))
+    mount_rw_compose_b64 = base64encode(file("${path.module}/compose/docker-compose.override.mount-rw.yml"))
   })
 
   # user_data 내용이 바뀌면 (예: auditd 규칙 추가) 수동으로 -replace를 안 해도
@@ -69,6 +69,9 @@ resource "aws_instance" "trial" {
   ]
 
   tags = {
-    Name = "${var.project_name}-ec2-${count.index}"
+    Name          = "${var.project_name}-ec2-${count.index}"
+    EnvironmentId = var.environment_id
+    CreatedBy     = var.created_by
+    OwnerArn      = var.owner_arn
   }
 }

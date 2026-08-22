@@ -17,6 +17,7 @@ from .executables import find_working_executable
 
 class TunnelRequest(BaseModel):
     confirmation: Literal["START_FIXED_SSM_TUNNEL"]
+    target_instance_id: str = Field(pattern=r"^i-[0-9a-f]{8,17}$")
 
 
 class TunnelStopRequest(BaseModel):

@@ -47,9 +47,9 @@ resource "aws_flow_log" "trial" {
   count = var.enable_flow_logs ? 1 : 0
 
   vpc_id                   = aws_vpc.trial.id
-  traffic_type              = "ALL"
-  log_destination_type      = "cloud-watch-logs"
-  log_destination           = aws_cloudwatch_log_group.vpc_flow_logs[0].arn
-  iam_role_arn               = aws_iam_role.flow_logs[0].arn
-  max_aggregation_interval  = 60
+  traffic_type             = "ALL"
+  log_destination_type     = "cloud-watch-logs"
+  log_destination          = aws_cloudwatch_log_group.vpc_flow_logs[0].arn
+  iam_role_arn             = aws_iam_role.flow_logs[0].arn
+  max_aggregation_interval = 60
 }

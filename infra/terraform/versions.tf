@@ -15,9 +15,13 @@ provider "aws" {
 
   default_tags {
     tags = {
-      Project = "agentic-ai-trust-boundary"
-      Layer   = "os-ubuntu"
-      Managed = "terraform"
+      Project       = "agentic-ai-trust-boundary"
+      Layer         = "os-ubuntu"
+      Managed       = "terraform"
+      ManagedBy     = "Terraform"
+      EnvironmentId = var.environment_id
+      CreatedBy     = var.created_by
+      OwnerArn      = var.owner_arn
     }
   }
 }

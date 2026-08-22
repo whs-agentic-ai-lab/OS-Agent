@@ -69,7 +69,7 @@ export interface RunRecord extends RunRequest {
   completed_at: string | null;
 }
 
-export type DeploymentState = "disabled" | "not_ready" | "idle" | "running" | "succeeded" | "failed";
+export type DeploymentState = "not_ready" | "idle" | "running" | "succeeded" | "failed";
 
 export interface DeploymentLog {
   sequence: number;
@@ -78,10 +78,32 @@ export interface DeploymentLog {
   created_at: string;
 }
 
+export interface AwsCallerIdentity {
+  account_id: string;
+  arn: string;
+  display_name: string;
+  owner_key: string;
+  environment_prefix: string;
+}
+
+export interface AwsInstanceSummary {
+  instance_id: string;
+  name: string;
+  environment_id: string;
+  created_by: string;
+  owner_arn: string;
+  state: string;
+  instance_type: string;
+  availability_zone: string;
+  private_ip: string | null;
+  launch_time: string | null;
+  ssm_ping_status: string;
+  local_state_available: boolean;
+}
+
 export interface DeploymentStatus {
   status: DeploymentState;
   operation: "none" | "initialize" | "deploy" | "destroy";
-  enabled: boolean;
   prerequisites: Record<string, boolean>;
   fixed_environment: {
     region: string;
@@ -95,6 +117,8 @@ export interface DeploymentStatus {
   error: string | null;
   started_at: string | null;
   completed_at: string | null;
+  caller_identity: AwsCallerIdentity | null;
+  instances: AwsInstanceSummary[];
 }
 
 export type TunnelState = "not_ready" | "installing" | "idle" | "starting" | "connected" | "failed";

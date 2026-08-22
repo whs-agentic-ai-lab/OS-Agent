@@ -35,6 +35,14 @@ output "backend_ecr_repository_url" {
   value       = aws_ecr_repository.agent_backend.repository_url
 }
 
+output "environment_id" {
+  value = var.environment_id
+}
+
+output "created_by" {
+  value = var.created_by
+}
+
 output "backend_local_port" {
   description = "SSM Port Forwarding의 원격 대상 포트"
   value       = 8000

@@ -1,15 +1,47 @@
-frontend/node_modules/
-frontend/dist/
-.playwright-cli/
-backend/.venv/
-backend/.pytest_cache/
-backend/**/__pycache__/
-backend/runtime/
+# Secrets and local credentials
+/key/
+/keys/
 .env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+**/credentials.json
+**/service-account*.json
+
+# Python
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+*.py[cod]
+*.coverage
+coverage.xml
+
+# Node.js and frontend builds
+**/node_modules/
+frontend/dist/
+frontend/.vite/
+.playwright-cli/
+
+# Local runtime output and logs
+backend/runtime/
 *.log
 .source-os/
-infra/terraform/.terraform/
-infra/terraform/.terraform.tfstate.lock.info
-infra/terraform/terraform.tfstate
-infra/terraform/terraform.tfstate.backup
-infra/terraform/terraform.tfvars
+
+# Terraform: state and locally supplied variables must never be committed
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+!infra/terraform/fixed.auto.tfvars
+!infra/terraform/terraform.tfvars.example
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/

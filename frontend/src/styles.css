@@ -12,7 +12,7 @@
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; background: var(--canvas); }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--canvas); font-weight: 500; }
-button, textarea, select { font: inherit; }
+button, input, textarea, select { font: inherit; }
 button, label, select { -webkit-tap-highlight-color: transparent; }
 button { font-weight: 600; }
 
@@ -113,12 +113,39 @@ dd { margin: 5px 0 0; font-size: 14px; font-weight: 600; }
 .infrastructure-button { color: var(--ink); background: #fff; border: 1px solid var(--border-strong); }
 .infrastructure-button.is-primary, .run-button { color: #fff; background: var(--primary); border: 1px solid var(--primary); }
 .infrastructure-button.is-danger { color: var(--error); border-color: var(--error); }
+.infrastructure-button.is-danger.is-outline { background: transparent; }
 .infrastructure-button:hover:not(:disabled) { background: var(--primary-soft); border-color: var(--primary); }
 .infrastructure-button.is-primary:hover:not(:disabled), .run-button:hover:not(:disabled) { color: #fff; background: var(--primary-hover); }
 .infrastructure-button.is-danger:hover:not(:disabled) { color: #fff; background: var(--error); border-color: var(--error); }
 .infrastructure-button:disabled, .run-button:disabled { color: var(--subtle); background: #dedbd8; border-color: #dedbd8; cursor: not-allowed; }
 .deployment-notice { margin: 12px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .deployment-notice code { color: var(--ink); }
+.environment-create { display: grid; gap: 8px; margin-top: 12px; }
+.environment-create > label { color: var(--ink); font-size: 12px; font-weight: 700; }
+.environment-create > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.environment-create input { min-width: 0; height: 48px; padding: 0 12px; color: var(--ink); background: #fff; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); outline: 0; }
+.environment-create input:focus { border-color: var(--focus); box-shadow: 0 0 0 3px rgba(123,66,188,.16); }
+.environment-create p { display: grid; gap: 4px; margin: 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.environment-create code { overflow-wrap: anywhere; color: var(--primary); font-family: "JetBrains Mono", Consolas, monospace; }
+.instance-inventory { margin-top: 24px; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.instance-inventory-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 16px; background: var(--surface-subtle); border-bottom: 1px solid var(--border); }
+.instance-inventory-heading h3 { margin: 0; font-size: 16px; }
+.instance-inventory-heading p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+.instance-inventory-heading .infrastructure-button { min-height: 40px; }
+.instance-table-wrap { overflow-x: auto; }
+.instance-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.instance-table th, .instance-table td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.instance-table th { color: var(--muted); background: #fbfaf9; font-size: 11px; }
+.instance-table tr.is-selected td { background: var(--primary-soft); }
+.instance-table td strong, .instance-table td small { display: block; }
+.instance-table td small { margin-top: 4px; color: var(--muted); }
+.instance-table code { font-family: "JetBrains Mono", Consolas, monospace; font-size: 11px; }
+.instance-state { display: inline-flex; padding: 4px 7px; color: var(--muted); background: var(--surface-subtle); border-radius: 999px; font-weight: 700; }
+.instance-state.is-running { color: #0c6840; background: var(--success-soft); }
+.instance-state.is-stopped, .instance-state.is-stopping { color: #764a00; background: var(--warning-soft); }
+.instance-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 16px; }
+.instance-actions .infrastructure-button { min-height: 42px; }
+.instance-inventory > .deployment-notice { margin: 0; padding: 16px; }
 .deployment-log { margin-top: 24px; overflow: hidden; color: #f4f4f5; background: var(--log); border: 1px solid #34353a; border-radius: var(--radius-md); font-family: "JetBrains Mono", Consolas, monospace; }
 .deployment-log > div { display: flex; justify-content: space-between; padding: 12px 16px; color: #b7b8bf; border-bottom: 1px solid #3a3b41; font-size: 11px; }
 .deployment-log ol { max-height: 320px; margin: 0; padding: 0; overflow: auto; list-style: none; }
@@ -259,6 +286,9 @@ footer > span { color: #92939a; font-size: 12px; }
   .fixed-environment { grid-template-columns: 1fr; }
   .fixed-environment div, .fixed-environment div:nth-last-child(-n + 2) { border-right: 0; border-bottom: 1px solid var(--border); }
   .fixed-environment div:last-child { border-bottom: 0; }
+  .environment-create > div { grid-template-columns: 1fr; }
+  .instance-inventory-heading { align-items: stretch; flex-direction: column; }
+  .instance-actions { display: grid; }
   .input-meta { flex-direction: column; gap: 4px; }
   .permission-state { align-items: flex-start; gap: 16px; }
   footer { flex-direction: column; min-height: 190px; }

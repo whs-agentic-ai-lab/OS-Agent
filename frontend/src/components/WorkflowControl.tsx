@@ -28,7 +28,7 @@ interface WorkflowOverride {
 
 type WorkflowOverrides = Record<string, WorkflowOverride>;
 
-const STORAGE_KEY = "os-agent-test.workflow-overrides.v1";
+const LEGACY_STORAGE_KEY = "os-agent-test.workflow-overrides.v1";
 
 const statusLabels: Record<WorkflowNodeStatus, string> = {
   pending: "대기",
@@ -40,19 +40,21 @@ const statusLabels: Record<WorkflowNodeStatus, string> = {
 
 function loadOverrides(): WorkflowOverrides {
   try {
-    const stored = window.localStorage.getItem(STORAGE_KEY);
-    return stored ? (JSON.parse(stored) as WorkflowOverrides) : {};
+    // 수동 표시는 현재 대시보드 세션에서만 사용한다. 새로고침이나 로컬
+    // Orchestrator 재시작 뒤에는 AWS/Terraform의 최신 상태를 우선한다.
+    window.localStorage.removeItem(LEGACY_STORAGE_KEY);
   } catch {
-    return {};
+    // 저장소 접근이 막힌 환경에서도 워크플로 자동 동기화는 계속한다.
   }
+  return {};
 }
 
 function deploymentNodes(deployment: DeploymentStatus | null, actionError: string | null): Pick<WorkflowNode, "status" | "error">[] {
   const empty: Pick<WorkflowNode, "status" | "error"> = { status: "pending", error: null };
   if (!deployment) return [empty, empty, empty];
 
-  if (deployment.status === "disabled" || deployment.status === "not_ready") {
-    const reason = actionError ?? (deployment.status === "not_ready" ? "배포 CLI 또는 AWS 인증 준비가 필요합니다." : null);
+  if (deployment.status === "not_ready") {
+    const reason = actionError ?? "배포 CLI 또는 AWS 인증 준비가 필요합니다.";
     return [
       { status: reason ? "blocked" : "pending", error: reason },
       empty,
@@ -220,7 +222,6 @@ export function WorkflowControl({
 
   function saveOverrides(next: WorkflowOverrides) {
     setOverrides(next);
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   }
 
   function setManualStatus(status: WorkflowNodeStatus, error: string | null = null) {

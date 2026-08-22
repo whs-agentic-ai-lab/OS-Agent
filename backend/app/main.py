@@ -12,6 +12,7 @@ from .deployment import (
     DeploymentStatus,
     DestroyRequest,
     InitializeRequest,
+    TerminateInstanceRequest,
 )
 from .executor import AgentExecutor
 from .planner import LocalPlanner, OpenRouterPlanner
@@ -63,9 +64,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.post("/api/deployments", response_model=DeploymentStatus)
     def create_deployment(request: DeploymentRequest) -> DeploymentStatus:
-        del request
         try:
-            return deployment_manager.start()
+            return deployment_manager.start(request)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -79,9 +79,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.post("/api/deployments/destroy", response_model=DeploymentStatus)
     def destroy_deployment(request: DestroyRequest) -> DeploymentStatus:
-        del request
         try:
-            return deployment_manager.destroy()
+            return deployment_manager.destroy(request)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @application.post("/api/deployments/instances/terminate", response_model=DeploymentStatus)
+    def terminate_instance(request: TerminateInstanceRequest) -> DeploymentStatus:
+        try:
+            return deployment_manager.terminate_instance(request)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -91,9 +97,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.post("/api/tunnel", response_model=TunnelStatus)
     def start_tunnel(request: TunnelRequest) -> TunnelStatus:
-        del request
         try:
-            return tunnel_manager.start(deployment_manager.get_trial_instance_id())
+            return tunnel_manager.start(
+                deployment_manager.get_trial_instance_id(request.target_instance_id)
+            )
         except (RuntimeError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 

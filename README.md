@@ -56,9 +56,29 @@ os-Agent-test/
 
 배포 버튼은 Terraform으로 ECR을 준비하고, 백엔드 Docker 이미지를 push한 다음 전체 인프라를 apply한다. NAT Gateway, EC2, VPC Endpoint와 CloudWatch Logs 등 **비용이 발생할 수 있는 AWS 리소스**를 만든다.
 
+AWS 리소스 이름과 태그에는 로그인한 IAM/SSO 사용자 식별자와 사용자가 입력한 환경 이름이 포함된다. 대시보드는 AWS의 실제 EC2 목록을 다시 조회하므로 여러 팀원의 인스턴스 중 연결 대상을 선택할 수 있다. 환경 전체 삭제는 생성 PC에 보관된 환경별 Terraform state가 있을 때만 가능하며, EC2 단독 종료는 다른 리소스를 남길 수 있다.
+
 ## 로컬 실행
 
 Python 3.10과 Node.js 22 이상을 기준으로 한다.
+
+### Windows 팀원 최초 환경설정
+
+Git만 설치된 Windows PC에서는 저장소를 clone한 뒤 최초 한 번만 다음 파일을 실행한다.
+
+```cmd
+setup.cmd
+```
+
+`setup.cmd`는 `winget`을 사용해 Python, Node.js, AWS CLI, Terraform, Docker Desktop을 설치하고 AWS Session Manager Plugin을 준비한다. Docker Desktop 약관, WSL/재부팅, Windows 관리자 권한처럼 자동화할 수 없는 단계는 화면 안내를 완료한 뒤 `Y`를 입력하면 이어서 진행한다. 이미 완료된 항목은 다시 실행해도 건너뛴다.
+
+환경설정이 끝난 뒤부터는 다음 파일만 실행한다.
+
+```cmd
+run.cmd
+```
+
+`run.cmd`는 AWS 로그인 상태, Docker 실행 상태와 프로젝트 의존성을 확인하고 로컬 프론트엔드와 백엔드를 함께 시작한다. `backend/.env`가 없으면 실행을 중단하고 관리자에게 파일을 받아 넣으라고 안내한다. 실제 키 값은 Git에 커밋하지 않는다.
 
 ```powershell
 cd C:\Users\vinny\Desktop\whs_team\os-Agent-test\backend

@@ -11,9 +11,32 @@ variable "aws_profile" {
 }
 
 variable "project_name" {
-  description = "리소스 이름 접두사"
+  description = "IAM/SSO 소유자와 사용자가 입력한 환경 이름을 조합한 리소스 접두사"
   type        = string
   default     = "trial"
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9-]{2,49}$", var.project_name))
+    error_message = "project_name은 3~50자의 영문 소문자, 숫자, 하이픈이어야 합니다."
+  }
+}
+
+variable "environment_id" {
+  description = "대시보드와 AWS 인벤토리에서 환경을 식별하는 고유 ID"
+  type        = string
+  default     = "trial"
+}
+
+variable "created_by" {
+  description = "환경을 생성한 IAM/SSO 표시 이름"
+  type        = string
+  default     = "unknown"
+}
+
+variable "owner_arn" {
+  description = "환경을 생성한 AWS principal ARN"
+  type        = string
+  default     = "unknown"
 }
 
 variable "vpc_cidr" {

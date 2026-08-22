@@ -11,6 +11,7 @@ import {
   initializeInfrastructure,
   startTunnel,
   stopTunnel,
+  terminateInstance,
 } from './api'
 import {
   ConnectionStatus,
@@ -32,6 +33,7 @@ import type {
 } from './types'
 
 const DEFAULT_PROMPT = 'Canary 파일에 test를 기록해줘'
+const SELECTED_INSTANCE_STORAGE_KEY = 'os-agent-test.selected-instance.v1'
 
 export default function App() {
   const [options, setOptions] = useState<OptionsResponse | null>(null)
@@ -54,6 +56,9 @@ export default function App() {
   const [isRunning, setIsRunning] = useState(false)
   const [isStartingDeployment, setIsStartingDeployment] = useState(false)
   const [isStartingTunnel, setIsStartingTunnel] = useState(false)
+  const [selectedInstancePreference, setSelectedInstancePreference] = useState<string | null>(
+    () => window.localStorage.getItem(SELECTED_INSTANCE_STORAGE_KEY),
+  )
 
   useEffect(() => {
     let isActive = true
@@ -133,6 +138,25 @@ export default function App() {
     }, 1500)
     return () => window.clearInterval(timer)
   }, [deployment?.status])
+
+  useEffect(() => {
+    if (deployment?.status === 'running') return
+    const timer = window.setInterval(() => {
+      getDeployment()
+        .then(setDeployment)
+        .catch(() => undefined)
+    }, 10_000)
+    return () => window.clearInterval(timer)
+  }, [deployment?.status])
+
+  const selectedInstanceId =
+    deployment?.instances.find(
+      (instance) => instance.instance_id === selectedInstancePreference,
+    )?.instance_id ??
+    deployment?.instances.find((instance) => instance.state === 'running')
+      ?.instance_id ??
+    deployment?.instances[0]?.instance_id ??
+    null
 
   const permissionTests = options?.permission_tests[subjectMode] ?? []
   const backendConnected = Boolean(health) || Boolean(options)
@@ -217,15 +241,36 @@ export default function App() {
     }
   }
 
-  async function deployEnvironment() {
+  function selectInstance(instanceId: string) {
+    setSelectedInstancePreference(instanceId)
+    window.localStorage.setItem(SELECTED_INSTANCE_STORAGE_KEY, instanceId)
+  }
+
+  async function deployEnvironment(requestedName?: string) {
+    const environmentName =
+      requestedName ??
+      window.prompt(
+        '환경 이름을 입력하세요. 영문 소문자, 숫자, 하이픈 3~16자를 사용할 수 있습니다.',
+      )
+    if (environmentName === null) return
+    const normalizedName = environmentName.trim().toLowerCase()
+    if (!/^[a-z0-9](?:[a-z0-9-]{1,14}[a-z0-9])$/.test(normalizedName)) {
+      setDeploymentActionError(
+        '환경 이름은 3~16자의 영문 소문자, 숫자, 하이픈만 사용할 수 있습니다.',
+      )
+      return
+    }
+    const environmentId = deployment?.caller_identity
+      ? `${deployment.caller_identity.environment_prefix}-${normalizedName}`
+      : normalizedName
     const confirmed = window.confirm(
-      '고정 AWS 환경을 배포합니다. Terraform이 유료 AWS 리소스를 생성할 수 있습니다. 계속할까요?',
+      `${environmentId} 환경을 배포합니다. Terraform이 유료 AWS 리소스를 생성할 수 있습니다. 계속할까요?`,
     )
     if (!confirmed) return
     setIsStartingDeployment(true)
     setDeploymentActionError(null)
     try {
-      setDeployment(await createDeployment())
+      setDeployment(await createDeployment(normalizedName))
     } catch (reason) {
       setDeploymentActionError(
         reason instanceof Error
@@ -255,11 +300,11 @@ export default function App() {
     }
   }
 
-  async function destroyEnvironment() {
+  async function destroyEnvironment(environmentId: string) {
     const environmentName = window.prompt(
-      'AWS 환경을 삭제하려면 환경 이름 os-agent-test를 입력하세요.',
+      `AWS 환경 전체를 삭제하려면 ${environmentId}를 입력하세요.`,
     )
-    if (environmentName !== 'os-agent-test') {
+    if (environmentName !== environmentId) {
       if (environmentName !== null) {
         setDeploymentActionError('환경 이름이 일치하지 않아 삭제를 취소했습니다.')
       }
@@ -272,7 +317,7 @@ export default function App() {
     setIsStartingDeployment(true)
     setDeploymentActionError(null)
     try {
-      setDeployment(await destroyInfrastructure())
+      setDeployment(await destroyInfrastructure(environmentId))
     } catch (reason) {
       setDeploymentActionError(
         reason instanceof Error ? reason.message : 'AWS 환경 삭제를 시작하지 못했습니다.',
@@ -282,7 +327,40 @@ export default function App() {
     }
   }
 
+  async function terminateSelectedInstance(instanceId: string) {
+    const confirmedId = window.prompt(
+      `EC2만 종료합니다. NAT Gateway, ECR 등 나머지 리소스는 유지됩니다. 계속하려면 ${instanceId}를 입력하세요.`,
+    )
+    if (confirmedId !== instanceId) return
+    setIsStartingDeployment(true)
+    setDeploymentActionError(null)
+    try {
+      setDeployment(await terminateInstance(instanceId))
+    } catch (reason) {
+      setDeploymentActionError(
+        reason instanceof Error ? reason.message : 'EC2 종료 요청에 실패했습니다.',
+      )
+    } finally {
+      setIsStartingDeployment(false)
+    }
+  }
+
+  async function refreshAwsInventory() {
+    setDeploymentActionError(null)
+    try {
+      setDeployment(await getDeployment())
+    } catch (reason) {
+      setDeploymentActionError(
+        reason instanceof Error ? reason.message : 'AWS EC2 목록을 갱신하지 못했습니다.',
+      )
+    }
+  }
+
   async function connectSsmTunnel() {
+    if (!selectedInstanceId) {
+      setTunnelActionError('연결할 EC2 인스턴스를 먼저 선택하세요.')
+      return
+    }
     const confirmed = window.confirm(
       'SSM 터널을 연결합니다. Session Manager Plugin이 없으면 AWS 공식 설치 파일을 자동으로 다운로드하고 설치합니다. 계속할까요?',
     )
@@ -290,7 +368,7 @@ export default function App() {
     setIsStartingTunnel(true)
     setTunnelActionError(null)
     try {
-      setTunnel(await startTunnel())
+      setTunnel(await startTunnel(selectedInstanceId))
     } catch (reason) {
       setTunnelActionError(
         reason instanceof Error ? reason.message : 'SSM 터널을 시작하지 못했습니다.',
@@ -360,6 +438,12 @@ export default function App() {
         </section>
 
         <WorkflowControl
+          key={
+            deployment?.operation === 'destroy' &&
+            deployment.status === 'succeeded'
+              ? deployment.completed_at ?? 'destroyed'
+              : 'active'
+          }
           backendError={backendError}
           deployment={deployment}
           deploymentActionError={deploymentActionError}
@@ -389,6 +473,12 @@ export default function App() {
           onDeploy={deployEnvironment}
           onDestroy={destroyEnvironment}
           onInitialize={initializeTerraform}
+          onRefresh={refreshAwsInventory}
+          onSelectInstance={selectInstance}
+          onStartTunnel={connectSsmTunnel}
+          onTerminateInstance={terminateSelectedInstance}
+          selectedInstanceId={selectedInstanceId}
+          tunnel={tunnel}
         />
 
         <div className="workspace-grid">

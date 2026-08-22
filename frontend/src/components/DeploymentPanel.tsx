@@ -1,16 +1,23 @@
-import type { DeploymentState, DeploymentStatus } from "../types";
+import { useState } from "react";
+
+import type { DeploymentState, DeploymentStatus, TunnelStatus } from "../types";
 
 interface DeploymentPanelProps {
   deployment: DeploymentStatus | null;
   actionError: string | null;
   isStarting: boolean;
-  onDeploy: () => void;
-  onDestroy: () => void;
+  onDeploy: (environmentName: string) => void;
+  onDestroy: (environmentId: string) => void;
   onInitialize: () => void;
+  onRefresh: () => void;
+  onSelectInstance: (instanceId: string) => void;
+  onStartTunnel: () => void;
+  onTerminateInstance: (instanceId: string) => void;
+  selectedInstanceId: string | null;
+  tunnel: TunnelStatus | null;
 }
 
 const statusLabels: Record<DeploymentState, string> = {
-  disabled: "비활성",
   not_ready: "준비 필요",
   idle: "배포 가능",
   running: "배포 중",
@@ -38,28 +45,52 @@ function statusLabel(deployment: DeploymentStatus | null): string {
   return statusLabels[deployment.status];
 }
 
-export function DeploymentPanel({ deployment, actionError, isStarting, onDeploy, onDestroy, onInitialize }: DeploymentPanelProps) {
+export function DeploymentPanel({
+  deployment,
+  actionError,
+  isStarting,
+  onDeploy,
+  onDestroy,
+  onInitialize,
+  onRefresh,
+  onSelectInstance,
+  onStartTunnel,
+  onTerminateInstance,
+  selectedInstanceId,
+  tunnel,
+}: DeploymentPanelProps) {
+  const [environmentName, setEnvironmentName] = useState("");
   const status = deployment?.status ?? "not_ready";
   const prerequisites = deployment?.prerequisites ?? {};
   const isBusy = status === "running" || isStarting;
   const canDeploy = Boolean(
-    deployment?.enabled &&
-      Object.values(prerequisites).every(Boolean) &&
+    Object.values(prerequisites).every(Boolean) &&
       !isBusy,
   );
   const canInitialize = Boolean(
-    deployment?.enabled &&
-      prerequisites.terraform &&
+    prerequisites.terraform &&
       prerequisites.terraform_files &&
       !isBusy,
+  );
+  const selectedInstance = deployment?.instances.find(
+    (instance) => instance.instance_id === selectedInstanceId,
+  );
+  const selectedInstanceHasTunnel = Boolean(
+    selectedInstance &&
+      tunnel?.target_instance_id === selectedInstance.instance_id &&
+      ["installing", "starting", "connected"].includes(tunnel.status),
   );
   const canDestroy = Boolean(
-    deployment?.enabled &&
-      prerequisites.terraform &&
+    prerequisites.terraform &&
       prerequisites.aws_cli &&
       prerequisites.terraform_files &&
+      selectedInstance?.local_state_available &&
       !isBusy,
   );
+  const validEnvironmentName = /^[a-z0-9](?:[a-z0-9-]{1,14}[a-z0-9])$/.test(environmentName);
+  const environmentPreview = deployment?.caller_identity && validEnvironmentName
+    ? `${deployment.caller_identity.environment_prefix}-${environmentName}`
+    : null;
   const environment = deployment?.fixed_environment;
   const outputs = Object.entries(deployment?.outputs ?? {});
 
@@ -95,23 +126,120 @@ export function DeploymentPanel({ deployment, actionError, isStarting, onDeploy,
             <button className="infrastructure-button is-secondary" disabled={!canInitialize} onClick={onInitialize} type="button">
               Terraform 초기화
             </button>
-            <button className="infrastructure-button is-primary" disabled={!canDeploy} onClick={onDeploy} type="button">
-              AWS 환경 배포
-            </button>
-            <button className="infrastructure-button is-danger" disabled={!canDestroy} onClick={onDestroy} type="button">
-              AWS 환경 삭제
-            </button>
           </div>
-          {!deployment?.enabled ? (
-            <p className="deployment-notice">
-              로컬 백엔드에서 <code>DEPLOYMENT_ENABLED=true</code>를 설정하면 배포 버튼이 활성화됩니다.
+          <div className="environment-create">
+            <label htmlFor="environment-name">환경 이름</label>
+            <div>
+              <input
+                autoComplete="off"
+                id="environment-name"
+                maxLength={16}
+                onChange={(event) => setEnvironmentName(event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ""))}
+                placeholder="permission-test"
+                value={environmentName}
+              />
+              <button
+                className="infrastructure-button is-primary"
+                disabled={!canDeploy || !validEnvironmentName}
+                onClick={() => onDeploy(environmentName)}
+                type="button"
+              >
+              AWS 환경 배포
+              </button>
+            </div>
+            <p>
+              로그인 사용자: <strong>{deployment?.caller_identity?.display_name ?? "확인 중"}</strong>
+              {environmentPreview ? <code>{environmentPreview}</code> : <span>3~16자의 영문 소문자·숫자·하이픈</span>}
             </p>
-          ) : null}
+          </div>
           {status === "not_ready" ? (
             <p className="deployment-notice">표시된 CLI와 AWS 인증을 먼저 준비해 주세요.</p>
           ) : null}
           {actionError ? <p className="error-message" role="alert">{actionError}</p> : null}
         </div>
+      </div>
+
+      <div className="instance-inventory">
+        <div className="instance-inventory-heading">
+          <div>
+            <h3>AWS EC2 인스턴스</h3>
+            <p>실제 AWS 목록을 기준으로 연결할 환경을 선택합니다.</p>
+          </div>
+          <button className="infrastructure-button is-secondary" disabled={isBusy} onClick={onRefresh} type="button">
+            목록 새로고침
+          </button>
+        </div>
+
+        {deployment?.instances.length ? (
+          <div className="instance-table-wrap">
+            <table className="instance-table">
+              <thead>
+                <tr>
+                  <th scope="col">선택</th>
+                  <th scope="col">환경</th>
+                  <th scope="col">생성자</th>
+                  <th scope="col">EC2</th>
+                  <th scope="col">상태</th>
+                  <th scope="col">SSM</th>
+                </tr>
+              </thead>
+              <tbody>
+                {deployment.instances.map((instance) => (
+                  <tr className={instance.instance_id === selectedInstanceId ? "is-selected" : ""} key={instance.instance_id}>
+                    <td>
+                      <input
+                        aria-label={`${instance.environment_id} 선택`}
+                        checked={instance.instance_id === selectedInstanceId}
+                        name="selected-instance"
+                        onChange={() => onSelectInstance(instance.instance_id)}
+                        type="radio"
+                      />
+                    </td>
+                    <td><strong>{instance.environment_id}</strong><small>{instance.name}</small></td>
+                    <td>{instance.created_by}</td>
+                    <td><code>{instance.instance_id}</code><small>{instance.instance_type} · {instance.availability_zone}</small></td>
+                    <td><span className={`instance-state is-${instance.state}`}>{instance.state}</span></td>
+                    <td>{instance.ssm_ping_status}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="deployment-notice">현재 AWS 계정에서 os-agent-test EC2를 찾지 못했습니다.</p>
+        )}
+
+        <div className="instance-actions">
+          <button
+            className="infrastructure-button is-primary"
+            disabled={!selectedInstance || selectedInstance.state !== "running" || tunnel?.status === "connected"}
+            onClick={onStartTunnel}
+            type="button"
+          >
+            선택 EC2 SSM 연결
+          </button>
+          <button
+            className="infrastructure-button is-danger"
+            disabled={!canDestroy || !selectedInstance || selectedInstanceHasTunnel}
+            onClick={() => selectedInstance && onDestroy(selectedInstance.environment_id)}
+            type="button"
+          >
+            환경 전체 삭제
+          </button>
+          <button
+            className="infrastructure-button is-danger is-outline"
+            disabled={!selectedInstance || isBusy || selectedInstanceHasTunnel}
+            onClick={() => selectedInstance && onTerminateInstance(selectedInstance.instance_id)}
+            type="button"
+          >
+            EC2만 종료
+          </button>
+        </div>
+        {selectedInstance && !selectedInstance.local_state_available ? (
+          <p className="deployment-notice">
+            이 PC에는 {selectedInstance.environment_id}의 Terraform state가 없어 전체 삭제할 수 없습니다. EC2 단독 종료는 다른 AWS 리소스를 남깁니다.
+          </p>
+        ) : null}
       </div>
 
       {deployment && (deployment.logs.length > 0 || deployment.error) ? (

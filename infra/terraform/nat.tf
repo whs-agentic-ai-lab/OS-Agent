@@ -17,9 +17,9 @@ resource "aws_internet_gateway" "trial" {
 
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.trial.id
-  cidr_block               = var.public_subnet_cidr
-  availability_zone        = var.availability_zone
-  map_public_ip_on_launch  = true
+  cidr_block              = var.public_subnet_cidr
+  availability_zone       = var.availability_zone
+  map_public_ip_on_launch = true
 
   tags = {
     Name = "${var.project_name}-public-subnet"
@@ -67,5 +67,5 @@ resource "aws_nat_gateway" "trial" {
 resource "aws_route" "private_via_nat" {
   route_table_id         = aws_route_table.private.id
   destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id          = aws_nat_gateway.trial.id
+  nat_gateway_id         = aws_nat_gateway.trial.id
 }

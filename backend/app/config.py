@@ -13,7 +13,6 @@ class Settings:
     openrouter_model: str
     allowed_origins: tuple[str, ...]
     runtime_dir: Path
-    deployment_enabled: bool = False
     aws_profile: str = "whs-team"
     aws_region: str = "us-east-1"
     terraform_dir: Path = PROJECT_ROOT / "infra" / "terraform"
@@ -30,7 +29,6 @@ def get_settings() -> Settings:
         openrouter_model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
         allowed_origins=tuple(value.strip() for value in origins.split(",") if value.strip()),
         runtime_dir=BACKEND_ROOT / "runtime",
-        deployment_enabled=os.getenv("DEPLOYMENT_ENABLED", "false").lower() == "true",
         aws_profile=os.getenv("AWS_PROFILE", "whs-team"),
         aws_region=os.getenv("AWS_REGION", "us-east-1"),
         terraform_dir=PROJECT_ROOT / "infra" / "terraform",

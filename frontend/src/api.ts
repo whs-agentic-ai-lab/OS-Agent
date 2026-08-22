@@ -33,11 +33,14 @@ export function getDeployment(): Promise<DeploymentStatus> {
   return request<DeploymentStatus>("/api/deployments/current");
 }
 
-export function createDeployment(): Promise<DeploymentStatus> {
+export function createDeployment(environmentName: string): Promise<DeploymentStatus> {
   return request<DeploymentStatus>("/api/deployments", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ confirmation: "DEPLOY_FIXED_OS_ENVIRONMENT" }),
+    body: JSON.stringify({
+      confirmation: "DEPLOY_FIXED_OS_ENVIRONMENT",
+      environment_name: environmentName,
+    }),
   });
 }
 
@@ -49,13 +52,24 @@ export function initializeInfrastructure(): Promise<DeploymentStatus> {
   });
 }
 
-export function destroyInfrastructure(): Promise<DeploymentStatus> {
+export function destroyInfrastructure(environmentId: string): Promise<DeploymentStatus> {
   return request<DeploymentStatus>("/api/deployments/destroy", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       confirmation: "DESTROY_FIXED_OS_ENVIRONMENT",
-      environment_name: "os-agent-test",
+      environment_id: environmentId,
+    }),
+  });
+}
+
+export function terminateInstance(instanceId: string): Promise<DeploymentStatus> {
+  return request<DeploymentStatus>("/api/deployments/instances/terminate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      confirmation: "TERMINATE_OS_AGENT_INSTANCE",
+      instance_id: instanceId,
     }),
   });
 }
@@ -64,11 +78,14 @@ export function getTunnel(): Promise<TunnelStatus> {
   return request<TunnelStatus>("/api/tunnel");
 }
 
-export function startTunnel(): Promise<TunnelStatus> {
+export function startTunnel(instanceId: string): Promise<TunnelStatus> {
   return request<TunnelStatus>("/api/tunnel", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ confirmation: "START_FIXED_SSM_TUNNEL" }),
+    body: JSON.stringify({
+      confirmation: "START_FIXED_SSM_TUNNEL",
+      target_instance_id: instanceId,
+    }),
   });
 }
 
