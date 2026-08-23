@@ -8,8 +8,12 @@ services:
     environment:
       DEPLOYMENT_ENABLED: "false"
       ALLOWED_ORIGINS: "https://os-agent-dashboard.vercel.app"
+      HOST_SUPERVISOR_SOCKET: "/run/os-agent/host-supervisor.sock"
     volumes:
       - /opt/trial/runtime/data:/app/runtime
+      - /run/os-agent:/run/os-agent
+    group_add:
+      - "10006"
     networks:
       - control
       - egress

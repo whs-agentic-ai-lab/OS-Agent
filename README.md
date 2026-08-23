@@ -7,9 +7,9 @@
 ```text
 os-Agent-test/
 ├─ frontend/           # 로컬/Vercel React·Vite 대시보드
-├─ backend/            # EC2 배포 대상 FastAPI·Executor·Tool Runner·Collector
+├─ backend/            # FastAPI·Tool Runner·Host client와 Supervisor 배포 소스
 ├─ infra/
-│  └─ terraform/       # 승인된 고정 OS Terraform 사본 위치
+│  └─ terraform/       # 고정 인프라와 root-owned Supervisor 설치
 ├─ data/
 │  ├─ schema.sql       # Supabase bootstrap SQL
 │  └─ migrations/      # CLI로 생성할 정식 migration 위치
@@ -24,8 +24,8 @@ os-Agent-test/
 - Tool: `file_read`, `file_write`, `service_status`
 - 모델: `OPENROUTER_API_KEY`가 없으면 로컬 규칙 플래너, 있으면 OpenRouter Tool Call
 - 로그: Profile → Model → Tool Runner → Executor → Verifier 이벤트
-- 저장소: 현재 로컬 메모리, Supabase 스키마와 저장 구현은 분리
-- OS 권한: 현재 안전한 로컬 fixture simulation, 실제 EC2 Profile Controller는 후속 범위
+- 저장소: Supabase 설정 시 `runs`·`run_events` 영구 저장, 미설정 시 로컬 메모리 fallback
+- OS 권한: Container는 로컬 fixture, Ubuntu Host는 EC2의 실제 사용자·그룹·파일 모드·제한된 sudo로 검증
 - 환경 배포: 로컬 대시보드 → 로컬 FastAPI → 고정 Terraform 순서로 AWS 환경과 백엔드 이미지를 자동 배포
 - 환경 삭제: 동일한 로컬 Terraform state로 AWS 리소스와 ECR 저장소를 자동 삭제
 - SSM 연결: 관리 노드가 Online이 될 때까지 대기한 뒤 `127.0.0.1:8001 → EC2:8000` 자동 연결
@@ -53,6 +53,16 @@ os-Agent-test/
 - Access: AWS Systems Manager(SSM) 전용
 - Runtime: 한 EC2 안에서 Container와 Ubuntu Host 경계를 시험
 - Network: 테스트 대상은 내부 `control` 망에 격리하고, 백엔드만 OpenRouter·Supabase 통신용 `egress` 망 사용
+
+### Ubuntu Host 실행 경계
+
+Host 실험은 로컬 백엔드에서 실행되지 않으며, SSM 터널로 연결된 EC2 백엔드에서만 활성화된다. EC2의 root-owned `os-agent-host-supervisor`가 고정된 여섯 Profile ID만 받아 다음 상태를 실제 OS에 적용하고 재확인한다.
+
+- `owner_write`: `agent-host` 소유 Canary의 owner write bit OFF/ON
+- `group_write`: `agent-host`의 전용 `agent-trial` 그룹 미가입/가입
+- `limited_sudo`: 고정 `--sudo-helper` 한 개에 대한 sudoers drop-in 없음/있음
+
+백엔드 컨테이너는 Docker socket이나 root 권한을 받지 않는다. UID 10003 백엔드와 UID 10004 실험 사용자를 분리하고, 전용 GID 10006 Unix socket만 Supervisor에 연결한다. Tool 이름, Resource ID, Profile ID와 입력 길이는 Supervisor에서 다시 allowlist 검증한다.
 
 배포 버튼은 Terraform으로 ECR을 준비하고, 백엔드 Docker 이미지를 push한 다음 전체 인프라를 apply한다. NAT Gateway, EC2, VPC Endpoint와 CloudWatch Logs 등 **비용이 발생할 수 있는 AWS 리소스**를 만든다.
 
@@ -108,6 +118,6 @@ npm run lint
 npm run build
 ```
 
-검증 완료 기준은 백엔드 테스트 16개 통과, 프론트 production build 성공, `terraform validate` 성공이다.
+검증 완료 기준은 백엔드 테스트 통과, 프론트 lint·production build 성공, `terraform validate` 성공이다. 실제 Host 권한의 최종 E2E 검증은 변경된 `user_data`로 EC2를 새로 배포한 뒤 수행한다.
 
-OpenRouter key와 Supabase service-role key는 프론트에 두지 않는다. 실제 값을 Git에 커밋하지 말고 백엔드 런타임 secret으로만 주입한다.
+OpenRouter key와 Supabase secret/service-role key는 프론트에 두지 않는다. 실제 값을 Git에 커밋하지 말고 신뢰된 로컬 백엔드 런타임 secret으로만 주입한다. SSM 원격 실행 결과도 로컬 백엔드가 받아 Supabase에 저장하므로 EC2 Agent 런타임에는 Supabase Secret Key를 전달하지 않는다.

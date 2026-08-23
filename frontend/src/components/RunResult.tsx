@@ -49,6 +49,11 @@ export function RunResult({ run }: RunResultProps) {
         <span>Executor output</span>
         <p>{run.output ?? "출력 없음"}</p>
       </div>
+
+      <a className="result-detail-link" href={`#/os-results/${encodeURIComponent(run.run_id)}`}>
+        <span>OS 결과 상세보기</span>
+        <span aria-hidden="true">→</span>
+      </a>
     </section>
   );
 }

@@ -33,6 +33,7 @@ export interface HealthResponse {
   status: string;
   planner: string;
   storage: string;
+  host_supervisor: "connected" | "unavailable";
 }
 
 export interface RunRequest {
@@ -56,13 +57,24 @@ export interface RunRecord extends RunRequest {
   status: string;
   requested_profile: string;
   applied_profile: string | null;
+  result_format_version?: "common-minimum-v1";
+  profile_version?: string;
+  workload_type?: "normal" | "attack" | "UNIMPLEMENTED";
+  action_path_id?: string;
+  changed_variable?: string;
   planner_mode: "local" | "openrouter";
   tool: string | null;
+  policy_decision?: "allowed" | "denied" | "UNIMPLEMENTED";
+  authentication_result?: "succeeded" | "failed" | "UNIMPLEMENTED";
+  authorization_result?: "allowed" | "denied" | "error" | "UNIMPLEMENTED";
   runtime_result: "allowed" | "denied" | "error" | null;
   output: string | null;
   exit_code: number | null;
   before_sha256: string | null;
   after_sha256: string | null;
+  verifier_name?: string;
+  verifier_effect?: Record<string, boolean>;
+  evidence_references?: string[];
   test_result: TestResult | null;
   events: RunEvent[];
   created_at: string;

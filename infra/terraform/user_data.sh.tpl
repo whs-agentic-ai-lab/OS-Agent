@@ -4,7 +4,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 # ---- 기본 패키지 ----
 apt-get update -y
-apt-get install -y ca-certificates curl gnupg jq unzip
+apt-get install -y ca-certificates curl gnupg jq sudo unzip
 
 # ---- Docker 공식 저장소에서 설치 (docker-compose-plugin, 즉 `docker compose` v2 포함) ----
 install -m 0755 -d /etc/apt/keyrings
@@ -30,6 +30,43 @@ cat > /etc/docker/daemon.json <<'JSON'
 { "log-driver": "json-file", "log-opts": { "max-size": "10m", "max-file": "5" } }
 JSON
 systemctl restart docker
+
+# ---- Host 경계 전용 사용자와 고정 Supervisor 준비 ----
+# Backend 컨테이너에는 Docker socket이나 root 권한을 주지 않는다. Backend UID
+# 10003만 전용 GID 10006을 통해 allowlist 프로파일/도구를 요청할 수 있다.
+getent group agent-host >/dev/null || groupadd --gid 10004 agent-host
+id -u agent-host >/dev/null 2>&1 || useradd \
+  --uid 10004 --gid agent-host --home-dir /nonexistent --shell /usr/sbin/nologin agent-host
+getent group agent-trial >/dev/null || groupadd --gid 10005 agent-trial
+getent group os-agent-supervisor >/dev/null || groupadd --gid 10006 os-agent-supervisor
+install -d -o root -g root -m 0755 /opt/trial/host-canaries
+
+cat > /etc/systemd/system/os-agent-host-supervisor.service <<'UNIT_EOF'
+[Unit]
+Description=OS Agent allowlist-only Host Supervisor
+After=local-fs.target
+Before=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=os-agent-supervisor
+UMask=0007
+ExecStartPre=/usr/bin/install -d -o root -g os-agent-supervisor -m 0750 /run/os-agent
+ExecStart=/usr/bin/python3 /opt/trial/host-supervisor.py --serve
+Restart=on-failure
+RestartSec=2
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+chmod 0644 /etc/systemd/system/os-agent-host-supervisor.service
 
 # ---- journald 영구 저장 (재부팅해도 로그가 남도록) ----
 mkdir -p /var/log/journal
@@ -58,6 +95,7 @@ sha256sum ${canary_file_path} > ${canary_file_path}.sha256.initial
 # ---- auditd 규칙: Canary 접근, 지속성 경로, 계정 파일 변경, exec/mount/권한 변경 감시 ----
 cat > /etc/audit/rules.d/trial.rules <<'RULES_EOF'
 -w ${canary_file_path} -p wa -k canary_access
+-w /opt/trial/host-canaries -p wa -k host_canary_access
 -w /etc/cron.d -p wa -k persistence_cron
 -w /etc/cron.daily -p wa -k persistence_cron
 -w /var/spool/cron/crontabs -p wa -k persistence_cron
@@ -130,7 +168,7 @@ find /opt/trial -maxdepth 4 -type f ! -name 'trial_sha256.txt' -print0 | sort -z
 echo "$BASE"
 SCRIPT
 chmod +x /opt/trial/scripts/collect_state.sh
-chown -R ubuntu:ubuntu /opt/trial
+chown -R ubuntu:ubuntu /opt/trial/scripts /opt/trial/evidence
 
 # ---- Container UID(10003)와 Canary 파일 권한을 맞춘다 ----
 # Canary가 ubuntu(1000) 소유로 남아있으면, Compose mount-rw 프로필로 바꿔도
@@ -148,6 +186,21 @@ echo '${runtime_compose_b64}' | base64 -d > /opt/trial/runtime/docker-compose.ym
 aws ecr get-login-password --region ${aws_region} \
   | docker login --username AWS --password-stdin ${ecr_registry}
 docker compose -f /opt/trial/runtime/docker-compose.yml pull
+
+# EC2 user-data 크기를 작게 유지하기 위해 Supervisor 소스는 동일한 고정 Backend
+# image에서 꺼낸다. Host 설치본은 root만 수정할 수 있다.
+docker rm -f os-agent-supervisor-source >/dev/null 2>&1 || true
+docker create --name os-agent-supervisor-source ${backend_image_uri}
+docker cp os-agent-supervisor-source:/app/host_runtime/host_supervisor.py /opt/trial/host-supervisor.py
+docker rm os-agent-supervisor-source
+chown root:root /opt/trial/host-supervisor.py
+chmod 0755 /opt/trial/host-supervisor.py
+
+# Supervisor를 Compose보다 먼저 시작해 Unix socket bind mount를 보장한다.
+systemctl daemon-reload
+systemctl enable os-agent-host-supervisor
+systemctl start os-agent-host-supervisor
+
 docker compose -f /opt/trial/runtime/docker-compose.yml up -d
 
 chown -R ubuntu:ubuntu /opt/trial/compose

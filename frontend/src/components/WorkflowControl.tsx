@@ -4,6 +4,7 @@ import type { DeploymentStatus, RunRecord, TunnelStatus, WorkflowNode, WorkflowN
 
 interface WorkflowControlProps {
   deployment: DeploymentStatus | null;
+  environmentName: string;
   deploymentActionError: string | null;
   tunnelActionError: string | null;
   tunnel: TunnelStatus | null;
@@ -15,7 +16,8 @@ interface WorkflowControlProps {
   backendError: string | null;
   run: RunRecord | null;
   runError: string | null;
-  onDeploy: () => void;
+  onDeploy: (environmentName: string) => void;
+  onEnvironmentNameChange: (environmentName: string) => void;
   onStartTunnel: () => void;
   onStopTunnel: () => void;
   onFocusExperiment: () => void;
@@ -117,6 +119,7 @@ function deploymentNodes(deployment: DeploymentStatus | null, actionError: strin
 
 export function WorkflowControl({
   deployment,
+  environmentName,
   deploymentActionError,
   tunnelActionError,
   tunnel,
@@ -129,6 +132,7 @@ export function WorkflowControl({
   run,
   runError,
   onDeploy,
+  onEnvironmentNameChange,
   onStartTunnel,
   onStopTunnel,
   onFocusExperiment,
@@ -219,6 +223,8 @@ export function WorkflowControl({
   const selected = nodes.find((node) => node.id === selectedId) ?? nodes[0];
   const completedCount = nodes.filter((node) => node.status === "succeeded").length;
   const failedCount = nodes.filter((node) => node.status === "failed" || node.status === "blocked").length;
+  const validEnvironmentName = /^[a-z0-9](?:[a-z0-9-]{1,14}[a-z0-9])$/.test(environmentName);
+  const deploymentReady = Object.values(deployment?.prerequisites ?? {}).every(Boolean);
 
   function saveOverrides(next: WorkflowOverrides) {
     setOverrides(next);
@@ -323,9 +329,29 @@ export function WorkflowControl({
 
         <div className="workflow-context-action">
           {selected.id === "image" || selected.id === "terraform" || selected.id === "runtime" ? (
-            <button disabled={isStartingDeployment || deployment?.status === "running"} onClick={onDeploy} type="button">
-              {deployment?.status === "failed" ? "배포 다시 실행" : "환경 배포 실행"}
-            </button>
+            <div className="workflow-deploy-action">
+              <label htmlFor="workflow-environment-name">환경 이름</label>
+              <input
+                autoComplete="off"
+                id="workflow-environment-name"
+                maxLength={16}
+                onChange={(event) => onEnvironmentNameChange(event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ""))}
+                placeholder="permission-test"
+                value={environmentName}
+              />
+              <button
+                disabled={
+                  !deploymentReady ||
+                  !validEnvironmentName ||
+                  isStartingDeployment ||
+                  deployment?.status === "running"
+                }
+                onClick={() => onDeploy(environmentName)}
+                type="button"
+              >
+                {deployment?.status === "failed" ? "배포 다시 실행" : "환경 배포 실행"}
+              </button>
+            </div>
           ) : null}
           {selected.id === "test" ? <button onClick={onFocusExperiment} type="button">실험 구성으로 이동</button> : null}
           {selected.id === "tunnel" ? (

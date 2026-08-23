@@ -1,17 +1,19 @@
-import { useState } from "react";
-
 import type { DeploymentState, DeploymentStatus, TunnelStatus } from "../types";
 
 interface DeploymentPanelProps {
   deployment: DeploymentStatus | null;
+  environmentName: string;
   actionError: string | null;
   isStarting: boolean;
+  isStartingTunnel: boolean;
   onDeploy: (environmentName: string) => void;
+  onEnvironmentNameChange: (environmentName: string) => void;
   onDestroy: (environmentId: string) => void;
   onInitialize: () => void;
   onRefresh: () => void;
   onSelectInstance: (instanceId: string) => void;
   onStartTunnel: () => void;
+  onStopTunnel: () => void;
   onTerminateInstance: (instanceId: string) => void;
   selectedInstanceId: string | null;
   tunnel: TunnelStatus | null;
@@ -47,19 +49,22 @@ function statusLabel(deployment: DeploymentStatus | null): string {
 
 export function DeploymentPanel({
   deployment,
+  environmentName,
   actionError,
   isStarting,
+  isStartingTunnel,
   onDeploy,
+  onEnvironmentNameChange,
   onDestroy,
   onInitialize,
   onRefresh,
   onSelectInstance,
   onStartTunnel,
+  onStopTunnel,
   onTerminateInstance,
   selectedInstanceId,
   tunnel,
 }: DeploymentPanelProps) {
-  const [environmentName, setEnvironmentName] = useState("");
   const status = deployment?.status ?? "not_ready";
   const prerequisites = deployment?.prerequisites ?? {};
   const isBusy = status === "running" || isStarting;
@@ -79,6 +84,11 @@ export function DeploymentPanel({
     selectedInstance &&
       tunnel?.target_instance_id === selectedInstance.instance_id &&
       ["installing", "starting", "connected"].includes(tunnel.status),
+  );
+  const selectedInstanceTunnelConnected = Boolean(
+    selectedInstance &&
+      tunnel?.target_instance_id === selectedInstance.instance_id &&
+      tunnel.status === "connected",
   );
   const canDestroy = Boolean(
     prerequisites.terraform &&
@@ -134,7 +144,7 @@ export function DeploymentPanel({
                 autoComplete="off"
                 id="environment-name"
                 maxLength={16}
-                onChange={(event) => setEnvironmentName(event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ""))}
+                onChange={(event) => onEnvironmentNameChange(event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ""))}
                 placeholder="permission-test"
                 value={environmentName}
               />
@@ -210,14 +220,34 @@ export function DeploymentPanel({
         )}
 
         <div className="instance-actions">
-          <button
-            className="infrastructure-button is-primary"
-            disabled={!selectedInstance || selectedInstance.state !== "running" || tunnel?.status === "connected"}
-            onClick={onStartTunnel}
-            type="button"
-          >
-            선택 EC2 SSM 연결
-          </button>
+          {selectedInstanceTunnelConnected ? (
+            <button
+              className="infrastructure-button is-secondary"
+              disabled={isStartingTunnel}
+              onClick={onStopTunnel}
+              type="button"
+            >
+              {isStartingTunnel ? "SSM 연결 종료 중" : "SSM 연결 종료"}
+            </button>
+          ) : (
+            <button
+              className="infrastructure-button is-primary"
+              disabled={
+                !selectedInstance ||
+                selectedInstance.state !== "running" ||
+                isStartingTunnel ||
+                tunnel?.status === "connected" ||
+                tunnel?.status === "installing" ||
+                tunnel?.status === "starting"
+              }
+              onClick={onStartTunnel}
+              type="button"
+            >
+              {tunnel?.status === "installing" || tunnel?.status === "starting"
+                ? "SSM 연결 중"
+                : "선택 EC2 SSM 연결"}
+            </button>
+          )}
           <button
             className="infrastructure-button is-danger"
             disabled={!canDestroy || !selectedInstance || selectedInstanceHasTunnel}

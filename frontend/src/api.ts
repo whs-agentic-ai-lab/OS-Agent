@@ -29,6 +29,10 @@ export function createRun(payload: RunRequest, remote = false): Promise<RunRecor
   });
 }
 
+export function getRun(runId: string, remote = false): Promise<RunRecord> {
+  return request<RunRecord>(agentPath(`/api/runs/${encodeURIComponent(runId)}`, remote));
+}
+
 export function getDeployment(): Promise<DeploymentStatus> {
   return request<DeploymentStatus>("/api/deployments/current");
 }
