@@ -72,7 +72,7 @@ variable "trial_ec2_count" {
 variable "enable_flow_logs" {
   description = "VPC Flow Logs 활성화 여부"
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "golden_ami_id" {

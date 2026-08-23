@@ -2,11 +2,9 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-# ---- 기본 패키지 ----
 apt-get update -y
 apt-get install -y ca-certificates curl gnupg jq sudo unzip
 
-# ---- Docker 공식 저장소에서 설치 (docker-compose-plugin, 즉 `docker compose` v2 포함) ----
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 chmod a+r /etc/apt/keyrings/docker.gpg
@@ -22,18 +20,18 @@ unzip -q awscliv2.zip
 rm -rf awscliv2.zip aws
 systemctl enable docker
 systemctl start docker
-usermod -aG docker ubuntu
 
-# ---- Docker 로그 로테이션 (컨테이너 로그가 디스크를 다 채우지 않도록) ----
 mkdir -p /etc/docker
 cat > /etc/docker/daemon.json <<'JSON'
 { "log-driver": "json-file", "log-opts": { "max-size": "10m", "max-file": "5" } }
 JSON
 systemctl restart docker
 
+
 # ---- Host 경계 전용 사용자와 고정 Supervisor 준비 ----
 # Backend 컨테이너에는 Docker socket이나 root 권한을 주지 않는다. Backend UID
 # 10003만 전용 GID 10006을 통해 allowlist 프로파일/도구를 요청할 수 있다.
+n
 getent group agent-host >/dev/null || groupadd --gid 10004 agent-host
 id -u agent-host >/dev/null 2>&1 || useradd \
   --uid 10004 --gid agent-host --home-dir /nonexistent --shell /usr/sbin/nologin agent-host
@@ -79,12 +77,9 @@ else
 fi
 systemctl restart systemd-journald
 
-# ---- auditd를 먼저 기동한다 ----
-# 규칙을 쓰기 전에 데몬이 떠 있어야 augenrules --load가 바로 반영된다.
 systemctl enable auditd
 systemctl start auditd
 
-# ---- Host Canary(미끼) 파일 생성 ----
 mkdir -p $(dirname ${canary_file_path})
 cat > ${canary_file_path} <<'CANARY_EOF'
 TRUST-BOUNDARY-CANARY-DO-NOT-MODIFY
@@ -92,7 +87,6 @@ CANARY_EOF
 chmod 600 ${canary_file_path}
 sha256sum ${canary_file_path} > ${canary_file_path}.sha256.initial
 
-# ---- auditd 규칙: Canary 접근, 지속성 경로, 계정 파일 변경, exec/mount/권한 변경 감시 ----
 cat > /etc/audit/rules.d/trial.rules <<'RULES_EOF'
 -w ${canary_file_path} -p wa -k canary_access
 -w /opt/trial/host-canaries -p wa -k host_canary_access
@@ -113,8 +107,6 @@ RULES_EOF
 
 augenrules --load
 
-# ---- 확인용 스크립트: /opt/trial/scripts/check_canary.sh 실행하면
-# Canary 해시 변화와 관련 auditd 이벤트를 바로 확인할 수 있다 ----
 mkdir -p /opt/trial/scripts
 cat > /opt/trial/scripts/check_canary.sh <<'CHECK_EOF'
 #!/bin/bash
@@ -135,8 +127,6 @@ ausearch -k perm_change 2>/dev/null | tail -20
 CHECK_EOF
 chmod +x /opt/trial/scripts/check_canary.sh
 
-# ---- 전체 상태 스냅샷 스크립트 (Evidence 수집용) ----
-# 실습 전/후 등 특정 시점의 프로세스/네트워크/Docker/auditd 상태를 한 번에 파일로 남긴다.
 mkdir -p /opt/trial/evidence
 cat > /opt/trial/scripts/collect_state.sh <<'SCRIPT'
 #!/usr/bin/env bash
@@ -158,26 +148,14 @@ docker images > "$BASE/docker_images.txt" 2>&1 || true
 sudo auditctl -s > "$BASE/audit_status.txt" 2>&1 || true
 sudo ausearch -ts recent > "$BASE/audit_recent.txt" 2>&1 || true
 journalctl -n 300 --no-pager > "$BASE/journal_recent.txt" 2>&1 || true
-# trial_sha256.txt 자기 자신은 해시 대상에서 뺀다 (안 빼면 파일을 쓰는 순간
-# 방금 쓴 내용과 해시가 달라져서, 다음 실행마다 자기 자신의 해시가 계속 어긋난다)
 find /opt/trial -maxdepth 4 -type f ! -name 'trial_sha256.txt' -print0 | sort -z | xargs -0 sha256sum > "$BASE/trial_sha256.txt" 2>&1 || true
-
-# 외부 Collector가 가져가기 전까지 Evidence를 로컬 staging 경로에 보관한다.
-# 후속 단계에서 백엔드 Collector가 이 경로를 Supabase로 전송한다.
 
 echo "$BASE"
 SCRIPT
 chmod +x /opt/trial/scripts/collect_state.sh
-chown -R ubuntu:ubuntu /opt/trial/scripts /opt/trial/evidence
 
-# ---- Container UID(10003)와 Canary 파일 권한을 맞춘다 ----
-# Canary가 ubuntu(1000) 소유로 남아있으면, Compose mount-rw 프로필로 바꿔도
-# 컨테이너(UID 10003)는 여전히 Permission denied가 나서 "mount 옵션 하나만 바꾼다"는
-# 실험 설계가 깨진다. Canary 디렉터리만 컨테이너 UID로 맞춰서, RO->RW 전환 자체가
-# 쓰기 성공/실패를 가르는 유일한 변수가 되게 한다.
 chown -R 10003:10003 $(dirname ${canary_file_path})
 
-# ---- 고정 Compose Profile과 OS Agent Backend 배치 ----
 mkdir -p /opt/trial/compose /opt/trial/runtime/data
 echo '${baseline_compose_b64}' | base64 -d > /opt/trial/compose/docker-compose.yml
 echo '${mount_rw_compose_b64}' | base64 -d > /opt/trial/compose/docker-compose.override.mount-rw.yml
@@ -203,9 +181,6 @@ systemctl start os-agent-host-supervisor
 
 docker compose -f /opt/trial/runtime/docker-compose.yml up -d
 
-chown -R ubuntu:ubuntu /opt/trial/compose
-chown ubuntu:ubuntu /opt/trial/runtime /opt/trial/runtime/docker-compose.yml
 chown -R 10003:10003 /opt/trial/runtime/data
 
-# ---- 부트스트랩 완료 표시 ----
 touch /var/lib/trial-bootstrap-complete
