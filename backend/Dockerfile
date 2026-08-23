@@ -9,10 +9,11 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY host_runtime ./host_runtime
 
-RUN useradd --uid 10003 --create-home agent-runtime
+RUN groupadd --gid 10003 agent-runtime \
+    && useradd --uid 10003 --gid 10003 --create-home agent-runtime
 USER agent-runtime
 
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
-

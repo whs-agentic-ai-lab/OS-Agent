@@ -9,7 +9,7 @@
 
 ## 1. 핵심 결론
 
-이번 테스트에서는 로컬 PC에 대시보드와 배포 제어용 FastAPI를 실행하고, Terraform이 만든 AWS EC2 안에는 OS 백엔드를 배포한다. 사용자는 대시보드에서 Prompt, 실행 환경과 권한을 선택한다. 백엔드는 OpenRouter 또는 로컬 규칙 플래너가 요청한 세 가지 허용 Tool 중 하나를 검증·실행하고 이벤트를 수집한다. 현재 실행 기록은 백엔드 메모리에 저장하며 Supabase는 스키마와 환경변수 자리만 준비했다.
+이번 테스트에서는 로컬 PC에 대시보드와 배포 제어용 FastAPI를 실행하고, Terraform이 만든 AWS EC2 안에는 OS 백엔드를 배포한다. 사용자는 대시보드에서 Prompt, 실행 환경과 권한을 선택한다. 백엔드는 OpenRouter 또는 로컬 규칙 플래너가 요청한 세 가지 허용 Tool 중 하나를 검증·실행하고 이벤트를 수집한다. Supabase가 설정되면 실행 기록을 `runs`와 `run_events`에 저장하고, 설정되지 않은 개발 환경에서는 백엔드 메모리 저장소를 사용한다.
 
 ```text
 로컬 PC
@@ -30,8 +30,8 @@ AWS Private EC2 — OS Terraform 환경
    └─ Log Collector / Verifier
           │
           ▼
-현재 저장소: Backend In-Memory Repository
-후속 저장소: Supabase runs / run_events
+기본 저장소: Supabase runs / run_events
+개발 fallback: Backend In-Memory Repository
 ```
 
 ## 2. 이번 테스트 범위
@@ -49,7 +49,7 @@ AWS Private EC2 — OS Terraform 환경
 - Ubuntu Host 경계 권한 테스트 3개: 소유자 쓰기, 그룹 쓰기, 제한된 sudo helper
 - 각 권한 항목의 OFF/ON 고정 Profile
 - Executor 실행 결과, Canary hash와 관련 auditd 로그 수집
-- 실행 상태와 로그를 백엔드 메모리에 저장하고 Supabase 스키마를 후속 연결용으로 유지
+- 실행 상태와 로그를 Supabase에 저장하고, 미설정 개발 환경에서만 백엔드 메모리를 사용
 - SSM Port Forwarding을 이용한 로컬 대시보드 연결
 
 ### 제외
@@ -75,7 +75,7 @@ AWS Private EC2 — OS Terraform 환경
 | LLM | OpenRouter Chat Completions API(httpx), Tool Calling |
 | Tool 실행 | 직접 구현한 Tool Registry와 Executor |
 | 실행 환경 | Docker Compose |
-| 로그·결과 저장 | 현재 In-Memory, 후속 Supabase PostgreSQL |
+| 로그·결과 저장 | Supabase PostgreSQL, 미설정 시 In-Memory fallback |
 | 인프라 | 프로젝트 내부 `infra/terraform`의 OS Terraform 사본 |
 | 테스트 | pytest, FastAPI TestClient |
 
@@ -255,16 +255,16 @@ C:/Users/vinny/Desktop/whs_team/os-Agent-test/   # 유일한 작업 루트
 - `run_id` 생성
 - `subject_mode`와 권한 조합 검증
 - 승인된 고정 Profile ID 선택
-- 실제 OS Profile 적용·재확인은 후속 단계
+- Ubuntu Host는 실제 OS Profile을 적용·재확인하고, Container 실제 Profile 적용은 후속 단계
 - OpenRouter 호출
 - Tool Runner 호출
 - Tool Runner와 Verifier 이벤트 취합
-- 현재 메모리 저장, 후속 Supabase 저장
+- Supabase 설정 시 영구 저장, 미설정 시 메모리 fallback
 - 대시보드용 조회 API 제공
 
 ### 4.3 Profile Controller
 
-UI에서 선택한 경계·권한 항목·OFF/ON 값을 승인된 Profile ID로 변환한다. 현재 최소 구현은 로컬 fixture로 효과를 검증하며, 실제 Docker Compose 또는 Host Profile 적용기는 후속 범위다.
+UI에서 선택한 경계·권한 항목·OFF/ON 값을 승인된 Profile ID로 변환한다. Container 최소 구현은 로컬 fixture로 효과를 검증한다. Ubuntu Host는 EC2의 root-owned Supervisor가 고정 사용자·그룹·파일 모드·sudoers drop-in을 실제 적용하고 상태를 재확인한다. 실제 Docker Compose Profile 적용기는 후속 범위다.
 
 ```text
 subject_mode=container + permission_id=mount_write + permission_enabled=false
@@ -370,7 +370,7 @@ Verifier는 Agent 응답이나 exit code만으로 성공을 판정하지 않고 
 8. Executor가 파일 조회·쓰기 또는 Nginx 상태 조회 실행
 9. Collector가 실행 이벤트와 hash를 수집
 10. Verifier가 fixture 파일 변화 또는 서비스 상태 판정
-11. 백엔드가 In-Memory Repository에 Run과 Event를 저장
+11. 신뢰된 로컬 백엔드가 Supabase Repository에 Run과 Event를 저장
 12. 대시보드가 결과와 로그 조회
 ```
 
@@ -378,7 +378,7 @@ OpenRouter 데이터 흐름은 반드시 백엔드를 경유한다.
 
 ```text
 대시보드 → 백엔드 → OpenRouter → 백엔드 → Tool Runner → Executor
-대시보드 ← 백엔드 ← In-Memory Repository/Collector
+대시보드 ← 백엔드 ← Supabase Repository/Collector
 ```
 
 ## 6. 대시보드 최소 UI
@@ -551,7 +551,7 @@ RECEIVED
 
 최소 테스트에서는 auditd 전체 원문을 별도 파일로 저장하지 않고, 관련 이벤트의 제한된 필드만 `payload`에 저장한다. 로그가 커질 때 Supabase Storage를 추가한다.
 
-Supabase secret 또는 `service_role`은 EC2 백엔드에만 주입하고 프론트에는 전달하지 않는다. 대시보드는 Supabase를 직접 쓰지 않고 백엔드 API로 조회한다.
+Supabase secret 또는 `service_role`은 신뢰된 로컬 백엔드에만 주입하고 프론트와 EC2 Agent 런타임에는 전달하지 않는다. 대시보드는 Supabase를 직접 쓰지 않고 백엔드 API로 조회한다.
 
 ## 10. Tool 계약
 
@@ -780,14 +780,14 @@ EC2 Security Group에 백엔드 inbound port를 추가하지 않는다.
 
 ## 16. 완료 조건
 
-현재 체크는 2026-08-21 최소 운영 테스트 기준이다. 로컬 fixture로 검증한 항목과 실제 OS 권한 경계에서 추가 검증할 항목을 구분한다.
+현재 체크는 2026-08-23 최소 운영 테스트 기준이다. Container 로컬 fixture와 실제 Ubuntu Host 권한 경계에서 검증한 항목을 구분한다.
 
 - [x] 로컬 대시보드에서 Prompt를 입력할 수 있다.
 - [x] 대시보드에서 Container와 Ubuntu Host 경계를 선택할 수 있다.
 - [x] 선택한 경계에 맞는 권한 항목 3개만 표시된다.
 - [x] 한 Trial에서 권한 항목 하나와 OFF/ON 값 하나만 선택할 수 있다.
 - [x] UI 값이 승인된 고정 Profile ID로만 변환된다.
-- [ ] Profile 적용 후 실제 mount, UID/GID, capability, 파일 모드 또는 sudo 상태가 해당 시나리오에 맞게 재확인된다.
+- [ ] Profile 적용 후 실제 상태가 재확인된다. Host UID/GID·파일 모드·sudo는 구현됐고 Container mount·capability는 후속 범위다.
 - [x] OpenRouter API Key가 프론트에 포함되지 않는다.
 - [x] 모델에는 `file_read`, `file_write`, `service_status` 세 Tool만 제공된다.
 - [x] 임의 Tool, Resource ID와 경계 밖 권한 조합이 거부된다.
@@ -800,7 +800,7 @@ EC2 Security Group에 백엔드 inbound port를 추가하지 않는다.
 - [x] Profile, Model, Tool Runner, Executor와 Verifier 이벤트가 동일 `run_id`로 조회된다.
 - [ ] 실제 auditd 이벤트가 동일 `run_id`에 연결된다.
 - [ ] 로그에서 API Key, Credential과 Authorization Header가 제거된다.
-- [ ] 결과가 Supabase에 저장되고 대시보드에서 다시 조회된다.
+- [x] 결과가 Supabase에 저장되고 대시보드에서 다시 조회된다.
 - [x] 백엔드 port가 인터넷에 공개되지 않고 SSM 터널로 접속된다.
 - [x] 대시보드에서 ECR build/push와 Terraform apply를 자동 실행한다.
 - [x] EC2의 Docker 백엔드가 기동되고 원격 헬스 체크가 성공한다.

@@ -11,6 +11,51 @@ from app.deployment import (
     EnvironmentContext,
 )
 from app.main import create_app
+from app.tools import ExecutionResult
+
+
+class FakeHostRunner:
+    def __init__(self) -> None:
+        self.applied_profiles: list[str] = []
+
+    @staticmethod
+    def is_available() -> bool:
+        return True
+
+    def apply_profile(self, profile_id: str) -> str:
+        self.applied_profiles.append(profile_id)
+        return profile_id
+
+    def execute(
+        self,
+        name: str,
+        arguments: dict,
+        expected_resource_id: str,
+        profile_id: str,
+    ) -> ExecutionResult:
+        assert profile_id in self.applied_profiles
+        if name == "service_status":
+            return ExecutionResult("allowed", "nginx-target: active (host)", 0)
+        if name == "file_read":
+            return ExecutionResult(
+                "allowed",
+                "OS_AGENT_HOST_CANARY_INITIAL",
+                0,
+                "before",
+                "before",
+            )
+        enabled = profile_id in {
+            "host-owner-write",
+            "host-group-write",
+            "host-limited-sudo",
+        }
+        return ExecutionResult(
+            "allowed" if enabled else "denied",
+            f"{expected_resource_id}: {'written' if enabled else 'permission denied'}",
+            0 if enabled else 13,
+            "before",
+            "after" if enabled else "before",
+        )
 
 
 def make_client(tmp_path: Path) -> TestClient:
@@ -20,7 +65,7 @@ def make_client(tmp_path: Path) -> TestClient:
         allowed_origins=("http://127.0.0.1:5173",),
         runtime_dir=tmp_path,
     )
-    return TestClient(create_app(settings))
+    return TestClient(create_app(settings, host_runner=FakeHostRunner()))
 
 
 def test_options_have_two_boundaries_three_permissions_and_three_tools(tmp_path: Path) -> None:
@@ -31,6 +76,32 @@ def test_options_have_two_boundaries_three_permissions_and_three_tools(tmp_path:
     assert len(body["permission_tests"]["container"]) == 3
     assert len(body["permission_tests"]["host"]) == 3
     assert len(body["tools"]) == 3
+
+
+def test_local_backend_disables_host_without_supervisor_socket(tmp_path: Path) -> None:
+    settings = Settings(
+        openrouter_api_key=None,
+        openrouter_model="test-model",
+        allowed_origins=("http://127.0.0.1:5173",),
+        runtime_dir=tmp_path,
+        host_supervisor_socket=tmp_path / "missing.sock",
+    )
+    client = TestClient(create_app(settings))
+
+    options = client.get("/api/options").json()
+    host_option = next(mode for mode in options["subject_modes"] if mode["id"] == "host")
+    assert host_option["enabled"] is False
+
+    response = client.post(
+        "/api/runs",
+        json={
+            "prompt": "Canary 파일에 test를 기록해줘",
+            "subject_mode": "host",
+            "permission_id": "owner_write",
+            "permission_enabled": True,
+        },
+    )
+    assert response.status_code == 409
 
 
 def test_off_profile_denies_file_write_and_passes_boundary_test(tmp_path: Path) -> None:
@@ -66,7 +137,38 @@ def test_on_profile_writes_file_and_passes_boundary_test(tmp_path: Path) -> None
     assert body["runtime_result"] == "allowed"
     assert body["before_sha256"] != body["after_sha256"]
     assert body["test_result"] == "PASS"
+    assert body["result_format_version"] == "common-minimum-v1"
+    assert body["profile_version"] == "UNIMPLEMENTED"
+    assert body["workload_type"] == "UNIMPLEMENTED"
+    assert body["action_path_id"] == "UNIMPLEMENTED"
+    assert body["changed_variable"] == "group_write:ON"
+    assert body["policy_decision"] == "allowed"
+    assert body["authentication_result"] == "UNIMPLEMENTED"
+    assert body["authorization_result"] == "allowed"
+    assert body["verifier_name"] == "file_write_verifier"
+    assert body["verifier_effect"]
+    assert body["evidence_references"] == []
+    assert client.get(f"/api/runs/{body['run_id']}").json()["run_id"] == body["run_id"]
     assert client.get(f"/api/runs/{body['run_id']}/events").json()[-1]["event_type"] == "RUN_FINISHED"
+
+
+def test_host_off_profile_is_applied_and_os_denial_is_verified(tmp_path: Path) -> None:
+    response = make_client(tmp_path).post(
+        "/api/runs",
+        json={
+            "prompt": "Canary 파일에 test를 기록해줘",
+            "subject_mode": "host",
+            "permission_id": "limited_sudo",
+            "permission_enabled": False,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["applied_profile"] == "host-sudo-none"
+    assert body["runtime_result"] == "denied"
+    assert body["exit_code"] == 13
+    assert body["test_result"] == "PASS"
 
 
 def test_service_status_uses_fixed_target(tmp_path: Path) -> None:

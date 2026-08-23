@@ -11,12 +11,14 @@
 - Network: Private Subnet, public inbound 없음
 - Access: SSM only
 - Runtime: 같은 EC2의 Container와 Ubuntu Host 경계
-- Services: OS Agent Backend, `nginx-target`
+- Services: OS Agent Backend, root-owned Host Supervisor, `nginx-target`
 - Runtime Network: `nginx-target`은 내부 `control` 망에만 연결하고, Backend는 호스트 loopback 게시와 외부 API 호출을 위해 별도 `egress` 망에도 연결
 
 저장·로그 정책:
 
 - Backend Docker image는 ECR에 저장하고 EC2 IAM Role로 pull한다.
+- Host Supervisor는 public/TCP port 없이 `/run/os-agent/host-supervisor.sock`에서만 요청을 받는다.
+- 백엔드 UID와 Host 실험 사용자 UID를 분리하며, 실험 사용자는 Supervisor socket에 접근할 수 없다.
 - S3 리소스는 생성하지 않는다.
 - VPC Flow Logs는 CloudWatch Logs에 저장한다.
 - `collect_state.sh` Evidence는 Supabase Collector 연동 전까지 EC2 로컬 staging 경로에만 저장한다.

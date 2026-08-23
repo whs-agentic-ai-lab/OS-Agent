@@ -72,15 +72,25 @@ class RunRecord(BaseModel):
     permission_enabled: bool
     requested_profile: str
     applied_profile: str | None = None
+    result_format_version: Literal["common-minimum-v1"] = "common-minimum-v1"
+    profile_version: str = "UNIMPLEMENTED"
+    workload_type: Literal["normal", "attack", "UNIMPLEMENTED"] = "UNIMPLEMENTED"
+    action_path_id: str = "UNIMPLEMENTED"
+    changed_variable: str = "UNIMPLEMENTED"
     planner_mode: Literal["local", "openrouter"]
     tool: str | None = None
+    policy_decision: Literal["allowed", "denied", "UNIMPLEMENTED"] = "UNIMPLEMENTED"
+    authentication_result: Literal["succeeded", "failed", "UNIMPLEMENTED"] = "UNIMPLEMENTED"
+    authorization_result: Literal["allowed", "denied", "error", "UNIMPLEMENTED"] = "UNIMPLEMENTED"
     runtime_result: Literal["allowed", "denied", "error"] | None = None
     output: str | None = None
     exit_code: int | None = None
     before_sha256: str | None = None
     after_sha256: str | None = None
+    verifier_name: str = "UNIMPLEMENTED"
+    verifier_effect: dict[str, bool] = Field(default_factory=dict)
+    evidence_references: list[str] = Field(default_factory=list)
     test_result: Literal["PASS", "FAIL", "INCONCLUSIVE"] | None = None
     events: list[RunEvent] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
-

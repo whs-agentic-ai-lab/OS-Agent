@@ -15,23 +15,33 @@ from .deployment import (
     TerminateInstanceRequest,
 )
 from .executor import AgentExecutor
+from .host_client import HostRunner, HostSupervisorClient
 from .planner import LocalPlanner, OpenRouterPlanner
-from .repository import InMemoryRunRepository
+from .repository import create_run_repository
 from .schemas import OptionsResponse, RunEvent, RunRecord, RunRequest
 from .tools import ToolRunner
 from .tunnel import SsmTunnelManager, TunnelRequest, TunnelStatus, TunnelStopRequest
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    host_runner: HostRunner | None = None,
+) -> FastAPI:
     active_settings = settings or get_settings()
-    repository = InMemoryRunRepository()
+    repository = create_run_repository(
+        active_settings.supabase_url,
+        active_settings.supabase_secret_key,
+    )
     tool_runner = ToolRunner(active_settings.runtime_dir)
     planner = (
         OpenRouterPlanner(active_settings.openrouter_api_key, active_settings.openrouter_model)
         if active_settings.openrouter_api_key
         else LocalPlanner()
     )
-    executor = AgentExecutor(planner, tool_runner, repository)
+    active_host_runner = host_runner or HostSupervisorClient(
+        active_settings.host_supervisor_socket
+    )
+    executor = AgentExecutor(planner, tool_runner, repository, active_host_runner)
     deployment_manager = DeploymentManager(active_settings)
     tunnel_manager = SsmTunnelManager(active_settings)
 
@@ -47,12 +57,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.get("/api/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "planner": planner.mode, "storage": "memory"}
+        return {
+            "status": "ok",
+            "planner": planner.mode,
+            "storage": repository.storage_name,
+            "host_supervisor": (
+                "connected" if active_host_runner.is_available() else "unavailable"
+            ),
+        }
 
     @application.get("/api/options", response_model=OptionsResponse)
     def options() -> OptionsResponse:
         return OptionsResponse(
-            subject_modes=SUBJECT_MODES,
+            subject_modes=[
+                mode.model_copy(
+                    update={
+                        "enabled": mode.id.value != "host"
+                        or active_host_runner.is_available()
+                    }
+                )
+                for mode in SUBJECT_MODES
+            ],
             permission_tests={key.value: value for key, value in PERMISSION_TESTS.items()},
             tools=TOOLS,
             planner_mode=planner.mode,
@@ -141,12 +166,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.post("/api/remote/runs", response_model=RunRecord)
     def remote_run(request: RunRequest) -> RunRecord:
-        return RunRecord.model_validate(
+        run = RunRecord.model_validate(
             remote_request("POST", "/api/runs", request.model_dump(mode="json"))
         )
+        # Supabase Secret Key는 EC2 Agent 런타임에 전달하지 않는다. 신뢰된 로컬
+        # 제어 백엔드가 SSM으로 받은 결과를 영구 저장한다.
+        repository.save(run)
+        return run
+
+    @application.get("/api/remote/runs/{run_id}", response_model=RunRecord)
+    def remote_get_run(run_id: str) -> RunRecord:
+        stored_run = repository.get(run_id)
+        if stored_run is not None:
+            return stored_run
+        return RunRecord.model_validate(remote_request("GET", f"/api/runs/{run_id}"))
 
     @application.post("/api/runs", response_model=RunRecord)
     def create_run(request: RunRequest) -> RunRecord:
+        if request.subject_mode.value == "host" and not active_host_runner.is_available():
+            raise HTTPException(
+                status_code=409,
+                detail="Ubuntu Host 실험은 SSM으로 연결된 AWS 런타임에서만 실행할 수 있습니다.",
+            )
         try:
             return executor.run(request)
         except ValueError as exc:
