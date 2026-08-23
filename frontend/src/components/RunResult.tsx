@@ -14,7 +14,7 @@ export function RunResult({ run }: RunResultProps) {
       <section className="result-panel empty-state" aria-labelledby="result-title">
         <span className="section-index">03</span>
         <h2 id="result-title">실행 결과</h2>
-        <p>실험을 실행하면 적용 프로파일, Tool, hash 검증 결과가 여기에 표시됩니다.</p>
+        <p>실험을 실행하면 통합 Run ID와 권한별 검증 결과가 여기에 표시됩니다.</p>
       </section>
     );
   }
@@ -39,6 +39,21 @@ export function RunResult({ run }: RunResultProps) {
         <div><dt>Planner</dt><dd>{run.planner_mode}</dd></div>
       </dl>
 
+      <ul className="batch-result-list" aria-label="통합 Run의 권한별 결과">
+        {run.permission_results.map((item) => (
+          <li key={item.permission_id}>
+            <div>
+              <span>{item.permission_id}:{item.permission_enabled ? "ON" : "OFF"}</span>
+              <strong>{item.applied_profile ?? item.requested_profile}</strong>
+              <small>{item.resource_id} · {item.runtime_result ?? "—"}</small>
+            </div>
+            <span className={`result-label ${item.test_result?.toLowerCase() ?? "inconclusive"}`}>
+              {item.test_result ?? "INCONCLUSIVE"}
+            </span>
+          </li>
+        ))}
+      </ul>
+
       <div className="hash-comparison">
         <div><span>Before SHA-256</span><strong>{shortHash(run.before_sha256)}</strong></div>
         <span className="hash-arrow" aria-hidden="true">→</span>
@@ -51,7 +66,7 @@ export function RunResult({ run }: RunResultProps) {
       </div>
 
       <a className="result-detail-link" href={`#/os-results/${encodeURIComponent(run.run_id)}`}>
-        <span>OS 결과 상세보기</span>
+        <span>전체 로그에서 상세보기</span>
         <span aria-hidden="true">→</span>
       </a>
     </section>

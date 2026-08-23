@@ -352,7 +352,9 @@ function Get-ListeningProcessId {
     return $null
 }
 
-function Stop-FrontendServerForDependencySync {
+function Stop-FrontendServer {
+    param([string]$Reason = "재시작")
+
     $processIds = [System.Collections.Generic.HashSet[int]]::new()
     $nodeModulesRoot = [System.IO.Path]::GetFullPath((Join-Path $frontendRoot "node_modules"))
 
@@ -391,7 +393,7 @@ function Stop-FrontendServerForDependencySync {
     }
 
     $idText = (($processIds | Sort-Object) -join ", ")
-    Write-Host "의존성 갱신을 위해 이 프로젝트의 Node 프로세스(PID $idText)를 종료합니다..."
+    Write-Host "$Reason을 위해 이 프로젝트의 Node 프로세스(PID $idText)를 종료합니다..."
     foreach ($processIdToStop in $processIds) {
         Stop-Process -Id $processIdToStop -Force -ErrorAction SilentlyContinue
     }
@@ -409,6 +411,75 @@ function Stop-FrontendServerForDependencySync {
         Start-Sleep -Milliseconds 250
     }
     throw "기존 프론트엔드 프로세스를 종료하지 못했습니다. PID: $idText"
+}
+
+function Stop-ExistingBackendForRestart {
+    $listenerProcessId = Get-ListeningProcessId -Port 8000
+    if (-not $listenerProcessId) {
+        return
+    }
+
+    $listener = Get-Process -Id $listenerProcessId -ErrorAction SilentlyContinue
+    if (-not $listener -or $listener.ProcessName -notin @("python", "pythonw")) {
+        $processName = if ($listener) { $listener.ProcessName } else { "알 수 없음" }
+        throw "8000 포트를 '$processName' 프로세스가 사용 중입니다. 해당 프로그램을 종료한 뒤 다시 실행하세요."
+    }
+
+    try {
+        $openApi = Invoke-RestMethod -Uri "$backendUrl/openapi.json" -TimeoutSec 2
+    }
+    catch {
+        throw "8000 포트의 기존 Python 서버가 OS Agent 백엔드인지 확인할 수 없습니다. 해당 프로세스를 종료한 뒤 다시 실행하세요."
+    }
+    if ($openApi.info.title -ne "OS Agent Minimum Test API") {
+        throw "8000 포트에서 다른 Python API가 실행 중입니다. 해당 프로그램을 종료한 뒤 다시 실행하세요."
+    }
+
+    try {
+        Invoke-RestMethod `
+            -Method Post `
+            -Uri "$backendUrl/api/tunnel/stop" `
+            -ContentType "application/json" `
+            -Body '{"confirmation":"STOP_FIXED_SSM_TUNNEL"}' `
+            -TimeoutSec 5 | Out-Null
+    }
+    catch {
+        Write-Host "기존 SSM 터널 종료 요청에 응답이 없어 백엔드 재시작을 계속합니다." -ForegroundColor Yellow
+    }
+
+    Write-Host "변경된 코드를 반영하기 위해 기존 OS Agent 백엔드(PID $listenerProcessId)를 재시작합니다..."
+    Stop-Process -Id $listenerProcessId -Force
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        if (-not (Test-TcpPort -Port 8000)) {
+            Start-Sleep -Milliseconds 300
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw "기존 OS Agent 백엔드를 종료하지 못했습니다. PID: $listenerProcessId"
+}
+
+function Stop-OrphanedSsmTunnel {
+    $listenerProcessId = Get-ListeningProcessId -Port 8001
+    if (-not $listenerProcessId) {
+        return
+    }
+
+    $listener = Get-Process -Id $listenerProcessId -ErrorAction SilentlyContinue
+    if (-not $listener -or $listener.ProcessName -ne "session-manager-plugin") {
+        return
+    }
+
+    Write-Host "남아 있는 SSM 포트 포워딩(PID $listenerProcessId)을 정리합니다..." -ForegroundColor Yellow
+    Stop-Process -Id $listenerProcessId -Force
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        if (-not (Test-TcpPort -Port 8001)) {
+            Start-Sleep -Milliseconds 300
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw "기존 SSM 포트 포워딩을 종료하지 못했습니다. PID: $listenerProcessId"
 }
 
 function Initialize-BackendEnvironment {
@@ -517,7 +588,7 @@ function Sync-FrontendDependencies {
     if ($currentHash -ne $savedHash) {
         # 실행 중인 Vite가 Rolldown 네이티브 모듈을 잠그고 있으면 npm ci가
         # Windows EPERM으로 실패하므로 이 프로젝트가 사용하는 5173 서버만 종료한다.
-        Stop-FrontendServerForDependencySync
+        Stop-FrontendServer -Reason "의존성 갱신"
         Write-Host "프론트엔드 의존성을 설치합니다..."
         Push-Location $frontendRoot
         try {
@@ -597,31 +668,19 @@ try {
     }
 
     try {
-        $launcherStage = "프론트엔드 및 백엔드 시작"
+        $launcherStage = "백엔드 시작"
         $env:AWS_PROFILE = $AwsProfile
         $env:AWS_REGION = $AwsRegion
 
-        if (-not (Test-TcpPort -Port 8000)) {
-            Write-Host "백엔드를 시작합니다..."
-            Start-Process `
-                -FilePath $venvPython `
-                -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000") `
-                -WorkingDirectory $backendRoot | Out-Null
-        }
-        else {
-            Write-Host "8000 포트가 이미 사용 중이므로 기존 백엔드를 사용합니다."
-        }
-
-        if (-not (Test-TcpPort -Port 5173)) {
-            Write-Host "프론트엔드를 시작합니다..."
-            Start-Process `
-                -FilePath $npm `
-                -ArgumentList @("run", "dev", "--", "--host", "127.0.0.1") `
-                -WorkingDirectory $frontendRoot | Out-Null
-        }
-        else {
-            Write-Host "5173 포트가 이미 사용 중이므로 기존 프론트엔드를 사용합니다."
-        }
+        Stop-ExistingBackendForRestart
+        Stop-OrphanedSsmTunnel
+        Stop-FrontendServer -Reason "변경된 코드 반영"
+        Write-Host "백엔드를 시작합니다..."
+        $backendProcess = Start-Process `
+            -FilePath $venvPython `
+            -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000") `
+            -WorkingDirectory $backendRoot `
+            -PassThru
     }
     finally {
         $env:AWS_PROFILE = $previousEnvironment.AWS_PROFILE
@@ -632,6 +691,9 @@ try {
     Write-Host "백엔드 시작을 기다립니다..."
     $backendReady = $false
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        if ($backendProcess.HasExited) {
+            throw "백엔드가 시작 직후 종료되었습니다. 백엔드 CMD 창의 오류를 확인하세요. 종료 코드: $($backendProcess.ExitCode)"
+        }
         try {
             $health = Invoke-RestMethod -Uri "$backendUrl/api/health" -TimeoutSec 2
             if ($health.status -eq "ok") {
@@ -647,6 +709,13 @@ try {
     if (-not $backendReady) {
         throw "30초 안에 백엔드 헬스 체크가 성공하지 않았습니다."
     }
+
+    $launcherStage = "프론트엔드 시작"
+    Write-Host "백엔드 연결 확인 완료. 프론트엔드를 시작합니다..."
+    Start-Process `
+        -FilePath $npm `
+        -ArgumentList @("run", "dev", "--", "--host", "127.0.0.1") `
+        -WorkingDirectory $frontendRoot | Out-Null
 
     Start-Process $frontendUrl
     Write-Host "실행 완료: $frontendUrl"

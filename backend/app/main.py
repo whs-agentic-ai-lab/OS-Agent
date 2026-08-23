@@ -1,7 +1,7 @@
 import json
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from .catalog import PERMISSION_TESTS, SUBJECT_MODES, TOOLS
@@ -18,7 +18,14 @@ from .executor import AgentExecutor
 from .host_client import HostRunner, HostSupervisorClient
 from .planner import LocalPlanner, OpenRouterPlanner
 from .repository import create_run_repository
-from .schemas import OptionsResponse, RunEvent, RunRecord, RunRequest
+from .schemas import (
+    OptionsResponse,
+    RunDeleteResponse,
+    RunEvent,
+    RunListResponse,
+    RunRecord,
+    RunRequest,
+)
 from .tools import ToolRunner
 from .tunnel import SsmTunnelManager, TunnelRequest, TunnelStatus, TunnelStopRequest
 
@@ -50,7 +57,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=list(active_settings.allowed_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["Content-Type"],
     )
     application.add_event_handler("shutdown", tunnel_manager.close)
@@ -59,6 +66,7 @@ def create_app(
     def health() -> dict[str, str]:
         return {
             "status": "ok",
+            "run_api_version": "integrated-v1",
             "planner": planner.mode,
             "storage": repository.storage_name,
             "host_supervisor": (
@@ -166,9 +174,35 @@ def create_app(
 
     @application.post("/api/remote/runs", response_model=RunRecord)
     def remote_run(request: RunRequest) -> RunRecord:
+        remote_health_payload = remote_request("GET", "/api/health")
+        if remote_health_payload.get("run_api_version") != "integrated-v1":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "AWS 백엔드가 통합 Run API를 지원하지 않습니다. "
+                    "원격 백엔드 이미지와 Host Supervisor를 먼저 갱신하세요."
+                ),
+            )
         run = RunRecord.model_validate(
-            remote_request("POST", "/api/runs", request.model_dump(mode="json"))
+            remote_request(
+                "POST",
+                "/api/runs",
+                request.model_dump(
+                    mode="json",
+                    exclude={"permission_id", "permission_enabled"},
+                ),
+            )
         )
+        requested_permissions = [item.model_dump() for item in request.permissions]
+        returned_permissions = [item.model_dump() for item in run.permissions]
+        if (
+            returned_permissions != requested_permissions
+            or len(run.permission_results) != len(request.permissions)
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail="AWS 백엔드가 통합 권한 결과를 완전하게 반환하지 않았습니다.",
+            )
         # Supabase Secret Key는 EC2 Agent 런타임에 전달하지 않는다. 신뢰된 로컬
         # 제어 백엔드가 SSM으로 받은 결과를 영구 저장한다.
         repository.save(run)
@@ -193,12 +227,31 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @application.get("/api/runs", response_model=RunListResponse)
+    def list_runs(
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, ge=1, le=100),
+    ) -> RunListResponse:
+        items, total = repository.list_runs(page, page_size)
+        return RunListResponse(
+            items=items,
+            total=total,
+            page=page,
+            page_size=page_size,
+        )
+
     @application.get("/api/runs/{run_id}", response_model=RunRecord)
     def get_run(run_id: str) -> RunRecord:
         run = repository.get(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="실행 기록을 찾을 수 없습니다.")
         return run
+
+    @application.delete("/api/runs/{run_id}", response_model=RunDeleteResponse)
+    def delete_run(run_id: str) -> RunDeleteResponse:
+        if not repository.delete(run_id):
+            raise HTTPException(status_code=404, detail="삭제할 실행 기록을 찾을 수 없습니다.")
+        return RunDeleteResponse(run_id=run_id, deleted=True)
 
     @application.get("/api/runs/{run_id}/events", response_model=list[RunEvent])
     def get_events(run_id: str) -> list[RunEvent]:

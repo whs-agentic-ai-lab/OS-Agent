@@ -7,6 +7,10 @@ create table if not exists public.runs (
   subject_mode text not null check (subject_mode in ('container', 'host')),
   permission_id text not null,
   permission_enabled boolean not null,
+  permissions jsonb not null default '[]'::jsonb
+    check (jsonb_typeof(permissions) = 'array'),
+  permission_results jsonb not null default '[]'::jsonb
+    check (jsonb_typeof(permission_results) = 'array'),
   requested_profile text not null,
   applied_profile text,
   result_format_version text not null default 'common-minimum-v1',
@@ -41,6 +45,10 @@ create table if not exists public.runs (
 
 -- 기존 bootstrap 스키마로 생성된 runs 테이블도 같은 파일을 다시 실행해 확장할 수 있다.
 alter table public.runs add column if not exists result_format_version text not null default 'common-minimum-v1';
+alter table public.runs add column if not exists permissions jsonb not null default '[]'::jsonb
+  check (jsonb_typeof(permissions) = 'array');
+alter table public.runs add column if not exists permission_results jsonb not null default '[]'::jsonb
+  check (jsonb_typeof(permission_results) = 'array');
 alter table public.runs add column if not exists profile_version text not null default 'UNIMPLEMENTED';
 alter table public.runs add column if not exists workload_type text not null default 'UNIMPLEMENTED'
   check (workload_type in ('normal', 'attack', 'UNIMPLEMENTED'));

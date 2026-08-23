@@ -128,18 +128,32 @@ def _reset_canary(profile: Profile) -> Path:
 
 
 def apply_profile(profile_id: str) -> str:
-    profile = PROFILES.get(profile_id)
-    if profile is None:
-        raise ValueError("허용 목록에 없는 Host 프로파일입니다.")
-    with PROFILE_LOCK:
-        if profile.permission == "group":
-            _set_trial_group_membership(profile.enabled)
-        else:
-            _set_trial_group_membership(False)
-        _write_sudoers(profile.permission == "sudo" and profile.enabled)
-        path = _reset_canary(profile)
-        _verify_profile(profile, path)
+    apply_profiles([profile_id])
     return profile_id
+
+
+def apply_profiles(profile_ids: list[str]) -> list[str]:
+    if not profile_ids:
+        raise ValueError("하나 이상의 Host 프로파일이 필요합니다.")
+    profiles: list[Profile] = []
+    for profile_id in profile_ids:
+        profile = PROFILES.get(profile_id)
+        if profile is None:
+            raise ValueError("허용 목록에 없는 Host 프로파일입니다.")
+        profiles.append(profile)
+    permissions = [profile.permission for profile in profiles]
+    if len(permissions) != len(set(permissions)):
+        raise ValueError("같은 Host 권한의 OFF/ON 프로파일을 동시에 적용할 수 없습니다.")
+
+    with PROFILE_LOCK:
+        group_profile = next((item for item in profiles if item.permission == "group"), None)
+        sudo_profile = next((item for item in profiles if item.permission == "sudo"), None)
+        _set_trial_group_membership(bool(group_profile and group_profile.enabled))
+        _write_sudoers(bool(sudo_profile and sudo_profile.enabled))
+        paths = [_reset_canary(profile) for profile in profiles]
+        for profile, path in zip(profiles, paths, strict=True):
+            _verify_profile(profile, path)
+    return profile_ids
 
 
 def _verify_profile(profile: Profile, path: Path) -> None:
@@ -218,51 +232,94 @@ def execute(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("허용 목록에 없는 Tool입니다.")
 
     with PROFILE_LOCK:
-        apply_profile(profile_id)
-        if tool == "service_status":
-            if arguments != {"service_id": "nginx-target"}:
-                raise ValueError("허용 목록에 없는 서비스입니다.")
-            result = _run(
-                [
-                    "/usr/bin/docker",
-                    "inspect",
-                    "--format",
-                    "{{.State.Status}}",
-                    "nginx-target",
-                ]
-            )
-            active = result.returncode == 0 and result.stdout.strip() == "running"
-            return {
-                "runtime_result": "allowed" if active else "error",
-                "output": "nginx-target: active (host)" if active else "nginx-target: inactive",
-                "exit_code": 0 if active else result.returncode or 1,
-            }
+        apply_profiles([profile_id])
+        return _execute_applied(tool, arguments, expected_resource, profile)
 
-        resource_id = _required_text(arguments, "resource_id")
-        if resource_id != expected_resource:
-            raise ValueError("현재 권한 시험과 다른 Resource ID가 요청되었습니다.")
-        path = CANARIES[resource_id]
-        before = _hash(path)
-        content = ""
-        if tool == "file_write":
-            content = arguments.get("content", "")
-            if not isinstance(content, str) or len(content) > 128 or "\x00" in content:
-                raise ValueError("기록 내용은 NUL 없는 128자 이하 문자열이어야 합니다.")
-            result = _sudo_tool(content) if profile.permission == "sudo" else _agent_tool(
-                tool, resource_id, content
-            )
-        else:
-            result = _agent_tool(tool, resource_id)
-        after = _hash(path)
-        denied = result.returncode in {1, 13}
-        output = (result.stdout if result.returncode == 0 else result.stderr).strip()
+
+def execute_integrated(payload: dict[str, Any]) -> dict[str, Any]:
+    profile_ids = payload.get("profile_ids")
+    executions = payload.get("executions")
+    if not isinstance(profile_ids, list) or not all(
+        isinstance(item, str) and item for item in profile_ids
+    ):
+        raise ValueError("profile_ids 배열이 필요합니다.")
+    if not isinstance(executions, list) or len(executions) != len(profile_ids):
+        raise ValueError("프로파일 수와 실행 항목 수가 일치해야 합니다.")
+
+    profiles: list[Profile] = []
+    for profile_id in profile_ids:
+        profile = PROFILES.get(profile_id)
+        if profile is None:
+            raise ValueError("허용 목록에 없는 Host 프로파일입니다.")
+        profiles.append(profile)
+
+    with PROFILE_LOCK:
+        applied = apply_profiles(profile_ids)
+        results = []
+        for profile, execution_item in zip(profiles, executions, strict=True):
+            if not isinstance(execution_item, dict):
+                raise ValueError("실행 항목 형식이 올바르지 않습니다.")
+            tool = _required_text(execution_item, "tool")
+            expected_resource = _required_text(execution_item, "expected_resource_id")
+            arguments = execution_item.get("arguments")
+            if profile.resource_id != expected_resource or not isinstance(arguments, dict):
+                raise ValueError("Host 프로파일과 실행 Resource가 일치하지 않습니다.")
+            results.append(_execute_applied(tool, arguments, expected_resource, profile))
+    return {"applied_profiles": applied, "results": results}
+
+
+def _execute_applied(
+    tool: str,
+    arguments: dict[str, Any],
+    expected_resource: str,
+    profile: Profile,
+) -> dict[str, Any]:
+    if tool not in {"file_read", "file_write", "service_status"}:
+        raise ValueError("허용 목록에 없는 Tool입니다.")
+    if tool == "service_status":
+        if arguments != {"service_id": "nginx-target"}:
+            raise ValueError("허용 목록에 없는 서비스입니다.")
+        result = _run(
+            [
+                "/usr/bin/docker",
+                "inspect",
+                "--format",
+                "{{.State.Status}}",
+                "nginx-target",
+            ]
+        )
+        active = result.returncode == 0 and result.stdout.strip() == "running"
         return {
-            "runtime_result": "allowed" if result.returncode == 0 else "denied" if denied else "error",
-            "output": output or ("Host OS가 작업을 거부했습니다." if denied else "Host Tool 실행 오류"),
-            "exit_code": result.returncode,
-            "before_sha256": before,
-            "after_sha256": after,
+            "runtime_result": "allowed" if active else "error",
+            "output": "nginx-target: active (host)" if active else "nginx-target: inactive",
+            "exit_code": 0 if active else result.returncode or 1,
         }
+
+    resource_id = _required_text(arguments, "resource_id")
+    if resource_id != expected_resource:
+        raise ValueError("현재 권한 시험과 다른 Resource ID가 요청되었습니다.")
+    path = CANARIES[resource_id]
+    before = _hash(path)
+    content = ""
+    if tool == "file_write":
+        content = arguments.get("content", "")
+        if not isinstance(content, str) or len(content) > 128 or "\x00" in content:
+            raise ValueError("기록 내용은 NUL 없는 128자 이하 문자열이어야 합니다.")
+        result = _sudo_tool(content) if profile.permission == "sudo" else _agent_tool(
+            tool, resource_id, content
+        )
+    else:
+        result = _agent_tool(tool, resource_id)
+    after = _hash(path)
+    denied = result.returncode in {1, 13}
+    output = (result.stdout if result.returncode == 0 else result.stderr).strip()
+    return {
+        "runtime_result": "allowed" if result.returncode == 0 else "denied" if denied else "error",
+        "output": output or ("Host OS가 작업을 거부했습니다." if denied else "Host Tool 실행 오류"),
+        "exit_code": result.returncode,
+        "before_sha256": before,
+        "after_sha256": after,
+    }
 
 
 def _required_text(payload: dict[str, Any], key: str) -> str:
@@ -321,10 +378,16 @@ class SupervisorHandler(http.server.BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("JSON 객체가 필요합니다.")
             if self.path == "/v1/profiles/apply":
-                profile_id = _required_text(payload, "profile_id")
-                body = {"applied_profile": apply_profile(profile_id)}
+                profile_ids = payload.get("profile_ids")
+                if isinstance(profile_ids, list):
+                    body = {"applied_profiles": apply_profiles(profile_ids)}
+                else:
+                    profile_id = _required_text(payload, "profile_id")
+                    body = {"applied_profile": apply_profile(profile_id)}
             elif self.path == "/v1/execute":
                 body = execute(payload)
+            elif self.path == "/v1/execute-integrated":
+                body = execute_integrated(payload)
             else:
                 self._respond(404, {"detail": "존재하지 않는 Supervisor API입니다."})
                 return

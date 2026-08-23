@@ -1,4 +1,4 @@
-import type { DeploymentStatus, HealthResponse, OptionsResponse, RunRecord, RunRequest, TunnelStatus } from "./types";
+import type { DeploymentStatus, HealthResponse, OptionsResponse, RunDeleteResponse, RunListResponse, RunRecord, RunRequest, TunnelStatus } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
@@ -31,6 +31,20 @@ export function createRun(payload: RunRequest, remote = false): Promise<RunRecor
 
 export function getRun(runId: string, remote = false): Promise<RunRecord> {
   return request<RunRecord>(agentPath(`/api/runs/${encodeURIComponent(runId)}`, remote));
+}
+
+export function getRuns(page = 1, pageSize = 20): Promise<RunListResponse> {
+  const query = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  return request<RunListResponse>(`/api/runs?${query.toString()}`);
+}
+
+export function deleteRun(runId: string): Promise<RunDeleteResponse> {
+  return request<RunDeleteResponse>(`/api/runs/${encodeURIComponent(runId)}`, {
+    method: "DELETE",
+  });
 }
 
 export function getDeployment(): Promise<DeploymentStatus> {
