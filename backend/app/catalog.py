@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from .schemas import PermissionTest, SubjectMode, SubjectOption, ToolOption
+from .schemas import PermissionSelection, PermissionTest, SubjectMode, SubjectOption, ToolOption
 
 
 SUBJECT_MODES = [
@@ -86,6 +86,8 @@ RESOURCE_BY_PERMISSION = {
 
 @dataclass(frozen=True)
 class ProfileSelection:
+    permission_id: str
+    enabled: bool
     profile_id: str
     resource_id: str
 
@@ -100,7 +102,18 @@ def select_profile(
     if selected is None:
         raise ValueError("선택한 실행 경계에 존재하지 않는 권한 항목입니다.")
     return ProfileSelection(
+        permission_id=permission_id,
+        enabled=enabled,
         profile_id=selected.on_profile if enabled else selected.off_profile,
         resource_id=RESOURCE_BY_PERMISSION[permission_id],
     )
 
+
+def select_profiles(
+    subject_mode: SubjectMode,
+    permissions: list[PermissionSelection],
+) -> list[ProfileSelection]:
+    return [
+        select_profile(subject_mode, item.permission_id, item.enabled)
+        for item in permissions
+    ]

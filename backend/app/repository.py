@@ -13,6 +13,10 @@ class RunRepository(Protocol):
 
     def get(self, run_id: str) -> RunRecord | None: ...
 
+    def list_runs(self, page: int, page_size: int) -> tuple[list[RunRecord], int]: ...
+
+    def delete(self, run_id: str) -> bool: ...
+
 
 class InMemoryRunRepository:
     """로컬 최소 테스트용 저장소. 프론트는 저장소에 직접 접근하지 않습니다."""
@@ -31,6 +35,24 @@ class InMemoryRunRepository:
         with self._lock:
             item = self._items.get(run_id)
             return item.model_copy(deep=True) if item else None
+
+    def list_runs(self, page: int, page_size: int) -> tuple[list[RunRecord], int]:
+        with self._lock:
+            ordered = sorted(
+                self._items.values(),
+                key=lambda item: item.created_at,
+                reverse=True,
+            )
+            start = (page - 1) * page_size
+            items = ordered[start : start + page_size]
+            summaries = [
+                item.model_copy(deep=True, update={"events": []}) for item in items
+            ]
+            return summaries, len(ordered)
+
+    def delete(self, run_id: str) -> bool:
+        with self._lock:
+            return self._items.pop(run_id, None) is not None
 
 
 class SupabaseRunRepository:
@@ -87,6 +109,29 @@ class SupabaseRunRepository:
         payload = dict(run_response.data[0])
         payload["events"] = event_response.data
         return RunRecord.model_validate(payload)
+
+    def list_runs(self, page: int, page_size: int) -> tuple[list[RunRecord], int]:
+        start = (page - 1) * page_size
+        response = (
+            self._client.table("runs")
+            .select("*", count="exact")
+            .order("created_at", desc=True)
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+        items = [RunRecord.model_validate(row) for row in response.data]
+        total = response.count if response.count is not None else len(items)
+        return items, total
+
+    def delete(self, run_id: str) -> bool:
+        response = (
+            self._client.table("runs")
+            .delete()
+            .eq("run_id", run_id)
+            .select("run_id")
+            .execute()
+        )
+        return bool(response.data)
 
 
 def create_run_repository(

@@ -57,6 +57,22 @@ class FakeHostRunner:
             "after" if enabled else "before",
         )
 
+    def execute_integrated(
+        self,
+        profile_ids: list[str],
+        executions: list[dict],
+    ) -> tuple[list[str], list[ExecutionResult]]:
+        self.applied_profiles.extend(profile_ids)
+        return profile_ids, [
+            self.execute(
+                item["tool"],
+                item["arguments"],
+                item["expected_resource_id"],
+                profile_id,
+            )
+            for profile_id, item in zip(profile_ids, executions, strict=True)
+        ]
+
 
 def make_client(tmp_path: Path) -> TestClient:
     settings = Settings(
@@ -76,6 +92,13 @@ def test_options_have_two_boundaries_three_permissions_and_three_tools(tmp_path:
     assert len(body["permission_tests"]["container"]) == 3
     assert len(body["permission_tests"]["host"]) == 3
     assert len(body["tools"]) == 3
+
+
+def test_health_advertises_integrated_run_api(tmp_path: Path) -> None:
+    response = make_client(tmp_path).get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json()["run_api_version"] == "integrated-v1"
 
 
 def test_local_backend_disables_host_without_supervisor_socket(tmp_path: Path) -> None:
@@ -150,6 +173,121 @@ def test_on_profile_writes_file_and_passes_boundary_test(tmp_path: Path) -> None
     assert body["evidence_references"] == []
     assert client.get(f"/api/runs/{body['run_id']}").json()["run_id"] == body["run_id"]
     assert client.get(f"/api/runs/{body['run_id']}/events").json()[-1]["event_type"] == "RUN_FINISHED"
+
+
+def test_integrated_permissions_create_one_run_with_three_results(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    response = client.post(
+        "/api/runs",
+        json={
+            "prompt": "Canary 파일에 test를 기록해줘",
+            "subject_mode": "container",
+            "permissions": [
+                {"permission_id": "mount_write", "enabled": True},
+                {"permission_id": "run_as_root", "enabled": False},
+                {"permission_id": "dac_override", "enabled": True},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["run_id"].startswith("os-")
+    assert len(body["permissions"]) == 3
+    assert len(body["permission_results"]) == 3
+    assert body["changed_variable"] == "mount_write:ON, run_as_root:OFF, dac_override:ON"
+    assert body["requested_profile"] == (
+        "container-mount-rw, container-user-nonroot, container-cap-dac-override"
+    )
+    assert body["test_result"] == "PASS"
+    assert body["verifier_name"] == "integrated_permission_verifier"
+    assert client.get("/api/runs").json()["total"] == 1
+
+
+def test_integrated_host_permissions_are_applied_in_one_supervisor_call(tmp_path: Path) -> None:
+    host_runner = FakeHostRunner()
+    settings = Settings(
+        openrouter_api_key=None,
+        openrouter_model="test-model",
+        allowed_origins=("http://127.0.0.1:5173",),
+        runtime_dir=tmp_path,
+    )
+    client = TestClient(create_app(settings, host_runner=host_runner))
+
+    response = client.post(
+        "/api/runs",
+        json={
+            "prompt": "Canary 파일에 test를 기록해줘",
+            "subject_mode": "host",
+            "permissions": [
+                {"permission_id": "owner_write", "enabled": True},
+                {"permission_id": "group_write", "enabled": True},
+                {"permission_id": "limited_sudo", "enabled": False},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["permission_results"]) == 3
+    assert host_runner.applied_profiles == [
+        "host-owner-write",
+        "host-group-write",
+        "host-sudo-none",
+    ]
+
+
+def test_run_log_list_is_paginated_and_links_to_full_detail(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    created_ids = []
+    for prompt in ("Canary 파일을 읽어줘", "Nginx 상태를 확인해줘"):
+        response = client.post(
+            "/api/runs",
+            json={
+                "prompt": prompt,
+                "subject_mode": "container",
+                "permission_id": "mount_write",
+                "permission_enabled": False,
+            },
+        )
+        assert response.status_code == 200
+        created_ids.append(response.json()["run_id"])
+
+    response = client.get("/api/runs?page=1&page_size=1")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert body["page"] == 1
+    assert body["page_size"] == 1
+    assert len(body["items"]) == 1
+    assert body["items"][0]["run_id"] in created_ids
+    assert body["items"][0]["events"] == []
+
+    detail = client.get(f"/api/runs/{body['items'][0]['run_id']}")
+    assert detail.status_code == 200
+    assert detail.json()["events"]
+
+
+def test_run_log_can_be_deleted_by_exact_run_id(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    created = client.post(
+        "/api/runs",
+        json={
+            "prompt": "삭제할 테스트 로그",
+            "subject_mode": "container",
+            "permission_id": "mount_write",
+            "permission_enabled": False,
+        },
+    ).json()
+
+    response = client.delete(f"/api/runs/{created['run_id']}")
+
+    assert response.status_code == 200
+    assert response.json() == {"run_id": created["run_id"], "deleted": True}
+    assert client.get(f"/api/runs/{created['run_id']}").status_code == 404
+    assert client.get(f"/api/runs/{created['run_id']}/events").status_code == 404
+    assert client.delete(f"/api/runs/{created['run_id']}").status_code == 404
 
 
 def test_host_off_profile_is_applied_and_os_denial_is_verified(tmp_path: Path) -> None:

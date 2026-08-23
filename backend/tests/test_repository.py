@@ -44,14 +44,16 @@ def make_run() -> RunRecord:
     )
 
 
-def fluent_query(response_data: list[dict]) -> Mock:
+def fluent_query(response_data: list[dict], count: int | None = None) -> Mock:
     query = Mock()
     query.select.return_value = query
     query.eq.return_value = query
     query.limit.return_value = query
     query.order.return_value = query
+    query.range.return_value = query
+    query.delete.return_value = query
     query.upsert.return_value = query
-    query.execute.return_value = SimpleNamespace(data=response_data)
+    query.execute.return_value = SimpleNamespace(data=response_data, count=count)
     return query
 
 
@@ -88,6 +90,57 @@ def test_supabase_repository_rebuilds_run_with_ordered_events() -> None:
     assert restored.run_id == run.run_id
     assert restored.events[0].event_type == "VERIFIED"
     events_query.order.assert_called_once_with("sequence")
+
+
+def test_supabase_repository_lists_latest_runs_with_exact_count() -> None:
+    run = make_run()
+    client = Mock()
+    runs_query = fluent_query(
+        [run.model_dump(mode="json", exclude={"events"})],
+        count=42,
+    )
+    client.table.return_value = runs_query
+    repository = SupabaseRunRepository("https://example.supabase.co", "secret", client=client)
+
+    items, total = repository.list_runs(page=2, page_size=20)
+
+    assert items[0].run_id == run.run_id
+    assert items[0].events == []
+    assert total == 42
+    runs_query.select.assert_called_once_with("*", count="exact")
+    runs_query.order.assert_called_once_with("created_at", desc=True)
+    runs_query.range.assert_called_once_with(20, 39)
+
+
+def test_supabase_repository_restores_legacy_changed_variable() -> None:
+    run = make_run()
+    legacy_row = run.model_dump(mode="json", exclude={"events"})
+    legacy_row["permission_id"] = "group_write"
+    legacy_row["permission_enabled"] = True
+    legacy_row["changed_variable"] = "UNIMPLEMENTED"
+    client = Mock()
+    runs_query = fluent_query([legacy_row], count=1)
+    client.table.return_value = runs_query
+    repository = SupabaseRunRepository("https://example.supabase.co", "secret", client=client)
+
+    items, total = repository.list_runs(page=1, page_size=20)
+
+    assert total == 1
+    assert items[0].changed_variable == "group_write:ON"
+
+
+def test_supabase_repository_deletes_only_the_selected_run() -> None:
+    client = Mock()
+    runs_query = fluent_query([{"run_id": "os-repository-test"}])
+    client.table.return_value = runs_query
+    repository = SupabaseRunRepository("https://example.supabase.co", "secret", client=client)
+
+    deleted = repository.delete("os-repository-test")
+
+    assert deleted is True
+    runs_query.delete.assert_called_once_with()
+    runs_query.eq.assert_called_once_with("run_id", "os-repository-test")
+    runs_query.select.assert_called_once_with("run_id")
 
 
 def test_repository_requires_complete_supabase_configuration() -> None:

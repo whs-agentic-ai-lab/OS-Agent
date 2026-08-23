@@ -7,7 +7,6 @@ import {
   getDeployment,
   getHealth,
   getOptions,
-  getRun,
   getTunnel,
   initializeInfrastructure,
   startTunnel,
@@ -35,13 +34,21 @@ import type {
 } from './types'
 
 const DEFAULT_PROMPT = 'Canary 파일에 test를 기록해줘'
+const RUN_MARKER_PATTERN = /^\[실행값:[^\]]+\]\s*/
+
+function createUniqueRunPrompt(value: string): string {
+  const instruction = value.replace(RUN_MARKER_PATTERN, '').trim()
+  const marker = `[실행값:${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}]`
+  return `${marker} ${instruction.slice(0, 4000 - marker.length - 1)}`
+}
 const SELECTED_INSTANCE_STORAGE_KEY = 'os-agent-test.selected-instance.v1'
 const RESULT_DETAIL_HASH_PREFIX = '#/os-results/'
+const LOGS_HASH = '#/logs'
 
-function getDetailRunId(): string | null {
-  if (!window.location.hash.startsWith(RESULT_DETAIL_HASH_PREFIX)) return null
+function getDetailRunId(hash: string): string | null {
+  if (!hash.startsWith(RESULT_DETAIL_HASH_PREFIX)) return null
   try {
-    return decodeURIComponent(window.location.hash.slice(RESULT_DETAIL_HASH_PREFIX.length)) || null
+    return decodeURIComponent(hash.slice(RESULT_DETAIL_HASH_PREFIX.length)) || null
   } catch {
     return null
   }
@@ -56,17 +63,15 @@ export default function App() {
   const [healthChecked, setHealthChecked] = useState(false)
   const [storageHealthChecked, setStorageHealthChecked] = useState(false)
   const [subjectMode, setSubjectMode] = useState<SubjectModeId>('container')
-  const [permissionId, setPermissionId] = useState('mount_write')
-  const [permissionEnabled, setPermissionEnabled] = useState(false)
+  const [permissionSelections, setPermissionSelections] = useState<Record<string, boolean>>({
+    mount_write: false,
+    run_as_root: false,
+    dac_override: false,
+  })
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT)
   const [environmentName, setEnvironmentName] = useState('')
   const [run, setRun] = useState<RunRecord | null>(null)
-  const [detailRunId, setDetailRunId] = useState<string | null>(getDetailRunId)
-  const [detailLookup, setDetailLookup] = useState<{
-    runId: string
-    run: RunRecord | null
-    error: string | null
-  } | null>(null)
+  const [routeHash, setRouteHash] = useState(() => window.location.hash)
   const [backendError, setBackendError] = useState<string | null>(null)
   const [runError, setRunError] = useState<string | null>(null)
   const [deploymentActionError, setDeploymentActionError] = useState<
@@ -82,7 +87,7 @@ export default function App() {
   )
 
   useEffect(() => {
-    const handleHashChange = () => setDetailRunId(getDetailRunId())
+    const handleHashChange = () => setRouteHash(window.location.hash)
     window.addEventListener('hashchange', handleHashChange)
     return () => window.removeEventListener('hashchange', handleHashChange)
   }, [])
@@ -102,33 +107,6 @@ export default function App() {
   }, [])
 
   const agentRemote = tunnel?.status === 'connected'
-
-  useEffect(() => {
-    if (!detailRunId || run?.run_id === detailRunId) return
-
-    let isActive = true
-    const primaryRequest = getRun(detailRunId, agentRemote)
-    const request = agentRemote
-      ? primaryRequest.catch(() => getRun(detailRunId, false))
-      : primaryRequest
-
-    request
-      .then((response) => {
-        if (isActive) setDetailLookup({ runId: detailRunId, run: response, error: null })
-      })
-      .catch((reason) => {
-        if (!isActive) return
-        setDetailLookup({
-          runId: detailRunId,
-          run: null,
-          error: reason instanceof Error ? reason.message : '실행 기록을 불러오지 못했습니다.',
-        })
-      })
-
-    return () => {
-      isActive = false
-    }
-  }, [agentRemote, detailRunId, run])
 
   useEffect(() => {
     let isActive = true
@@ -227,11 +205,11 @@ export default function App() {
       ? (options?.subject_modes.find((mode) => mode.enabled)?.id ?? 'container')
       : subjectMode
   const permissionTests = options?.permission_tests[activeSubjectMode] ?? []
-  const activePermissionId = permissionTests.some(
-    (test) => test.id === permissionId,
+  const activePermissionSelections = permissionTests.flatMap((test) =>
+    Object.hasOwn(permissionSelections, test.id)
+      ? [{ permissionId: test.id, enabled: permissionSelections[test.id] }]
+      : [],
   )
-    ? permissionId
-    : (permissionTests[0]?.id ?? '')
   const backendConnected = Boolean(health) || Boolean(options)
   const connectionServices: ServiceConnection[] = [
     {
@@ -305,30 +283,36 @@ export default function App() {
   function changeSubjectMode(mode: SubjectModeId) {
     const nextTests = options?.permission_tests[mode] ?? []
     setSubjectMode(mode)
-    setPermissionId(nextTests[0]?.id ?? '')
-    setPermissionEnabled(false)
+    setPermissionSelections(Object.fromEntries(nextTests.map((test) => [test.id, false])))
+  }
+
+  function changePermissionSelection(permissionId: string, enabled: boolean) {
+    setPermissionSelections((current) => ({ ...current, [permissionId]: enabled }))
   }
 
   async function submitRun(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!activePermissionId || !prompt.trim()) return
+    if (activePermissionSelections.length === 0 || !prompt.trim()) return
+    const submittedPrompt = createUniqueRunPrompt(prompt)
     setIsRunning(true)
     setRunError(null)
+    setRun(null)
+    setPrompt(submittedPrompt)
     try {
       const result = await createRun(
         {
-          prompt: prompt.trim(),
+          prompt: submittedPrompt,
           subject_mode: activeSubjectMode,
-          permission_id: activePermissionId,
-          permission_enabled: permissionEnabled,
+          permissions: activePermissionSelections.map((selection) => ({
+            permission_id: selection.permissionId,
+            enabled: selection.enabled,
+          })),
         },
         agentRemote,
       )
       setRun(result)
     } catch (reason) {
-      setRunError(
-        reason instanceof Error ? reason.message : '실행 요청에 실패했습니다.',
-      )
+      setRunError(reason instanceof Error ? reason.message : '통합 실행 요청에 실패했습니다.')
     } finally {
       setIsRunning(false)
     }
@@ -479,17 +463,10 @@ export default function App() {
     }
   }
 
-  if (detailRunId) {
-    const currentDetailRun =
-      run?.run_id === detailRunId
-        ? run
-        : detailLookup?.runId === detailRunId
-          ? detailLookup.run
-          : null
-    const currentDetailError =
-      detailLookup?.runId === detailRunId ? detailLookup.error : null
-    const isLoadingDetail = !currentDetailRun && currentDetailError === null
+  const detailRunId = getDetailRunId(routeHash)
+  const isLogPage = routeHash === LOGS_HASH || detailRunId !== null
 
+  if (isLogPage) {
     return (
       <div className="app-shell result-detail-shell">
         <div className="utility-bar">
@@ -500,22 +477,24 @@ export default function App() {
           <a className="brand" href="#main">
             OS<span>Agent</span>
           </a>
-          <ConnectionStatus services={connectionServices} />
+          <div className="top-nav-actions">
+            <ConnectionStatus services={connectionServices} />
+            <a className="nav-page-link" href="#main">컨트롤 패널</a>
+          </div>
         </header>
 
         <OsResultDetailPage
-          error={currentDetailError}
-          isLoading={isLoadingDetail}
-          run={currentDetailRun}
-          runId={detailRunId}
+          initialRunId={detailRunId}
+          key={detailRunId ?? 'logs'}
+          storageName={storageHealth?.storage ?? null}
         />
 
         <footer>
           <div>
             <strong>OS Agent Minimum Test</strong>
-            <p>공통 최소 실험 결과 · 단일 실행 상세</p>
+            <p>Supabase 전체 실행 로그 · 선택 실행 상세</p>
           </div>
-          <span>run_id · policy · runtime · verifier</span>
+          <span>run_id · events · policy · runtime · verifier</span>
         </footer>
       </div>
     )
@@ -531,7 +510,10 @@ export default function App() {
         <a className="brand" href="#main">
           OS<span>Agent</span>
         </a>
-        <ConnectionStatus services={connectionServices} />
+        <div className="top-nav-actions">
+          <ConnectionStatus services={connectionServices} />
+          <a className="nav-page-link" href={LOGS_HASH}>로그 조회</a>
+        </div>
       </header>
 
       <main id="main">
@@ -546,8 +528,8 @@ export default function App() {
           </div>
           <div className="hero-aside">
             <p>
-              하나의 고정 EC2에서 Container와 Ubuntu Host 경계를 선택하고, 단일
-              권한의 OFF/ON 차이를 검증합니다.
+              하나의 고정 EC2에서 Container와 Ubuntu Host 경계를 선택하고, 여러
+              권한 조건의 OFF/ON 차이를 일괄 검증합니다.
             </p>
             <dl>
               <div>
@@ -658,10 +640,8 @@ export default function App() {
                 </div>
 
                 <PermissionControl
-                  enabled={permissionEnabled}
-                  onSelect={setPermissionId}
-                  onToggle={setPermissionEnabled}
-                  selectedId={activePermissionId}
+                  onChange={changePermissionSelection}
+                  selections={permissionSelections}
                   tests={permissionTests}
                 />
 
@@ -673,10 +653,12 @@ export default function App() {
 
                 <button
                   className="run-button"
-                  disabled={isRunning}
+                  disabled={isRunning || activePermissionSelections.length === 0}
                   type="submit"
                 >
-                  <span>{isRunning ? '실행 중' : '실험 실행'}</span>
+                  <span>
+                    {isRunning ? '통합 프로파일 실행 중' : '통합 실험 실행'}
+                  </span>
                   <span aria-hidden="true">↗</span>
                 </button>
               </form>

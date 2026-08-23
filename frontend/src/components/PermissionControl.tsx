@@ -2,10 +2,8 @@ import type { PermissionTest } from "../types";
 
 interface PermissionControlProps {
   tests: PermissionTest[];
-  selectedId: string;
-  enabled: boolean;
-  onSelect: (permissionId: string) => void;
-  onToggle: (enabled: boolean) => void;
+  selections: Record<string, boolean>;
+  onChange: (permissionId: string, enabled: boolean) => void;
 }
 
 const profileDescriptions: Record<string, { off: string; on: string }> = {
@@ -37,71 +35,70 @@ const profileDescriptions: Record<string, { off: string; on: string }> = {
 
 export function PermissionControl({
   tests,
-  selectedId,
-  enabled,
-  onSelect,
-  onToggle,
+  selections,
+  onChange,
 }: PermissionControlProps) {
-  const selected = tests.find((test) => test.id === selectedId) ?? tests[0];
-  const descriptions = selected ? profileDescriptions[selected.id] : null;
-
   return (
-    <div className="permission-control">
-      <div className="field-group">
-        <label className="field-label" htmlFor="permission-test">
-          권한 테스트 항목
-        </label>
-        <select
-          id="permission-test"
-          onChange={(event) => onSelect(event.target.value)}
-          value={selectedId}
-        >
-          {tests.map((test) => (
-            <option key={test.id} value={test.id}>
-              {test.label}
-            </option>
-          ))}
-        </select>
-        <p className="helper-text">{selected?.description}</p>
-      </div>
+    <fieldset className="permission-control">
+      <legend className="field-label">권한 테스트 항목</legend>
+      <p className="helper-text permission-guide">
+        각 항목에서 OFF·ON 하나를 선택합니다. 세 권한은 하나의 통합 프로파일로 동시에 적용됩니다.
+        <strong>{tests.length}개 권한 조합</strong>
+      </p>
 
-      <div className="permission-state">
-        <div>
-          <span className="field-label">권한 상태</span>
-          <p className="helper-text">한 번에 선택한 권한 하나만 변경합니다.</p>
+      <div className="permission-matrix">
+        <div aria-hidden="true" className="permission-matrix-header">
+          <span>테스트 항목</span>
+          <span>OFF 프로파일</span>
+          <span>ON 프로파일</span>
         </div>
-        <button
-          aria-checked={enabled}
-          className={`toggle${enabled ? " is-on" : ""}`}
-          onClick={() => onToggle(!enabled)}
-          role="switch"
-          type="button"
-        >
-          <span aria-hidden="true" className="toggle-track">
-            <span className="toggle-thumb" />
-          </span>
-          <span>{enabled ? "ON" : "OFF"}</span>
-        </button>
-      </div>
 
-      {selected ? (
-        <dl className="profile-pair">
-          <div className={enabled ? "" : "is-active"}>
-            <dt>비활성 권한 (OFF)</dt>
-            <dd>
-              <strong>{selected.off_profile}</strong>
-              <span>{descriptions?.off}</span>
-            </dd>
-          </div>
-          <div className={enabled ? "is-active" : ""}>
-            <dt>활성 권한 (ON)</dt>
-            <dd>
-              <strong>{selected.on_profile}</strong>
-              <span>{descriptions?.on}</span>
-            </dd>
-          </div>
-        </dl>
-      ) : null}
-    </div>
+        {tests.map((test, index) => {
+          const descriptions = profileDescriptions[test.id];
+          const selected = selections[test.id];
+          const offSelected = !selected;
+          const onSelected = selected;
+          const descriptionId = `permission-description-${test.id}`;
+
+          return (
+            <div className={`permission-matrix-row${offSelected || onSelected ? " is-selected" : ""}`} key={test.id}>
+              <div className="permission-test-copy">
+                <span>{String(index + 1).padStart(2, "0")}</span>
+                <strong>{test.label}</strong>
+                <small id={descriptionId}>{test.description}</small>
+              </div>
+
+              <label className={`permission-profile-choice${offSelected ? " is-active" : ""}`}>
+                <input
+                  aria-describedby={descriptionId}
+                  checked={offSelected}
+                  name={`${test.id}-profile`}
+                  onChange={() => onChange(test.id, false)}
+                  type="radio"
+                  value={`${test.id}:OFF`}
+                />
+                <span className="permission-profile-state">OFF</span>
+                <strong>{test.off_profile}</strong>
+                <small>{descriptions?.off}</small>
+              </label>
+
+              <label className={`permission-profile-choice${onSelected ? " is-active" : ""}`}>
+                <input
+                  aria-describedby={descriptionId}
+                  checked={onSelected}
+                  name={`${test.id}-profile`}
+                  onChange={() => onChange(test.id, true)}
+                  type="radio"
+                  value={`${test.id}:ON`}
+                />
+                <span className="permission-profile-state">ON</span>
+                <strong>{test.on_profile}</strong>
+                <small>{descriptions?.on}</small>
+              </label>
+            </div>
+          );
+        })}
+      </div>
+    </fieldset>
   );
 }

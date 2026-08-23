@@ -1,17 +1,30 @@
+import { useEffect, useState } from "react";
+
+import { deleteRun, getRun, getRuns } from "../api";
+import type { RunEvent, RunListResponse, RunRecord } from "../types";
 import { EventTimeline } from "./EventTimeline";
-import type { RunEvent, RunRecord } from "../types";
 
 interface OsResultDetailPageProps {
-  error: string | null;
-  isLoading: boolean;
-  run: RunRecord | null;
-  runId: string;
+  initialRunId: string | null;
+  storageName: string | null;
 }
 
+const PAGE_SIZE = 20;
 const UNIMPLEMENTED = "미구현";
+const KOREAN_DATE_TIME_FORMATTER = new Intl.DateTimeFormat("ko-KR", {
+  dateStyle: "medium",
+  timeStyle: "medium",
+});
 
 function collectedValue(value: string | null | undefined): string {
   return !value || value === "UNIMPLEMENTED" ? UNIMPLEMENTED : value;
+}
+
+function changedVariableValue(run: RunRecord): string {
+  const storedValue = collectedValue(run.changed_variable);
+  if (storedValue !== UNIMPLEMENTED) return storedValue;
+  if (!run.permission_id) return UNIMPLEMENTED;
+  return `${run.permission_id}:${run.permission_enabled ? "ON" : "OFF"}`;
 }
 
 function translateSubjectMode(mode: RunRecord["subject_mode"]): string {
@@ -23,6 +36,11 @@ function translateVerdict(result: RunRecord["test_result"]): string {
   if (result === "FAIL") return "실패";
   if (result === "INCONCLUSIVE") return "판정 불가";
   return UNIMPLEMENTED;
+}
+
+function formatTimestamp(value: string | null): string {
+  if (!value) return UNIMPLEMENTED;
+  return KOREAN_DATE_TIME_FORMATTER.format(new Date(value));
 }
 
 function findLatestEvent(run: RunRecord, eventType: string): RunEvent | undefined {
@@ -82,28 +100,8 @@ function ResultValue({ children }: { children: string }) {
   );
 }
 
-export function OsResultDetailPage({ error, isLoading, run, runId }: OsResultDetailPageProps) {
-  if (isLoading) {
-    return (
-      <main className="result-detail-main" id="main">
-        <p className="detail-loading" role="status">OS 실험 결과를 불러오는 중입니다.</p>
-      </main>
-    );
-  }
-
-  if (error || !run) {
-    return (
-      <main className="result-detail-main" id="main">
-        <a className="detail-back-link" href="#main">← 컨트롤 패널로 돌아가기</a>
-        <section className="detail-error" role="alert">
-          <span className="section-index">OS RESULT</span>
-          <h1>결과를 불러오지 못했습니다</h1>
-          <p>{error ?? `${runId} 실행 기록을 찾을 수 없습니다.`}</p>
-        </section>
-      </main>
-    );
-  }
-
+function RunDetail({ run }: { run: RunRecord }) {
+  const integratedRun = run.permission_results.length > 1;
   const profile = run.applied_profile ?? run.requested_profile;
   const profileValue = `${profile} · 버전: ${collectedValue(run.profile_version)}`;
   const workloadType =
@@ -113,21 +111,19 @@ export function OsResultDetailPage({ error, isLoading, run, runId }: OsResultDet
         ? "공격"
         : UNIMPLEMENTED;
   const behaviorPath = `${run.tool ?? UNIMPLEMENTED} · 경로 ID: ${collectedValue(run.action_path_id)}`;
-  const changedVariable = collectedValue(run.changed_variable);
+  const changedVariable = changedVariableValue(run);
   const evidenceReferences = (run.evidence_references?.length ?? 0) > 0
     ? run.evidence_references?.join(", ") ?? UNIMPLEMENTED
     : UNIMPLEMENTED;
   const resultClass = run.test_result?.toLowerCase() ?? "unimplemented";
 
   return (
-    <main className="result-detail-main" id="main">
-      <a className="detail-back-link" href="#main">← 컨트롤 패널로 돌아가기</a>
-
+    <div className="selected-log-detail">
       <header className="result-detail-hero">
         <div>
-          <span className="eyebrow">공통 최소 실험 결과 양식 · 01</span>
-          <h1>OS 결과 상세보기</h1>
-          <p>한 번의 실행 조건과 정책 판정, 실제 효과를 같은 run_id로 연결합니다.</p>
+          <span className="eyebrow">선택한 실행 · {run.run_id}</span>
+          <h2>OS 결과 상세</h2>
+          <p>실행 조건과 정책 판정, 실제 효과, 이벤트 Evidence를 같은 run_id로 연결합니다.</p>
         </div>
         <div className="detail-verdict">
           <span>최종 판정</span>
@@ -135,10 +131,46 @@ export function OsResultDetailPage({ error, isLoading, run, runId }: OsResultDet
         </div>
       </header>
 
+      {run.permission_results.length > 0 ? (
+        <section className="common-result-section" aria-labelledby="permission-results-title">
+          <div className="common-result-heading">
+            <div>
+              <span className="section-index">PROFILE</span>
+              <h2 id="permission-results-title">통합 권한 프로파일 결과</h2>
+            </div>
+            <p><strong>1 Run</strong> · {run.permission_results.length}개 권한 동시 적용</p>
+          </div>
+          <ul className="batch-result-list">
+            {run.permission_results.map((item) => (
+              <li key={item.permission_id}>
+                <div>
+                  <span>{item.permission_id}:{item.permission_enabled ? "ON" : "OFF"}</span>
+                  <strong>{item.applied_profile ?? item.requested_profile}</strong>
+                  <small>{item.resource_id} · {item.output ?? UNIMPLEMENTED}</small>
+                  <dl className="permission-hash-grid">
+                    <div>
+                      <dt>Before SHA-256</dt>
+                      <dd>{item.before_sha256 ?? UNIMPLEMENTED}</dd>
+                    </div>
+                    <div>
+                      <dt>After SHA-256</dt>
+                      <dd>{item.after_sha256 ?? UNIMPLEMENTED}</dd>
+                    </div>
+                  </dl>
+                </div>
+                <span className={`result-label ${item.test_result?.toLowerCase() ?? "unimplemented"}`}>
+                  {translateVerdict(item.test_result)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
       <section className="common-result-section" aria-labelledby="common-result-title">
         <div className="common-result-heading">
           <div>
-            <span className="section-index">01</span>
+            <span className="section-index">RESULT</span>
             <h2 id="common-result-title">실행 조건과 실제 효과</h2>
           </div>
           <p><strong>{run.run_id}</strong> 기준 단일 실행 결과</p>
@@ -196,16 +228,238 @@ export function OsResultDetailPage({ error, isLoading, run, runId }: OsResultDet
         <dl>
           <div><dt>Prompt</dt><dd>{run.prompt}</dd></div>
           <div><dt>Executor output</dt><dd>{run.output ?? UNIMPLEMENTED}</dd></div>
-          <div><dt>Before SHA-256</dt><dd>{run.before_sha256 ?? UNIMPLEMENTED}</dd></div>
-          <div><dt>After SHA-256</dt><dd>{run.after_sha256 ?? UNIMPLEMENTED}</dd></div>
-          <div><dt>시작 시각</dt><dd>{run.created_at}</dd></div>
-          <div><dt>완료 시각</dt><dd>{run.completed_at ?? UNIMPLEMENTED}</dd></div>
+          <div>
+            <dt>Before SHA-256</dt>
+            <dd>{integratedRun ? "통합 Run — 권한별 해시 참조" : run.before_sha256 ?? UNIMPLEMENTED}</dd>
+          </div>
+          <div>
+            <dt>After SHA-256</dt>
+            <dd>{integratedRun ? "통합 Run — 권한별 해시 참조" : run.after_sha256 ?? UNIMPLEMENTED}</dd>
+          </div>
+          <div><dt>시작 시각</dt><dd>{formatTimestamp(run.created_at)}</dd></div>
+          <div><dt>완료 시각</dt><dd>{formatTimestamp(run.completed_at)}</dd></div>
         </dl>
       </section>
 
       <section className="detail-events" aria-label="실행 이벤트 Evidence">
         <EventTimeline events={run.events} />
       </section>
+    </div>
+  );
+}
+
+export function OsResultDetailPage({ initialRunId, storageName }: OsResultDetailPageProps) {
+  const [page, setPage] = useState(1);
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const [listResponse, setListResponse] = useState<RunListResponse | null>(null);
+  const [listError, setListError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(initialRunId);
+  const [detailState, setDetailState] = useState<{
+    runId: string;
+    run: RunRecord | null;
+    error: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    let isActive = true;
+    getRuns(page, PAGE_SIZE)
+      .then((response) => {
+        if (!isActive) return;
+        setListResponse(response);
+        setSelectedRunId((current) => current ?? response.items[0]?.run_id ?? null);
+      })
+      .catch((reason) => {
+        if (!isActive) return;
+        setListError(reason instanceof Error ? reason.message : "실행 로그 목록을 불러오지 못했습니다.");
+      });
+    return () => {
+      isActive = false;
+    };
+  }, [page, refreshVersion]);
+
+  useEffect(() => {
+    if (!selectedRunId) return;
+    let isActive = true;
+    getRun(selectedRunId)
+      .then((response) => {
+        if (isActive) setDetailState({ runId: selectedRunId, run: response, error: null });
+      })
+      .catch((reason) => {
+        if (!isActive) return;
+        setDetailState({
+          runId: selectedRunId,
+          run: null,
+          error: reason instanceof Error ? reason.message : "실행 상세를 불러오지 못했습니다.",
+        });
+      });
+    return () => {
+      isActive = false;
+    };
+  }, [refreshVersion, selectedRunId]);
+
+  const total = listResponse?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const selectedRun = detailState?.runId === selectedRunId ? detailState.run : null;
+  const detailError = detailState?.runId === selectedRunId ? detailState.error : null;
+
+  function selectRun(runId: string) {
+    setSelectedRunId(runId);
+    setDetailState(null);
+  }
+
+  function changePage(nextPage: number) {
+    setSelectedRunId(null);
+    setDetailState(null);
+    setListError(null);
+    setListResponse(null);
+    window.history.replaceState(null, "", "#/logs");
+    setPage(nextPage);
+  }
+
+  function refreshLogs() {
+    setListError(null);
+    setDeleteError(null);
+    setListResponse(null);
+    setDetailState(null);
+    setRefreshVersion((value) => value + 1);
+  }
+
+  async function removeRun(runId: string) {
+    const confirmation = window.prompt(
+      `실행 로그와 연결된 이벤트를 영구 삭제합니다. 계속하려면 ${runId}를 입력하세요.`,
+    );
+    if (confirmation === null) return;
+    if (confirmation !== runId) {
+      setDeleteError("Run ID가 일치하지 않아 삭제를 취소했습니다.");
+      return;
+    }
+
+    setDeletingRunId(runId);
+    setDeleteError(null);
+    try {
+      await deleteRun(runId);
+      if (selectedRunId === runId) {
+        setSelectedRunId(null);
+        setDetailState(null);
+        window.history.replaceState(null, "", "#/logs");
+      }
+      if (listResponse?.items.length === 1 && page > 1) {
+        setPage((current) => current - 1);
+      }
+      setListResponse(null);
+      setRefreshVersion((value) => value + 1);
+    } catch (reason) {
+      setDeleteError(reason instanceof Error ? reason.message : "실행 로그를 삭제하지 못했습니다.");
+    } finally {
+      setDeletingRunId(null);
+    }
+  }
+
+  return (
+    <main className="result-detail-main" id="main">
+      <header className="log-page-hero">
+        <div>
+          <span className="eyebrow">SUPABASE RUN LOGS · 전체 기록</span>
+          <h1>OS 실행 로그 조회</h1>
+          <p>Supabase에 저장된 모든 실행을 최신순으로 탐색하고, 실행별 결과와 이벤트 Evidence를 확인합니다.</p>
+        </div>
+        <dl className="log-summary">
+          <div><dt>저장소</dt><dd>{storageName === "supabase" ? "Supabase" : storageName ?? "확인 중"}</dd></div>
+          <div><dt>전체 실행</dt><dd>{total.toLocaleString("ko-KR")}</dd></div>
+        </dl>
+      </header>
+
+      <section className="log-browser" aria-labelledby="log-list-title">
+        <div className="common-result-heading log-list-heading">
+          <div>
+            <span className="section-index">LOG INDEX</span>
+            <h2 id="log-list-title">실행 기록</h2>
+          </div>
+          <button className="log-refresh-button" onClick={refreshLogs} type="button">
+            목록 새로고침
+          </button>
+        </div>
+
+        {listError ? <p className="log-state-message is-error" role="alert">{listError}</p> : null}
+        {deleteError ? <p className="log-state-message is-error" role="alert">{deleteError}</p> : null}
+        {!listResponse && !listError ? <p className="log-state-message" role="status">Supabase 로그를 불러오는 중입니다.</p> : null}
+        {listResponse?.items.length === 0 ? <p className="log-state-message">저장된 실행 로그가 없습니다.</p> : null}
+
+        {listResponse?.items.length ? (
+          <div className="log-list-table-wrap">
+            <table className="log-list-table">
+              <caption className="sr-only">Supabase에 저장된 OS Agent 실행 로그 목록</caption>
+              <thead>
+                <tr>
+                  <th scope="col">실행 시각</th>
+                  <th scope="col">Run ID</th>
+                  <th scope="col">환경</th>
+                  <th scope="col">권한 변경</th>
+                  <th scope="col">Tool</th>
+                  <th scope="col">판정</th>
+                  <th scope="col">Prompt</th>
+                  <th scope="col">관리</th>
+                </tr>
+              </thead>
+              <tbody>
+                {listResponse.items.map((item) => {
+                  const selected = item.run_id === selectedRunId;
+                  const resultClass = item.test_result?.toLowerCase() ?? "unimplemented";
+                  return (
+                    <tr className={selected ? "is-selected" : undefined} key={item.run_id}>
+                      <td><time dateTime={item.created_at}>{formatTimestamp(item.created_at)}</time></td>
+                      <td>
+                        <a
+                          className="log-run-link"
+                          href={`#/os-results/${encodeURIComponent(item.run_id)}`}
+                          onClick={() => selectRun(item.run_id)}
+                        >
+                          {item.run_id}
+                        </a>
+                      </td>
+                      <td>{translateSubjectMode(item.subject_mode)}</td>
+                      <td>{changedVariableValue(item)}</td>
+                      <td>{item.tool ?? UNIMPLEMENTED}</td>
+                      <td><span className={`result-label ${resultClass}`}>{translateVerdict(item.test_result)}</span></td>
+                      <td className="log-prompt">{item.prompt}</td>
+                      <td>
+                        <button
+                          className="log-delete-button"
+                          disabled={deletingRunId !== null}
+                          onClick={() => removeRun(item.run_id)}
+                          type="button"
+                        >
+                          {deletingRunId === item.run_id ? "삭제 중" : "삭제"}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+
+        {total > PAGE_SIZE ? (
+          <nav className="log-pagination" aria-label="실행 로그 페이지">
+            <button disabled={page <= 1} onClick={() => changePage(page - 1)} type="button">이전</button>
+            <span>{page} / {totalPages}</span>
+            <button disabled={page >= totalPages} onClick={() => changePage(page + 1)} type="button">다음</button>
+          </nav>
+        ) : null}
+      </section>
+
+      {selectedRunId && !detailState ? <p className="detail-loading" role="status">선택한 실행의 전체 로그를 불러오는 중입니다.</p> : null}
+      {detailError ? (
+        <section className="detail-error" role="alert">
+          <span className="section-index">DETAIL ERROR</span>
+          <h2>상세 로그를 불러오지 못했습니다</h2>
+          <p>{detailError}</p>
+        </section>
+      ) : null}
+      {selectedRun ? <RunDetail run={selectedRun} /> : null}
     </main>
   );
 }

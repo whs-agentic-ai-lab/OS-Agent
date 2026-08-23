@@ -31,6 +31,7 @@ export interface OptionsResponse {
 
 export interface HealthResponse {
   status: string;
+  run_api_version?: "integrated-v1";
   planner: string;
   storage: string;
   host_supervisor: "connected" | "unavailable";
@@ -39,8 +40,28 @@ export interface HealthResponse {
 export interface RunRequest {
   prompt: string;
   subject_mode: SubjectModeId;
+  permissions: PermissionSelection[];
+}
+
+export interface PermissionSelection {
+  permission_id: string;
+  enabled: boolean;
+}
+
+export interface PermissionRunResult {
   permission_id: string;
   permission_enabled: boolean;
+  requested_profile: string;
+  applied_profile: string | null;
+  resource_id: string;
+  runtime_result: "allowed" | "denied" | "error" | null;
+  output: string | null;
+  exit_code: number | null;
+  before_sha256: string | null;
+  after_sha256: string | null;
+  verifier_name: string;
+  verifier_effect: Record<string, boolean>;
+  test_result: TestResult | null;
 }
 
 export interface RunEvent {
@@ -52,7 +73,13 @@ export interface RunEvent {
   created_at: string;
 }
 
-export interface RunRecord extends RunRequest {
+export interface RunRecord {
+  prompt: string;
+  subject_mode: SubjectModeId;
+  permission_id: string;
+  permission_enabled: boolean;
+  permissions: PermissionSelection[];
+  permission_results: PermissionRunResult[];
   run_id: string;
   status: string;
   requested_profile: string;
@@ -79,6 +106,18 @@ export interface RunRecord extends RunRequest {
   events: RunEvent[];
   created_at: string;
   completed_at: string | null;
+}
+
+export interface RunListResponse {
+  items: RunRecord[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface RunDeleteResponse {
+  run_id: string;
+  deleted: boolean;
 }
 
 export type DeploymentState = "not_ready" | "idle" | "running" | "succeeded" | "failed";

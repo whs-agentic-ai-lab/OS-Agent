@@ -19,6 +19,12 @@ class HostRunner(Protocol):
         profile_id: str,
     ) -> ExecutionResult: ...
 
+    def execute_integrated(
+        self,
+        profile_ids: list[str],
+        executions: list[dict[str, Any]],
+    ) -> tuple[list[str], list[ExecutionResult]]: ...
+
 
 class HostSupervisorClient:
     """Narrow client for the root-owned supervisor's Unix socket API."""
@@ -60,6 +66,30 @@ class HostSupervisorClient:
             before_sha256=body.get("before_sha256"),
             after_sha256=body.get("after_sha256"),
         )
+
+    def execute_integrated(
+        self,
+        profile_ids: list[str],
+        executions: list[dict[str, Any]],
+    ) -> tuple[list[str], list[ExecutionResult]]:
+        body = self._post(
+            "/v1/execute-integrated",
+            {"profile_ids": profile_ids, "executions": executions},
+        )
+        applied = body.get("applied_profiles")
+        raw_results = body.get("results")
+        if applied != profile_ids or not isinstance(raw_results, list):
+            raise RuntimeError("Host Supervisor 통합 실행 응답이 올바르지 않습니다.")
+        return applied, [
+            ExecutionResult(
+                runtime_result=str(item["runtime_result"]),
+                output=str(item["output"]),
+                exit_code=int(item["exit_code"]),
+                before_sha256=item.get("before_sha256"),
+                after_sha256=item.get("after_sha256"),
+            )
+            for item in raw_results
+        ]
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not self.socket_path.exists():

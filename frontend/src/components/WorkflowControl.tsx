@@ -28,9 +28,21 @@ interface WorkflowOverride {
   error: string | null;
 }
 
+interface WorkflowErrorLog {
+  id: string;
+  source: string;
+  message: string;
+  createdAt: string | null;
+}
+
 type WorkflowOverrides = Record<string, WorkflowOverride>;
 
 const LEGACY_STORAGE_KEY = "os-agent-test.workflow-overrides.v1";
+const workflowLogTimeFormatter = new Intl.DateTimeFormat("ko-KR", {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+});
 
 const statusLabels: Record<WorkflowNodeStatus, string> = {
   pending: "대기",
@@ -117,6 +129,10 @@ function deploymentNodes(deployment: DeploymentStatus | null, actionError: strin
       ];
 }
 
+function formatWorkflowLogTime(value: string | null): string {
+  return value ? workflowLogTimeFormatter.format(new Date(value)) : "시각 정보 없음";
+}
+
 export function WorkflowControl({
   deployment,
   environmentName,
@@ -139,7 +155,6 @@ export function WorkflowControl({
 }: WorkflowControlProps) {
   const [overrides, setOverrides] = useState<WorkflowOverrides>(loadOverrides);
   const [selectedId, setSelectedId] = useState("local");
-  const [errorDraft, setErrorDraft] = useState("");
 
   const nodes = useMemo(() => {
     const [image, terraform, runtime] = deploymentNodes(deployment, deploymentActionError);
@@ -225,6 +240,56 @@ export function WorkflowControl({
   const failedCount = nodes.filter((node) => node.status === "failed" || node.status === "blocked").length;
   const validEnvironmentName = /^[a-z0-9](?:[a-z0-9-]{1,14}[a-z0-9])$/.test(environmentName);
   const deploymentReady = Object.values(deployment?.prerequisites ?? {}).every(Boolean);
+  const errorLogs = useMemo(() => {
+    const entries: WorkflowErrorLog[] = [];
+    const messages = new Set<string>();
+    const addLog = (source: string, message: string | null | undefined, createdAt: string | null = null) => {
+      const normalized = message?.trim();
+      if (!normalized || messages.has(normalized)) return;
+      messages.add(normalized);
+      entries.push({
+        id: `${source}-${entries.length}`,
+        source,
+        message: normalized,
+        createdAt,
+      });
+    };
+
+    if (selected.id === "local") addLog("Backend", backendError);
+
+    if (["image", "terraform", "runtime", "teardown"].includes(selected.id)) {
+      for (const entry of deployment?.logs ?? []) {
+        if (entry.level === "error") {
+          addLog("AWS 배포", entry.message, entry.created_at);
+        }
+      }
+      addLog("AWS 배포", deployment?.error);
+      addLog("AWS 배포", deploymentActionError);
+    }
+
+    if (selected.id === "tunnel") {
+      addLog("SSM", tunnelActionError);
+      addLog("SSM", tunnel?.error);
+      for (const [index, message] of (tunnel?.logs ?? []).entries()) {
+        if (/error|failed|failure|denied|오류|실패|거부/i.test(message)) {
+          addLog(`SSM #${index + 1}`, message);
+        }
+      }
+    }
+
+    if (selected.id === "test") {
+      addLog("Agent 실행", runError);
+      for (const event of run?.events ?? []) {
+        if (/ERROR|FAILED|FAILURE/.test(event.event_type)) {
+          addLog(event.source, `${event.event_type}: ${event.message}`, event.created_at);
+        }
+      }
+    }
+
+    addLog("상태", selected.error);
+
+    return entries;
+  }, [backendError, deployment, deploymentActionError, run, runError, selected.error, selected.id, tunnel, tunnelActionError]);
 
   function saveOverrides(next: WorkflowOverrides) {
     setOverrides(next);
@@ -238,19 +303,10 @@ export function WorkflowControl({
     const next = { ...overrides };
     delete next[selected.id];
     saveOverrides(next);
-    setErrorDraft("");
   }
 
   function clearAllOverrides() {
     saveOverrides({});
-    setErrorDraft("");
-  }
-
-  function recordError() {
-    const message = errorDraft.trim();
-    if (!message) return;
-    setManualStatus("failed", message);
-    setErrorDraft("");
   }
 
   return (
@@ -272,10 +328,7 @@ export function WorkflowControl({
           <li key={node.id}>
             <button
               className={`workflow-node is-${node.status}${selected.id === node.id ? " is-selected" : ""}`}
-              onClick={() => {
-                setSelectedId(node.id);
-                setErrorDraft(node.error ?? "");
-              }}
+              onClick={() => setSelectedId(node.id)}
               type="button"
             >
               <span className="workflow-node-meta">
@@ -310,21 +363,31 @@ export function WorkflowControl({
           <button className="workflow-reset-node" disabled={!overrides[selected.id]} onClick={clearSelectedOverride} type="button">
             자동 상태로 복원
           </button>
+          <button className="workflow-reset-node" disabled={Object.keys(overrides).length === 0} onClick={clearAllOverrides} type="button">
+            전체 수동 상태 초기화
+          </button>
         </div>
 
-        <div className="workflow-error-control">
-          <label htmlFor="workflow-error">오류 기록</label>
-          <textarea
-            id="workflow-error"
-            onChange={(event) => setErrorDraft(event.target.value)}
-            placeholder="재현 조건이나 실패 원인을 기록하세요."
-            rows={2}
-            value={errorDraft}
-          />
-          <div>
-            <button disabled={!errorDraft.trim()} onClick={recordError} type="button">오류로 기록</button>
-            <button disabled={Object.keys(overrides).length === 0} onClick={clearAllOverrides} type="button">전체 수동 상태 초기화</button>
+        <div className="workflow-error-log" aria-live="polite">
+          <div className="workflow-error-log-heading">
+            <span>오류 로그</span>
+            <b>{errorLogs.length}</b>
           </div>
+          {errorLogs.length > 0 ? (
+            <ol>
+              {errorLogs.map((entry) => (
+                <li key={entry.id}>
+                  <div>
+                    <strong>{entry.source}</strong>
+                    <time>{formatWorkflowLogTime(entry.createdAt)}</time>
+                  </div>
+                  <p>{entry.message}</p>
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <p className="workflow-error-empty">선택한 노드에서 수집된 오류가 없습니다.</p>
+          )}
         </div>
 
         <div className="workflow-context-action">
