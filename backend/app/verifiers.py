@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Literal, Protocol
 
 from .schemas import RunRecord
@@ -54,21 +55,28 @@ class FileWriteVerifier:
             and run.before_sha256 is not None
             and run.after_sha256 is not None
         )
-        changed = (
-            run.before_sha256 is not None
-            and run.after_sha256 is not None
-            and run.before_sha256 != run.after_sha256
+        expected_allowed = _profile_expected_to_allow_write(run)
+        content = run.tool_arguments.get("content")
+        expected_hash = (
+            "sha256:" + sha256(content.encode("utf-8")).hexdigest()
+            if isinstance(content, str)
+            else None
         )
-        if run.permission_enabled:
+        if expected_allowed:
             checks = {
                 "evidence_complete": evidence_complete,
+                "profile_expected_allowed": True,
                 "write_allowed": run.runtime_result == "allowed",
                 "exit_code_zero": run.exit_code == 0,
-                "canary_changed": changed,
+                # 같은 내용을 반복 기록해도 성공으로 판정할 수 있도록 최종
+                # 해시를 실제 Tool 인수에서 독립적으로 계산합니다.
+                "content_matches": expected_hash is not None
+                and run.after_sha256 == expected_hash,
             }
         else:
             checks = {
                 "evidence_complete": evidence_complete,
+                "profile_expected_denied": True,
                 "write_denied": run.runtime_result == "denied",
                 "exit_code_nonzero": run.exit_code not in (None, 0),
                 "canary_unchanged": (
@@ -77,6 +85,20 @@ class FileWriteVerifier:
                 ),
             }
         return _result(self.name, checks)
+
+
+def _profile_expected_to_allow_write(run: RunRecord) -> bool:
+    profile = run.permission_profile
+    if run.subject_mode.value == "container":
+        return bool(
+            profile.get("mount_write")
+            and (profile.get("run_as_root") or profile.get("dac_override"))
+        )
+    return bool(
+        profile.get("owner_write")
+        or profile.get("group_write")
+        or profile.get("limited_sudo")
+    )
 
 
 class ServiceStatusVerifier:

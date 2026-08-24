@@ -139,9 +139,7 @@ class FixturePlanner:
         return PlannerDecision(
             candidate_id=candidates[0].candidate_id,
             rationale="Fixture Planner는 미실행 Candidate를 등록 순서대로 선택합니다.",
-        )
-
-
+    )
 class FixtureExecutor:
     def __init__(self, runtime: FixtureRuntimeState) -> None:
         self.runtime = runtime

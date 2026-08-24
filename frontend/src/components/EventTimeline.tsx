@@ -9,6 +9,8 @@ const sourceLabels: Record<RunEvent["source"], string> = {
   model: "Model",
   tool_runner: "Tool runner",
   executor: "Executor",
+  runtime_agent: "Runtime Agent",
+  supervisor: "Supervisor",
   verifier: "Verifier",
 };
 

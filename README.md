@@ -7,7 +7,7 @@
 ```text
 os-Agent-test/
 ├─ frontend/           # 로컬/Vercel React·Vite 대시보드
-├─ backend/            # FastAPI·Tool Runner·Host client와 Supervisor 배포 소스
+├─ backend/            # Control Backend, 환경 Runtime Agent, root Supervisor 소스
 ├─ infra/
 │  └─ terraform/       # 고정 인프라와 root-owned Supervisor 설치
 ├─ data/
@@ -20,14 +20,16 @@ os-Agent-test/
 ## 현재 동작 범위
 
 - 실행 경계: `Container`, `Ubuntu Host`
-- 경계별 권한 시험: 3개, 한 번에 하나만 OFF/ON
+- 경계별 권한 시험: 세 OFF/ON 값을 하나의 `permission_profile` 묶음으로 적용
+- Run 의미: 권한 프로파일 묶음 1개 + 환경 Runtime 1회 실행 + 독립 판정 1개 = `run_id` 1개
 - Tool: `file_read`, `file_write`, `service_status`
-- 모델: `OPENROUTER_API_KEY`가 없으면 로컬 규칙 플래너, 있으면 OpenRouter Tool Call
-- 로그: Profile → Model → Tool Runner → Executor → Verifier 이벤트
+- Agent Runtime: Container/Host 각각의 경계 안에서 Planner → Executor → Tool 실행
+- Control Backend: Run 배포·결과 수집·독립 Verifier·Supabase 저장만 담당하며 Canary를 직접 읽거나 쓰지 않음
+- 로그: Profile → Supervisor → 환경 Planner/Tool/Executor → Control Verifier 이벤트
 - 저장소: Supabase 설정 시 `runs`·`run_events` 영구 저장, 미설정 시 로컬 메모리 fallback
 - 로그 조회: 메인 네비게이션의 `로그 조회`에서 Supabase 전체 실행을 최신순·20건 단위로 탐색하고 실행별 공통 결과와 모든 이벤트 확인
 - 로그 삭제: 목록에서 Run ID를 다시 입력해 단일 실행을 삭제하며 연결된 `run_events`도 함께 삭제
-- OS 권한: Container는 로컬 fixture, Ubuntu Host는 EC2의 실제 사용자·그룹·파일 모드·제한된 sudo로 검증
+- OS 권한: Container는 실제 mount mode·UID·capability, Ubuntu Host는 실제 소유자·그룹·제한된 sudo 상태로 검증
 - 환경 배포: 로컬 대시보드 → 로컬 FastAPI → 고정 Terraform 순서로 AWS 환경과 백엔드 이미지를 자동 배포
 - 환경 삭제: 동일한 로컬 Terraform state로 AWS 리소스와 ECR 저장소를 자동 삭제
 - SSM 연결: 관리 노드가 Online이 될 때까지 대기한 뒤 `127.0.0.1:8001 → EC2:8000` 자동 연결
@@ -85,13 +87,13 @@ OS 권한 모델, 최종 Tool과 Independent Verifier가 확정되면 각각의 
 
 ### Ubuntu Host 실행 경계
 
-Host 실험은 로컬 백엔드에서 실행되지 않으며, SSM 터널로 연결된 EC2 백엔드에서만 활성화된다. EC2의 root-owned `os-agent-host-supervisor`가 고정된 여섯 Profile ID만 받아 다음 상태를 실제 OS에 적용하고 재확인한다.
+실제 권한 실험은 로컬 백엔드에서 실행되지 않으며, SSM 터널로 연결된 EC2 Runtime에서만 활성화된다. EC2의 root-owned `os-agent-host-supervisor`는 완전한 프로파일 묶음을 allowlist 검증한 뒤 권한을 적용하고 환경 Runtime Agent를 시작한다.
 
 - `owner_write`: `agent-host` 소유 Canary의 owner write bit OFF/ON
 - `group_write`: `agent-host`의 전용 `agent-trial` 그룹 미가입/가입
 - `limited_sudo`: 고정 `--sudo-helper` 한 개에 대한 sudoers drop-in 없음/있음
 
-백엔드 컨테이너는 Docker socket이나 root 권한을 받지 않는다. UID 10003 백엔드와 UID 10004 실험 사용자를 분리하고, 전용 GID 10006 Unix socket만 Supervisor에 연결한다. Tool 이름, Resource ID, Profile ID와 입력 길이는 Supervisor에서 다시 allowlist 검증한다.
+Container Run은 동일한 묶음의 `mount_write`, `run_as_root`, `dac_override`를 한 시험 컨테이너에 동시에 적용한다. Host Run은 `owner_write`, `group_write`, `limited_sudo`를 한 Canary에 동시에 적용한 뒤 `agent-host` Runtime을 시작한다. 백엔드 컨테이너는 Docker socket이나 root 권한을 받지 않고 전용 Unix socket으로 Supervisor에 Run만 요청한다. 최종 PASS/FAIL은 환경 Runtime이 아닌 Control Backend의 독립 Verifier가 판정한다.
 
 배포 버튼은 Terraform으로 ECR을 준비하고, 백엔드 Docker 이미지를 push한 다음 전체 인프라를 apply한다. NAT Gateway, EC2, VPC Endpoint와 CloudWatch Logs 등 **비용이 발생할 수 있는 AWS 리소스**를 만든다.
 

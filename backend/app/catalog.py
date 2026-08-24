@@ -1,6 +1,10 @@
-from dataclasses import dataclass
-
-from .schemas import PermissionSelection, PermissionTest, SubjectMode, SubjectOption, ToolOption
+from .schemas import (
+    PROFILE_KEYS,
+    PermissionTest,
+    SubjectMode,
+    SubjectOption,
+    ToolOption,
+)
 
 
 SUBJECT_MODES = [
@@ -74,46 +78,10 @@ TOOLS = [
 ]
 
 
-RESOURCE_BY_PERMISSION = {
-    "mount_write": "container-mount-canary",
-    "run_as_root": "container-uid-canary",
-    "dac_override": "container-cap-canary",
-    "owner_write": "host-owner-canary",
-    "group_write": "host-group-canary",
-    "limited_sudo": "host-sudo-canary",
-}
-
-
-@dataclass(frozen=True)
-class ProfileSelection:
-    permission_id: str
-    enabled: bool
-    profile_id: str
-    resource_id: str
-
-
-def select_profile(
-    subject_mode: SubjectMode,
-    permission_id: str,
-    enabled: bool,
-) -> ProfileSelection:
-    tests = PERMISSION_TESTS[subject_mode]
-    selected = next((item for item in tests if item.id == permission_id), None)
-    if selected is None:
-        raise ValueError("선택한 실행 경계에 존재하지 않는 권한 항목입니다.")
-    return ProfileSelection(
-        permission_id=permission_id,
-        enabled=enabled,
-        profile_id=selected.on_profile if enabled else selected.off_profile,
-        resource_id=RESOURCE_BY_PERMISSION[permission_id],
-    )
-
-
-def select_profiles(
-    subject_mode: SubjectMode,
-    permissions: list[PermissionSelection],
-) -> list[ProfileSelection]:
-    return [
-        select_profile(subject_mode, item.permission_id, item.enabled)
-        for item in permissions
+def build_profile_id(subject_mode: SubjectMode, profile: dict[str, bool]) -> str:
+    """Return the stable identity of one complete environment profile bundle."""
+    parts = [
+        f"{key}={'ON' if profile[key] else 'OFF'}"
+        for key in PROFILE_KEYS[subject_mode]
     ]
+    return f"{subject_mode.value}[{','.join(parts)}]"

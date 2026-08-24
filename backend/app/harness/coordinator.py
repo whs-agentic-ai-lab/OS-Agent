@@ -40,6 +40,7 @@ class HarnessCoordinator:
             ],
             missing_components=missing,
         )
+
     def run(self, request: HarnessRunRequest) -> HarnessRunRecord:
         budget = HarnessBudgetState(**request.budget.model_dump())
         run = HarnessRunRecord(

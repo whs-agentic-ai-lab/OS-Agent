@@ -27,30 +27,10 @@ const FIXTURE_PROFILES: Array<{
   mode: SubjectModeId;
   write: boolean;
 }> = [
-  {
-    id: "fixture-container-readonly",
-    label: "Container · Read only",
-    mode: "container",
-    write: false,
-  },
-  {
-    id: "fixture-container-write",
-    label: "Container · Write",
-    mode: "container",
-    write: true,
-  },
-  {
-    id: "fixture-host-readonly",
-    label: "Host · Read only",
-    mode: "host",
-    write: false,
-  },
-  {
-    id: "fixture-host-write",
-    label: "Host · Write",
-    mode: "host",
-    write: true,
-  },
+  { id: "fixture-container-readonly", label: "Container · Read only", mode: "container", write: false },
+  { id: "fixture-container-write", label: "Container · Write", mode: "container", write: true },
+  { id: "fixture-host-readonly", label: "Host · Read only", mode: "host", write: false },
+  { id: "fixture-host-write", label: "Host · Write", mode: "host", write: true },
 ];
 
 const FIXTURE_TOOLS = [
@@ -67,12 +47,8 @@ function statusLabel(status: HarnessStatus | null): string {
 export function HarnessPanel() {
   const [liveStatus, setLiveStatus] = useState<HarnessStatus | null>(null);
   const [fixtureStatus, setFixtureStatus] = useState<HarnessStatus | null>(null);
-  const [selectedProfileId, setSelectedProfileId] = useState(
-    FIXTURE_PROFILES[0].id,
-  );
-  const [objective, setObjective] = useState(
-    "권한별 Tool 실행, 독립 검증, 상태 Reset을 확인한다.",
-  );
+  const [selectedProfileId, setSelectedProfileId] = useState(FIXTURE_PROFILES[0].id);
+  const [objective, setObjective] = useState("권한별 Tool 실행, 독립 검증, 상태 Reset을 확인한다.");
   const [run, setRun] = useState<HarnessRunRecord | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -80,7 +56,6 @@ export function HarnessPanel() {
 
   useEffect(() => {
     let isActive = true;
-
     Promise.all([getHarnessStatus(), getFixtureHarnessStatus()])
       .then(([nextLiveStatus, nextFixtureStatus]) => {
         if (!isActive) return;
@@ -90,47 +65,34 @@ export function HarnessPanel() {
       })
       .catch((reason) => {
         if (!isActive) return;
-        setError(
-          reason instanceof Error
-            ? reason.message
-            : "Harness 상태를 불러오지 못했습니다.",
-        );
+        setError(reason instanceof Error ? reason.message : "Harness 상태를 불러오지 못했습니다.");
       })
       .finally(() => {
         if (isActive) setIsLoading(false);
       });
-
     return () => {
       isActive = false;
     };
   }, []);
 
   const selectedProfile =
-    FIXTURE_PROFILES.find((profile) => profile.id === selectedProfileId) ??
-    FIXTURE_PROFILES[0];
+    FIXTURE_PROFILES.find((profile) => profile.id === selectedProfileId) ?? FIXTURE_PROFILES[0];
 
   async function submitFixtureRun(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!objective.trim() || !fixtureStatus?.ready) return;
-
     setIsRunning(true);
     setRun(null);
     setError(null);
     try {
-      setRun(
-        await createFixtureHarnessRun({
-          objective: objective.trim(),
-          subject_mode: selectedProfile.mode,
-          scenario_id: "dashboard-self-test",
-          permission_profile_id: selectedProfile.id,
-        }),
-      );
+      setRun(await createFixtureHarnessRun({
+        objective: objective.trim(),
+        subject_mode: selectedProfile.mode,
+        scenario_id: "dashboard-self-test",
+        permission_profile_id: selectedProfile.id,
+      }));
     } catch (reason) {
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : "Fixture Harness 실행에 실패했습니다.",
-      );
+      setError(reason instanceof Error ? reason.message : "Fixture Harness 실행에 실패했습니다.");
     } finally {
       setIsRunning(false);
     }
@@ -142,10 +104,7 @@ export function HarnessPanel() {
         <div>
           <span className="section-index">H1</span>
           <h2 id="harness-title">Agent Harness</h2>
-          <p>
-            실제 OS Adapter 연결 상태와 안전한 메모리 Fixture 자가진단을 분리해
-            확인합니다.
-          </p>
+          <p>실제 OS Adapter 연결 상태와 안전한 메모리 Fixture 자가진단을 분리해 확인합니다.</p>
         </div>
         <div className="harness-status-group" aria-live="polite">
           <span className={`harness-status ${liveStatus?.ready ? "is-ready" : "is-waiting"}`}>
@@ -174,14 +133,12 @@ export function HarnessPanel() {
             <h3>테스트 Fixture</h3>
             <p>실제 파일·명령·네트워크를 건드리지 않는 Harness 자가진단입니다.</p>
           </div>
-
           <dl className="fixture-summary">
             <div><dt>권한 Profile</dt><dd>4</dd></div>
             <div><dt>Tool</dt><dd>3</dd></div>
             <div><dt>Verifier</dt><dd>1</dd></div>
             <div><dt>Resetter</dt><dd>1</dd></div>
           </dl>
-
           <ul className="fixture-tool-list">
             {FIXTURE_TOOLS.map((tool) => (
               <li key={tool.id}>
@@ -198,39 +155,20 @@ export function HarnessPanel() {
             <h3>Fixture Run 실행</h3>
             <p>State → Plan → Execute → Verify → Reset 전체 수명주기를 실행합니다.</p>
           </div>
-
           <label htmlFor="fixture-profile">권한 Profile</label>
-          <select
-            id="fixture-profile"
-            onChange={(event) => setSelectedProfileId(event.target.value)}
-            value={selectedProfileId}
-          >
+          <select id="fixture-profile" onChange={(event) => setSelectedProfileId(event.target.value)} value={selectedProfileId}>
             {FIXTURE_PROFILES.map((profile) => (
               <option key={profile.id} value={profile.id}>{profile.label}</option>
             ))}
           </select>
-
           <div className="fixture-profile-meta">
             <span>Boundary · {selectedProfile.mode}</span>
             <span>Write · {selectedProfile.write ? "ALLOW" : "DENY"}</span>
           </div>
-
           <label htmlFor="fixture-objective">Objective</label>
-          <textarea
-            id="fixture-objective"
-            maxLength={4000}
-            onChange={(event) => setObjective(event.target.value)}
-            rows={3}
-            value={objective}
-          />
-
+          <textarea id="fixture-objective" maxLength={4000} onChange={(event) => setObjective(event.target.value)} rows={3} value={objective} />
           {error ? <p className="error-message" role="alert">{error}</p> : null}
-
-          <button
-            className="fixture-run-button"
-            disabled={isRunning || !fixtureStatus?.ready || !objective.trim()}
-            type="submit"
-          >
+          <button className="fixture-run-button" disabled={isRunning || !fixtureStatus?.ready || !objective.trim()} type="submit">
             <span>{isRunning ? "Harness 실행 중" : "Fixture Harness 실행"}</span>
             <span aria-hidden="true">↗</span>
           </button>
@@ -241,14 +179,10 @@ export function HarnessPanel() {
             <span>VERIFICATION</span>
             <h3>검증 결과</h3>
           </div>
-
           {run ? (
             <>
               <div className="harness-result-summary">
-                <div>
-                  <span>Run</span>
-                  <code>{run.run_id}</code>
-                </div>
+                <div><span>Run</span><code>{run.run_id}</code></div>
                 <strong className={`is-${run.status.toLowerCase()}`}>{run.status}</strong>
               </div>
               <ul className="harness-action-list">
@@ -262,9 +196,7 @@ export function HarnessPanel() {
                         <small>{action.execution.success ? "실행 허용" : action.execution.error_code}</small>
                       </div>
                       <div>
-                        <span className={`verification-badge is-${action.verification.status.toLowerCase()}`}>
-                          {action.verification.status}
-                        </span>
+                        <span className={`verification-badge is-${action.verification.status.toLowerCase()}`}>{action.verification.status}</span>
                         <small>{checks.filter(Boolean).length}/{checks.length} checks · {action.reset.status}</small>
                       </div>
                     </li>
@@ -277,10 +209,7 @@ export function HarnessPanel() {
               </div>
             </>
           ) : (
-            <p className="harness-result-empty">
-              Profile을 선택해 실행하면 Tool별 허용·거부, 독립 검증, Reset 결과가
-              표시됩니다.
-            </p>
+            <p className="harness-result-empty">Profile을 선택해 실행하면 Tool별 허용·거부, 독립 검증, Reset 결과가 표시됩니다.</p>
           )}
         </div>
       </div>

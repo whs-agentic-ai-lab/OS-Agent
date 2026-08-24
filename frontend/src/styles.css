@@ -254,6 +254,11 @@ textarea:focus, select:focus { border-color: var(--focus); box-shadow: 0 0 0 3px
 .output-block { margin-top: 16px; padding: 16px; color: #fff; background: var(--log); border-radius: var(--radius-md); }
 .output-block > span { color: #b7b8bf; }
 .output-block p { margin: 8px 0 0; font-family: "JetBrains Mono", Consolas, monospace; font-size: 12px; line-height: 1.6; }
+.profile-bundle-summary { margin-top: 16px; padding: 16px; background: var(--primary-soft); border: 1px solid #b7d6ff; border-radius: var(--radius-md); }
+.profile-bundle-summary > span, .profile-bundle-detail > div > span { color: var(--primary); font-size: 10px; font-weight: 700; letter-spacing: .06em; }
+.profile-bundle-summary > strong, .profile-bundle-detail > div > strong { display: block; margin-top: 6px; overflow-wrap: anywhere; font-size: 13px; }
+.profile-bundle-summary ul, .profile-bundle-detail ul { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
+.profile-bundle-summary li, .profile-bundle-detail li { padding: 6px 9px; color: var(--ink); background: #fff; border: 1px solid var(--border); border-radius: 999px; font-family: "JetBrains Mono", Consolas, monospace; font-size: 10px; }
 .batch-result-guide { margin: -8px 0 16px; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .batch-result-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
 .batch-result-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px 12px; align-items: center; padding: 14px; background: var(--surface-subtle); border: 1px solid var(--border); border-radius: var(--radius-md); }
@@ -319,6 +324,13 @@ textarea:focus, select:focus { border-color: var(--focus); box-shadow: 0 0 0 3px
 .common-result-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; padding: 28px 32px; border-bottom: 1px solid var(--border); }
 .common-result-heading p { margin: 0; color: var(--muted); font-size: 12px; }
 .common-result-heading p strong { color: var(--ink); font-family: "JetBrains Mono", Consolas, monospace; }
+.profile-bundle-detail { padding: 24px 32px; }
+.profile-bundle-detail small { display: block; margin-top: 8px; color: var(--muted); }
+.profile-bundle-detail li { display: flex; gap: 8px; }
+.profile-bundle-detail li strong { color: var(--primary); }
+.profile-bundle-detail details { margin-top: 18px; padding: 12px 14px; background: var(--surface-subtle); border-radius: var(--radius-sm); }
+.profile-bundle-detail summary { cursor: pointer; font-size: 12px; font-weight: 700; }
+.profile-bundle-detail pre { margin: 12px 0 0; overflow-x: auto; font-size: 11px; line-height: 1.5; }
 .common-result-table-wrap { overflow-x: auto; }
 .common-result-table { width: 100%; min-width: 1900px; border-collapse: collapse; table-layout: fixed; }
 .common-result-table th, .common-result-table td { padding: 16px 20px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); }

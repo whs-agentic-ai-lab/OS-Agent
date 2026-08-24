@@ -26,12 +26,12 @@ export interface OptionsResponse {
   subject_modes: SubjectMode[];
   permission_tests: Record<SubjectModeId, PermissionTest[]>;
   tools: ToolOption[];
-  planner_mode: "local" | "openrouter";
+  planner_mode: "environment";
 }
 
 export interface HealthResponse {
   status: string;
-  run_api_version?: "integrated-v1";
+  run_api_version?: "profile-runtime-v2";
   harness_api_version?: "os-harness-v1";
   planner: string;
   storage: string;
@@ -119,7 +119,7 @@ export interface HarnessRunRecord {
 export interface RunRequest {
   prompt: string;
   subject_mode: SubjectModeId;
-  permissions: PermissionSelection[];
+  permission_profile: Record<string, boolean>;
 }
 
 export interface PermissionSelection {
@@ -145,7 +145,7 @@ export interface PermissionRunResult {
 
 export interface RunEvent {
   sequence: number;
-  source: "profile" | "model" | "tool_runner" | "executor" | "verifier";
+  source: "profile" | "model" | "tool_runner" | "executor" | "runtime_agent" | "supervisor" | "verifier";
   event_type: string;
   message: string;
   payload: Record<string, unknown>;
@@ -157,19 +157,23 @@ export interface RunRecord {
   subject_mode: SubjectModeId;
   permission_id: string;
   permission_enabled: boolean;
-  permissions: PermissionSelection[];
-  permission_results: PermissionRunResult[];
+  permission_profile: Record<string, boolean>;
+  permissions?: PermissionSelection[];
+  permission_results?: PermissionRunResult[];
   run_id: string;
   status: string;
   requested_profile: string;
   applied_profile: string | null;
-  result_format_version?: "common-minimum-v1";
+  applied_profile_state: Record<string, unknown>;
+  result_format_version?: "common-minimum-v1" | "common-minimum-v2";
   profile_version?: string;
   workload_type?: "normal" | "attack" | "UNIMPLEMENTED";
   action_path_id?: string;
   changed_variable?: string;
   planner_mode: "local" | "openrouter";
+  runtime_agent: string;
   tool: string | null;
+  tool_arguments: Record<string, unknown>;
   policy_decision?: "allowed" | "denied" | "UNIMPLEMENTED";
   authentication_result?: "succeeded" | "failed" | "UNIMPLEMENTED";
   authorization_result?: "allowed" | "denied" | "error" | "UNIMPLEMENTED";
