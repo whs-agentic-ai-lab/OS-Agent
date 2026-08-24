@@ -20,6 +20,7 @@ import {
 import { DeploymentPanel } from './components/DeploymentPanel'
 import { EnvironmentSelector } from './components/EnvironmentSelector'
 import { EventTimeline } from './components/EventTimeline'
+import { HarnessPanel } from './components/HarnessPanel'
 import { OsResultDetailPage } from './components/OsResultDetailPage'
 import { PermissionControl } from './components/PermissionControl'
 import { RunResult } from './components/RunResult'
@@ -547,6 +548,8 @@ export default function App() {
             </dl>
           </div>
         </section>
+
+        <HarnessPanel />
 
         <WorkflowControl
           key={

@@ -40,8 +40,11 @@ os-Agent-test/
 - `GET /api/harness/status`: Permission Provider, Tool Catalog, Planner, Executor, Verifier, Resetter 연결 상태 조회
 - `POST /api/harness/runs`: Harness Run 생성과 상태·Budget·종료 수명주기 실행
 - `GET /api/harness/runs/{run_id}`: In-memory Harness 실행 기록 조회
+- `GET /api/harness/fixtures/status`: 메모리 전용 Fixture 자가진단 준비 상태 조회
+- `POST /api/harness/fixture-runs`: Dashboard에서 안전한 Fixture 수명주기 실행
 - 현재 실제 OS Adapter는 연결 전이므로 Harness Run은 Tool을 실행하지 않고 `BLOCKED / MISSING_REQUIRED_COMPONENTS`로 종료
 - `create_fixture_harness_components()`를 테스트에서 주입하면 State → Frontier → Planner → Execute → Verify → Reset 전체 흐름 실행
+- Dashboard의 `Agent Harness` Panel에서 실제 Adapter 상태와 Fixture 실행 결과를 분리해 표시
 - 기존 `POST /api/runs`, Runtime Agent, root Supervisor, Terraform, SSM, Supabase 실행 경로는 그대로 유지
 
 OS 권한 모델, 최종 Tool과 Independent Verifier가 확정되면 각각의 Harness Port에 Adapter로 연결한다. Harness Core가 Domain 구현을 직접 import하거나 임시 권한 규칙을 만들지 않는다.
@@ -55,7 +58,7 @@ OS 권한 모델, 최종 Tool과 Independent Verifier가 확정되면 각각의 
 - Planner: 미실행 Candidate를 등록 순서대로 선택
 - Verifier: Profile의 기대 허용·거부와 메모리 상태 변화를 독립 Evidence ID로 판정
 - Resetter: 성공한 fixture write를 메모리 baseline으로 복구
-- Production 기본 앱에는 주입하지 않으며 TestClient 또는 명시적 개발 코드에서만 사용
+- 실제 Harness 실행에는 주입하지 않는다. 별도 `/api/harness/fixture-runs` 자가진단에서만 사용하며 외부 시스템에 Side effect를 만들지 않는다.
 
 ## 워크플로우 상태 관리
 

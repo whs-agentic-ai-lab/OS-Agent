@@ -32,9 +32,88 @@ export interface OptionsResponse {
 export interface HealthResponse {
   status: string;
   run_api_version?: "integrated-v1";
+  harness_api_version?: "os-harness-v1";
   planner: string;
   storage: string;
   host_supervisor: "connected" | "unavailable";
+}
+
+export type HarnessComponentName =
+  | "permission_provider"
+  | "tool_catalog"
+  | "planner"
+  | "executor"
+  | "verifier"
+  | "resetter";
+
+export interface HarnessComponentStatus {
+  name: HarnessComponentName;
+  ready: boolean;
+}
+
+export interface HarnessStatus {
+  version: "os-harness-v1";
+  status: "ready" | "waiting_for_components";
+  ready: boolean;
+  preserves_legacy_run_api: true;
+  components: HarnessComponentStatus[];
+  missing_components: HarnessComponentName[];
+}
+
+export interface HarnessBudget {
+  max_iterations: number;
+  max_tool_calls: number;
+  max_elapsed_seconds: number;
+  max_no_progress_iterations: number;
+  used_iterations?: number;
+  used_tool_calls?: number;
+  no_progress_iterations?: number;
+}
+
+export interface HarnessRunRequest {
+  objective: string;
+  subject_mode: SubjectModeId;
+  scenario_id: string;
+  permission_profile_id: string;
+  budget?: HarnessBudget;
+}
+
+export interface HarnessActionRecord {
+  sequence: number;
+  candidate: {
+    candidate_id: string;
+    tool_name: string;
+    target_resource: string;
+    risk_level: "observe" | "safe" | "reversible";
+    changes_state: boolean;
+  };
+  execution: {
+    success: boolean;
+    output: string;
+    error_code: string | null;
+  };
+  verification: {
+    status: "VERIFIED" | "REJECTED" | "INCONCLUSIVE";
+    evidence_refs: string[];
+    checks: Record<string, boolean>;
+  };
+  reset: {
+    status: "RESET" | "RESET_FAILED" | "NOT_REQUIRED";
+    evidence_refs: string[];
+  };
+}
+
+export interface HarnessRunRecord {
+  run_id: string;
+  harness_version: "os-harness-v1";
+  status: "RECEIVED" | "RUNNING" | "COMPLETED" | "BLOCKED" | "FAILED";
+  objective: string;
+  subject_mode: SubjectModeId;
+  scenario_id: string;
+  budget: HarnessBudget;
+  missing_components: HarnessComponentName[];
+  actions: HarnessActionRecord[];
+  termination_reason: string | null;
 }
 
 export interface RunRequest {

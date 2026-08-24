@@ -22,6 +22,7 @@ from .harness import (
     HarnessRunRequest,
     HarnessStatus,
     InMemoryHarnessRunRepository,
+    create_fixture_harness_components,
 )
 from .host_client import HostRunner, HostSupervisorClient
 from .planner import LocalPlanner, OpenRouterPlanner
@@ -62,6 +63,11 @@ def create_app(
     harness_coordinator = HarnessCoordinator(
         harness_components or HarnessComponents(),
         harness_repository,
+    )
+    fixture_harness_repository = InMemoryHarnessRunRepository()
+    fixture_harness_coordinator = HarnessCoordinator(
+        create_fixture_harness_components(),
+        fixture_harness_repository,
     )
     deployment_manager = DeploymentManager(active_settings)
     tunnel_manager = SsmTunnelManager(active_settings)
@@ -119,6 +125,32 @@ def create_app(
         run = harness_repository.get(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Harness 실행 기록을 찾을 수 없습니다.")
+        return run
+
+    @application.get("/api/harness/fixtures/status", response_model=HarnessStatus)
+    def fixture_harness_status() -> HarnessStatus:
+        return fixture_harness_coordinator.get_status()
+
+    @application.post(
+        "/api/harness/fixture-runs",
+        response_model=HarnessRunRecord,
+    )
+    def create_fixture_harness_run(
+        request: HarnessRunRequest,
+    ) -> HarnessRunRecord:
+        return fixture_harness_coordinator.run(request)
+
+    @application.get(
+        "/api/harness/fixture-runs/{run_id}",
+        response_model=HarnessRunRecord,
+    )
+    def get_fixture_harness_run(run_id: str) -> HarnessRunRecord:
+        run = fixture_harness_repository.get(run_id)
+        if run is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Fixture Harness 실행 기록을 찾을 수 없습니다.",
+            )
         return run
 
     @application.get("/api/deployments/current", response_model=DeploymentStatus)
