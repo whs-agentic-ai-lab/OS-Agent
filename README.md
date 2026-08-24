@@ -33,6 +33,30 @@ os-Agent-test/
 - SSM 연결: 관리 노드가 Online이 될 때까지 대기한 뒤 `127.0.0.1:8001 → EC2:8000` 자동 연결
 - 워크플로우 제어: 7단계 방향성 그래프, 자동 상태 동기화, 수동 체크포인트, 노드별 실제 오류 로그와 상태 복원
 
+## Agent Harness Core
+
+기존 단일 권한 Run과 실행 경계를 변경하지 않고, 향후 OS 권한·Tool·Verifier를 연결할 `os-harness-v1` Core를 별도 API로 제공한다.
+
+- `GET /api/harness/status`: Permission Provider, Tool Catalog, Planner, Executor, Verifier, Resetter 연결 상태 조회
+- `POST /api/harness/runs`: Harness Run 생성과 상태·Budget·종료 수명주기 실행
+- `GET /api/harness/runs/{run_id}`: In-memory Harness 실행 기록 조회
+- 현재 실제 OS Adapter는 연결 전이므로 Harness Run은 Tool을 실행하지 않고 `BLOCKED / MISSING_REQUIRED_COMPONENTS`로 종료
+- `create_fixture_harness_components()`를 테스트에서 주입하면 State → Frontier → Planner → Execute → Verify → Reset 전체 흐름 실행
+- 기존 `POST /api/runs`, Runtime Agent, root Supervisor, Terraform, SSM, Supabase 실행 경로는 그대로 유지
+
+OS 권한 모델, 최종 Tool과 Independent Verifier가 확정되면 각각의 Harness Port에 Adapter로 연결한다. Harness Core가 Domain 구현을 직접 import하거나 임시 권한 규칙을 만들지 않는다.
+
+### 메모리 전용 Fixture Adapter
+
+실제 OS 권한으로 오해하지 않도록 모든 이름에 `fixture-`를 사용하며 파일·명령·Network를 사용하지 않는다.
+
+- 권한 Profile: `fixture-container-readonly`, `fixture-container-write`, `fixture-host-readonly`, `fixture-host-write`
+- Tool: `fixture_file_read`, `fixture_file_write`, `fixture_service_status`
+- Planner: 미실행 Candidate를 등록 순서대로 선택
+- Verifier: Profile의 기대 허용·거부와 메모리 상태 변화를 독립 Evidence ID로 판정
+- Resetter: 성공한 fixture write를 메모리 baseline으로 복구
+- Production 기본 앱에는 주입하지 않으며 TestClient 또는 명시적 개발 코드에서만 사용
+
 ## 워크플로우 상태 관리
 
 대시보드 상단의 `최소 운영 워크플로우`는 로컬 개발부터 테스트 종료까지 7단계를 노드와 화살표로 표시한다.

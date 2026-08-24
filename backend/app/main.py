@@ -15,6 +15,14 @@ from .deployment import (
     TerminateInstanceRequest,
 )
 from .executor import AgentExecutor
+from .harness import (
+    HarnessComponents,
+    HarnessCoordinator,
+    HarnessRunRecord,
+    HarnessRunRequest,
+    HarnessStatus,
+    InMemoryHarnessRunRepository,
+)
 from .host_client import HostRunner, HostSupervisorClient
 from .planner import LocalPlanner, OpenRouterPlanner
 from .repository import create_run_repository
@@ -33,6 +41,7 @@ from .tunnel import SsmTunnelManager, TunnelRequest, TunnelStatus, TunnelStopReq
 def create_app(
     settings: Settings | None = None,
     host_runner: HostRunner | None = None,
+    harness_components: HarnessComponents | None = None,
 ) -> FastAPI:
     active_settings = settings or get_settings()
     repository = create_run_repository(
@@ -49,6 +58,11 @@ def create_app(
         active_settings.host_supervisor_socket
     )
     executor = AgentExecutor(planner, tool_runner, repository, active_host_runner)
+    harness_repository = InMemoryHarnessRunRepository()
+    harness_coordinator = HarnessCoordinator(
+        harness_components or HarnessComponents(),
+        harness_repository,
+    )
     deployment_manager = DeploymentManager(active_settings)
     tunnel_manager = SsmTunnelManager(active_settings)
 
@@ -67,6 +81,7 @@ def create_app(
         return {
             "status": "ok",
             "run_api_version": "integrated-v1",
+            "harness_api_version": "os-harness-v1",
             "planner": planner.mode,
             "storage": repository.storage_name,
             "host_supervisor": (
@@ -90,6 +105,21 @@ def create_app(
             tools=TOOLS,
             planner_mode=planner.mode,
         )
+
+    @application.get("/api/harness/status", response_model=HarnessStatus)
+    def harness_status() -> HarnessStatus:
+        return harness_coordinator.get_status()
+
+    @application.post("/api/harness/runs", response_model=HarnessRunRecord)
+    def create_harness_run(request: HarnessRunRequest) -> HarnessRunRecord:
+        return harness_coordinator.run(request)
+
+    @application.get("/api/harness/runs/{run_id}", response_model=HarnessRunRecord)
+    def get_harness_run(run_id: str) -> HarnessRunRecord:
+        run = harness_repository.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Harness 실행 기록을 찾을 수 없습니다.")
+        return run
 
     @application.get("/api/deployments/current", response_model=DeploymentStatus)
     def get_deployment() -> DeploymentStatus:
