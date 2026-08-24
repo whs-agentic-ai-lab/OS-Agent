@@ -1,4 +1,4 @@
-import type { DeploymentStatus, HealthResponse, OptionsResponse, RunDeleteResponse, RunListResponse, RunRecord, RunRequest, TunnelStatus } from "./types";
+import type { DeploymentStatus, HarnessRunRecord, HarnessRunRequest, HarnessStatus, HealthResponse, OptionsResponse, RunDeleteResponse, RunListResponse, RunRecord, RunRequest, TunnelStatus } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
@@ -19,6 +19,24 @@ export function getOptions(remote = false): Promise<OptionsResponse> {
 
 export function getHealth(remote = false): Promise<HealthResponse> {
   return request<HealthResponse>(agentPath("/api/health", remote));
+}
+
+export function getHarnessStatus(): Promise<HarnessStatus> {
+  return request<HarnessStatus>("/api/harness/status");
+}
+
+export function getFixtureHarnessStatus(): Promise<HarnessStatus> {
+  return request<HarnessStatus>("/api/harness/fixtures/status");
+}
+
+export function createFixtureHarnessRun(
+  payload: HarnessRunRequest,
+): Promise<HarnessRunRecord> {
+  return request<HarnessRunRecord>("/api/harness/fixture-runs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 }
 
 export function createRun(payload: RunRequest, remote = false): Promise<RunRecord> {
