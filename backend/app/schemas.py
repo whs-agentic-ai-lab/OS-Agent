@@ -39,7 +39,7 @@ class OptionsResponse(BaseModel):
     subject_modes: list[SubjectOption]
     permission_tests: dict[str, list[PermissionTest]]
     tools: list[ToolOption]
-    planner_mode: Literal["local", "openrouter"]
+    planner_mode: Literal["environment"] = "environment"
 
 
 class PermissionSelection(BaseModel):
@@ -47,9 +47,18 @@ class PermissionSelection(BaseModel):
     enabled: bool
 
 
+PROFILE_KEYS: dict[SubjectMode, tuple[str, str, str]] = {
+    SubjectMode.container: ("mount_write", "run_as_root", "dac_override"),
+    SubjectMode.host: ("owner_write", "group_write", "limited_sudo"),
+}
+
+
 class RunRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
     subject_mode: SubjectMode
+    permission_profile: dict[str, bool] = Field(default_factory=dict)
+    # v1 로그/클라이언트를 읽기 위한 호환 필드입니다. 신규 요청의 기준은
+    # permission_profile 객체 하나이며 목록 단위 실행은 하지 않습니다.
     permissions: list[PermissionSelection] = Field(default_factory=list)
     # 구버전 클라이언트 호환 필드. 새 클라이언트는 permissions만 전송합니다.
     permission_id: str | None = None
@@ -57,27 +66,55 @@ class RunRequest(BaseModel):
 
     @model_validator(mode="after")
     def normalize_permissions(self) -> "RunRequest":
-        if not self.permissions and self.permission_id and self.permission_enabled is not None:
+        if not self.permission_profile and self.permissions:
+            self.permission_profile = {
+                item.permission_id: item.enabled for item in self.permissions
+            }
+        if (
+            not self.permission_profile
+            and self.permission_id
+            and self.permission_enabled is not None
+        ):
+            # 단일 권한만 가진 v1 요청은 더 이상 새 통합 Run으로 실행할 수 없다.
+            # 명시적인 오류를 내기 위해 아래 exact-key 검증으로 넘긴다.
             self.permissions = [
                 PermissionSelection(
                     permission_id=self.permission_id,
                     enabled=self.permission_enabled,
                 )
             ]
-        if not self.permissions:
-            raise ValueError("하나 이상의 권한 프로파일을 선택하세요.")
-        permission_ids = [item.permission_id for item in self.permissions]
-        if len(permission_ids) != len(set(permission_ids)):
-            raise ValueError("같은 권한 항목을 중복 선택할 수 없습니다.")
-        if self.permission_id is None:
-            self.permission_id = self.permissions[0].permission_id
-            self.permission_enabled = self.permissions[0].enabled
+            self.permission_profile = {
+                self.permission_id: self.permission_enabled,
+            }
+        expected_keys = set(PROFILE_KEYS[self.subject_mode])
+        actual_keys = set(self.permission_profile)
+        if actual_keys != expected_keys:
+            missing = ", ".join(sorted(expected_keys - actual_keys)) or "없음"
+            extra = ", ".join(sorted(actual_keys - expected_keys)) or "없음"
+            raise ValueError(
+                "권한 프로파일 묶음은 선택 환경의 세 항목을 모두 포함해야 합니다. "
+                f"누락: {missing}; 잘못된 항목: {extra}"
+            )
+        self.permissions = [
+            PermissionSelection(permission_id=key, enabled=self.permission_profile[key])
+            for key in PROFILE_KEYS[self.subject_mode]
+        ]
+        self.permission_id = "profile_bundle"
+        self.permission_enabled = True
         return self
 
 
 class RunEvent(BaseModel):
     sequence: int
-    source: Literal["profile", "model", "tool_runner", "executor", "verifier"]
+    source: Literal[
+        "profile",
+        "model",
+        "tool_runner",
+        "executor",
+        "runtime_agent",
+        "supervisor",
+        "verifier",
+    ]
     event_type: str
     message: str
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -105,24 +142,55 @@ class PermissionRunResult(BaseModel):
     test_result: Literal["PASS", "FAIL", "INCONCLUSIVE"] | None = None
 
 
+class RuntimeDispatchRequest(BaseModel):
+    run_id: str
+    prompt: str
+    subject_mode: SubjectMode
+    permission_profile: dict[str, bool]
+    profile_id: str
+
+
+class RuntimeAgentResult(BaseModel):
+    run_id: str
+    subject_mode: SubjectMode
+    applied_profile: str
+    applied_profile_state: dict[str, Any]
+    runtime_agent: str
+    planner_mode: Literal["local", "openrouter"]
+    tool: Literal["file_read", "file_write", "service_status"]
+    tool_arguments: dict[str, Any] = Field(default_factory=dict)
+    policy_decision: Literal["allowed", "denied"] = "allowed"
+    runtime_result: Literal["allowed", "denied", "error"]
+    output: str
+    exit_code: int
+    before_sha256: str | None = None
+    after_sha256: str | None = None
+    events: list[RunEvent] = Field(default_factory=list)
+
+
 class RunRecord(BaseModel):
     run_id: str
     status: str
     prompt: str
     subject_mode: SubjectMode
-    permission_id: str
-    permission_enabled: bool
+    permission_id: str = "profile_bundle"
+    permission_enabled: bool = True
+    permission_profile: dict[str, bool] = Field(default_factory=dict)
     permissions: list[PermissionSelection] = Field(default_factory=list)
+    # v1 과거 로그 호환 전용. v2 신규 Run은 단일 Runtime 결과만 저장합니다.
     permission_results: list[PermissionRunResult] = Field(default_factory=list)
     requested_profile: str
     applied_profile: str | None = None
-    result_format_version: Literal["common-minimum-v1"] = "common-minimum-v1"
+    applied_profile_state: dict[str, Any] = Field(default_factory=dict)
+    result_format_version: Literal["common-minimum-v1", "common-minimum-v2"] = "common-minimum-v2"
     profile_version: str = "UNIMPLEMENTED"
     workload_type: Literal["normal", "attack", "UNIMPLEMENTED"] = "UNIMPLEMENTED"
     action_path_id: str = "UNIMPLEMENTED"
     changed_variable: str = "UNIMPLEMENTED"
     planner_mode: Literal["local", "openrouter"]
+    runtime_agent: str = "UNIMPLEMENTED"
     tool: str | None = None
+    tool_arguments: dict[str, Any] = Field(default_factory=dict)
     policy_decision: Literal["allowed", "denied", "UNIMPLEMENTED"] = "UNIMPLEMENTED"
     authentication_result: Literal["succeeded", "failed", "UNIMPLEMENTED"] = "UNIMPLEMENTED"
     authorization_result: Literal["allowed", "denied", "error", "UNIMPLEMENTED"] = "UNIMPLEMENTED"
@@ -147,11 +215,18 @@ class RunRecord(BaseModel):
             return value
 
         permissions = value.get("permissions")
+        permission_profile = value.get("permission_profile")
         permission_id = value.get("permission_id")
         permission_enabled = value.get("permission_enabled")
         if not permissions and isinstance(permission_id, str) and isinstance(permission_enabled, bool):
             permissions = [{"permission_id": permission_id, "enabled": permission_enabled}]
             value = {**value, "permissions": permissions}
+
+        if not permission_profile and permissions:
+            permission_profile = {
+                item["permission_id"]: item["enabled"] for item in permissions
+            }
+            value = {**value, "permission_profile": permission_profile}
 
         changed_variable = value.get("changed_variable")
         if (

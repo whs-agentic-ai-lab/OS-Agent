@@ -4,7 +4,9 @@
 
 `../schema.sql`은 검토 가능한 bootstrap SQL이다. 실제 Supabase 프로젝트를 연결할 때 다음 순서로 정식 마이그레이션을 생성한다.
 
-현재 bootstrap 스키마에는 `common-minimum-v1` 실행 결과 필드가 포함되어 있다. 기존 `runs` 테이블에 대해서도 `schema.sql`의 `alter table ... add column if not exists` 구문이 같은 필드를 추가한다. 수집기가 아직 없는 값은 DB에서 `UNIMPLEMENTED`로 저장하고 UI에서 `미구현`으로 표시한다.
+현재 bootstrap 스키마에는 `common-minimum-v2` 실행 결과 필드가 포함되어 있다. `permission_profile` 객체 하나가 한 `run_id`를 나타내며 `applied_profile_state`, `runtime_agent`, `tool_arguments`와 단일 Runtime Evidence를 함께 저장한다. 기존 v1의 `permissions`, `permission_results` 열은 과거 로그 읽기 호환을 위해 유지한다.
+
+원격 프로젝트에는 `profile_runtime_v2` 마이그레이션이 적용되어 있으며, `schema.sql`의 idempotent `alter table` 구문으로 같은 상태를 재현할 수 있다.
 
 1. Supabase CLI를 설치하고 `supabase --version` 및 `supabase migration new --help`를 확인한다.
 2. `supabase migration new initial_agent_runs`로 파일을 생성한다.

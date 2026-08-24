@@ -14,10 +14,18 @@ from .deployment import (
     InitializeRequest,
     TerminateInstanceRequest,
 )
-from .executor import AgentExecutor
-from .host_client import HostRunner, HostSupervisorClient
-from .planner import LocalPlanner, OpenRouterPlanner
+from .executor import RunCoordinator
+from .harness import (
+    HarnessComponents,
+    HarnessCoordinator,
+    HarnessRunRecord,
+    HarnessRunRequest,
+    HarnessStatus,
+    InMemoryHarnessRunRepository,
+    create_fixture_harness_components,
+)
 from .repository import create_run_repository
+from .runtime_client import EnvironmentRuntime, SupervisorRuntimeClient
 from .schemas import (
     OptionsResponse,
     RunDeleteResponse,
@@ -26,29 +34,33 @@ from .schemas import (
     RunRecord,
     RunRequest,
 )
-from .tools import ToolRunner
 from .tunnel import SsmTunnelManager, TunnelRequest, TunnelStatus, TunnelStopRequest
 
 
 def create_app(
     settings: Settings | None = None,
-    host_runner: HostRunner | None = None,
+    runtime_client: EnvironmentRuntime | None = None,
+    harness_components: HarnessComponents | None = None,
 ) -> FastAPI:
     active_settings = settings or get_settings()
     repository = create_run_repository(
         active_settings.supabase_url,
         active_settings.supabase_secret_key,
     )
-    tool_runner = ToolRunner(active_settings.runtime_dir)
-    planner = (
-        OpenRouterPlanner(active_settings.openrouter_api_key, active_settings.openrouter_model)
-        if active_settings.openrouter_api_key
-        else LocalPlanner()
-    )
-    active_host_runner = host_runner or HostSupervisorClient(
+    active_runtime = runtime_client or SupervisorRuntimeClient(
         active_settings.host_supervisor_socket
     )
-    executor = AgentExecutor(planner, tool_runner, repository, active_host_runner)
+    coordinator = RunCoordinator(active_runtime, repository)
+    harness_repository = InMemoryHarnessRunRepository()
+    harness_coordinator = HarnessCoordinator(
+        harness_components or HarnessComponents(),
+        harness_repository,
+    )
+    fixture_harness_repository = InMemoryHarnessRunRepository()
+    fixture_harness_coordinator = HarnessCoordinator(
+        create_fixture_harness_components(),
+        fixture_harness_repository,
+    )
     deployment_manager = DeploymentManager(active_settings)
     tunnel_manager = SsmTunnelManager(active_settings)
 
@@ -66,11 +78,12 @@ def create_app(
     def health() -> dict[str, str]:
         return {
             "status": "ok",
-            "run_api_version": "integrated-v1",
-            "planner": planner.mode,
+            "run_api_version": "profile-runtime-v2",
+            "harness_api_version": "os-harness-v1",
+            "planner": "environment-runtime",
             "storage": repository.storage_name,
             "host_supervisor": (
-                "connected" if active_host_runner.is_available() else "unavailable"
+                "connected" if active_runtime.is_available() else "unavailable"
             ),
         }
 
@@ -80,16 +93,56 @@ def create_app(
             subject_modes=[
                 mode.model_copy(
                     update={
-                        "enabled": mode.id.value != "host"
-                        or active_host_runner.is_available()
+                        "enabled": active_runtime.is_available(mode.id)
                     }
                 )
                 for mode in SUBJECT_MODES
             ],
             permission_tests={key.value: value for key, value in PERMISSION_TESTS.items()},
             tools=TOOLS,
-            planner_mode=planner.mode,
+            planner_mode="environment",
         )
+
+    @application.get("/api/harness/status", response_model=HarnessStatus)
+    def harness_status() -> HarnessStatus:
+        return harness_coordinator.get_status()
+
+    @application.post("/api/harness/runs", response_model=HarnessRunRecord)
+    def create_harness_run(request: HarnessRunRequest) -> HarnessRunRecord:
+        return harness_coordinator.run(request)
+
+    @application.get("/api/harness/runs/{run_id}", response_model=HarnessRunRecord)
+    def get_harness_run(run_id: str) -> HarnessRunRecord:
+        run = harness_repository.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Harness 실행 기록을 찾을 수 없습니다.")
+        return run
+
+    @application.get("/api/harness/fixtures/status", response_model=HarnessStatus)
+    def fixture_harness_status() -> HarnessStatus:
+        return fixture_harness_coordinator.get_status()
+
+    @application.post(
+        "/api/harness/fixture-runs",
+        response_model=HarnessRunRecord,
+    )
+    def create_fixture_harness_run(
+        request: HarnessRunRequest,
+    ) -> HarnessRunRecord:
+        return fixture_harness_coordinator.run(request)
+
+    @application.get(
+        "/api/harness/fixture-runs/{run_id}",
+        response_model=HarnessRunRecord,
+    )
+    def get_fixture_harness_run(run_id: str) -> HarnessRunRecord:
+        run = fixture_harness_repository.get(run_id)
+        if run is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Fixture Harness 실행 기록을 찾을 수 없습니다.",
+            )
+        return run
 
     @application.get("/api/deployments/current", response_model=DeploymentStatus)
     def get_deployment() -> DeploymentStatus:
@@ -175,12 +228,12 @@ def create_app(
     @application.post("/api/remote/runs", response_model=RunRecord)
     def remote_run(request: RunRequest) -> RunRecord:
         remote_health_payload = remote_request("GET", "/api/health")
-        if remote_health_payload.get("run_api_version") != "integrated-v1":
+        if remote_health_payload.get("run_api_version") != "profile-runtime-v2":
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "AWS 백엔드가 통합 Run API를 지원하지 않습니다. "
-                    "원격 백엔드 이미지와 Host Supervisor를 먼저 갱신하세요."
+                    "AWS 백엔드가 환경 Runtime v2 API를 지원하지 않습니다. "
+                    "원격 Backend 이미지와 Supervisor를 먼저 갱신하세요."
                 ),
             )
         run = RunRecord.model_validate(
@@ -189,19 +242,14 @@ def create_app(
                 "/api/runs",
                 request.model_dump(
                     mode="json",
-                    exclude={"permission_id", "permission_enabled"},
+                    exclude={"permission_id", "permission_enabled", "permissions"},
                 ),
             )
         )
-        requested_permissions = [item.model_dump() for item in request.permissions]
-        returned_permissions = [item.model_dump() for item in run.permissions]
-        if (
-            returned_permissions != requested_permissions
-            or len(run.permission_results) != len(request.permissions)
-        ):
+        if run.permission_profile != request.permission_profile:
             raise HTTPException(
                 status_code=502,
-                detail="AWS 백엔드가 통합 권한 결과를 완전하게 반환하지 않았습니다.",
+                detail="AWS Runtime이 요청한 권한 프로파일 묶음과 다른 결과를 반환했습니다.",
             )
         # Supabase Secret Key는 EC2 Agent 런타임에 전달하지 않는다. 신뢰된 로컬
         # 제어 백엔드가 SSM으로 받은 결과를 영구 저장한다.
@@ -217,13 +265,13 @@ def create_app(
 
     @application.post("/api/runs", response_model=RunRecord)
     def create_run(request: RunRequest) -> RunRecord:
-        if request.subject_mode.value == "host" and not active_host_runner.is_available():
+        if not active_runtime.is_available(request.subject_mode):
             raise HTTPException(
                 status_code=409,
-                detail="Ubuntu Host 실험은 SSM으로 연결된 AWS 런타임에서만 실행할 수 있습니다.",
+                detail="실제 권한 실험은 SSM으로 연결된 AWS 환경 Runtime에서만 실행할 수 있습니다.",
             )
         try:
-            return executor.run(request)
+            return coordinator.run(request)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

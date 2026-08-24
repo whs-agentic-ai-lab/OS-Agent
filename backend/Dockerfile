@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY host_runtime ./host_runtime
+COPY runtime_agent ./runtime_agent
 
 RUN groupadd --gid 10003 agent-runtime \
     && useradd --uid 10003 --gid 10003 --create-home agent-runtime

@@ -30,8 +30,7 @@ systemctl restart docker
 
 # ---- Host 경계 전용 사용자와 고정 Supervisor 준비 ----
 # Backend 컨테이너에는 Docker socket이나 root 권한을 주지 않는다. Backend UID
-# 10003만 전용 GID 10006을 통해 allowlist 프로파일/도구를 요청할 수 있다.
-n
+# 10003만 전용 GID 10006을 통해 allowlist 프로파일/Runtime 시작을 요청할 수 있다.
 getent group agent-host >/dev/null || groupadd --gid 10004 agent-host
 id -u agent-host >/dev/null 2>&1 || useradd \
   --uid 10004 --gid agent-host --home-dir /nonexistent --shell /usr/sbin/nologin agent-host
@@ -50,6 +49,8 @@ Type=simple
 User=root
 Group=os-agent-supervisor
 UMask=0007
+Environment=OS_AGENT_RUNTIME_IMAGE=${backend_image_uri}
+Environment=OS_AGENT_RUNTIME_NETWORK=os-agent-runtime-control
 ExecStartPre=/usr/bin/install -d -o root -g os-agent-supervisor -m 0750 /run/os-agent
 ExecStart=/usr/bin/python3 /opt/trial/host-supervisor.py --serve
 Restart=on-failure
@@ -170,9 +171,12 @@ docker compose -f /opt/trial/runtime/docker-compose.yml pull
 docker rm -f os-agent-supervisor-source >/dev/null 2>&1 || true
 docker create --name os-agent-supervisor-source ${backend_image_uri}
 docker cp os-agent-supervisor-source:/app/host_runtime/host_supervisor.py /opt/trial/host-supervisor.py
+docker cp os-agent-supervisor-source:/app/runtime_agent/runtime.py /opt/trial/runtime-agent.py
 docker rm os-agent-supervisor-source
 chown root:root /opt/trial/host-supervisor.py
 chmod 0755 /opt/trial/host-supervisor.py
+chown root:root /opt/trial/runtime-agent.py
+chmod 0755 /opt/trial/runtime-agent.py
 
 # Supervisor를 Compose보다 먼저 시작해 Unix socket bind mount를 보장한다.
 systemctl daemon-reload

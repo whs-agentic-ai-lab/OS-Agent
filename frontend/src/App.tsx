@@ -20,6 +20,7 @@ import {
 import { DeploymentPanel } from './components/DeploymentPanel'
 import { EnvironmentSelector } from './components/EnvironmentSelector'
 import { EventTimeline } from './components/EventTimeline'
+import { HarnessPanel } from './components/HarnessPanel'
 import { OsResultDetailPage } from './components/OsResultDetailPage'
 import { PermissionControl } from './components/PermissionControl'
 import { RunResult } from './components/RunResult'
@@ -303,10 +304,12 @@ export default function App() {
         {
           prompt: submittedPrompt,
           subject_mode: activeSubjectMode,
-          permissions: activePermissionSelections.map((selection) => ({
-            permission_id: selection.permissionId,
-            enabled: selection.enabled,
-          })),
+          permission_profile: Object.fromEntries(
+            activePermissionSelections.map((selection) => [
+              selection.permissionId,
+              selection.enabled,
+            ]),
+          ),
         },
         agentRemote,
       )
@@ -528,8 +531,8 @@ export default function App() {
           </div>
           <div className="hero-aside">
             <p>
-              하나의 고정 EC2에서 Container와 Ubuntu Host 경계를 선택하고, 여러
-              권한 조건의 OFF/ON 차이를 일괄 검증합니다.
+              하나의 고정 EC2에서 Container와 Ubuntu Host 경계를 선택하고, 세
+              권한을 하나의 프로파일로 적용한 단일 Run을 검증합니다.
             </p>
             <dl>
               <div>
@@ -579,24 +582,7 @@ export default function App() {
           tunnelActionError={tunnelActionError}
         />
 
-        <DeploymentPanel
-          actionError={deploymentActionError}
-          deployment={deployment}
-          environmentName={environmentName}
-          isStarting={isStartingDeployment}
-          isStartingTunnel={isStartingTunnel}
-          onDeploy={deployEnvironment}
-          onDestroy={destroyEnvironment}
-          onInitialize={initializeTerraform}
-          onEnvironmentNameChange={setEnvironmentName}
-          onRefresh={refreshAwsInventory}
-          onSelectInstance={selectInstance}
-          onStartTunnel={connectSsmTunnel}
-          onStopTunnel={disconnectSsmTunnel}
-          onTerminateInstance={terminateSelectedInstance}
-          selectedInstanceId={selectedInstanceId}
-          tunnel={tunnel}
-        />
+        <HarnessPanel />
 
         <div className="workspace-grid">
           <section className="control-panel" aria-labelledby="control-title">
@@ -634,7 +620,7 @@ export default function App() {
                     value={prompt}
                   />
                   <div className="input-meta">
-                    <span>OpenRouter key는 백엔드에서만 사용됩니다.</span>
+                    <span>Planner는 선택한 환경 Runtime 내부에서 실행됩니다.</span>
                     <span>{prompt.length} / 4000</span>
                   </div>
                 </div>
@@ -674,6 +660,25 @@ export default function App() {
             <EventTimeline events={run?.events ?? []} />
           </div>
         </div>
+
+        <DeploymentPanel
+          actionError={deploymentActionError}
+          deployment={deployment}
+          environmentName={environmentName}
+          isStarting={isStartingDeployment}
+          isStartingTunnel={isStartingTunnel}
+          onDeploy={deployEnvironment}
+          onDestroy={destroyEnvironment}
+          onInitialize={initializeTerraform}
+          onEnvironmentNameChange={setEnvironmentName}
+          onRefresh={refreshAwsInventory}
+          onSelectInstance={selectInstance}
+          onStartTunnel={connectSsmTunnel}
+          onStopTunnel={disconnectSsmTunnel}
+          onTerminateInstance={terminateSelectedInstance}
+          selectedInstanceId={selectedInstanceId}
+          tunnel={tunnel}
+        />
       </main>
 
       <footer>

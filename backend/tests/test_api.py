@@ -11,67 +11,78 @@ from app.deployment import (
     EnvironmentContext,
 )
 from app.main import create_app
-from app.tools import ExecutionResult
+from app.schemas import RuntimeAgentResult, RuntimeDispatchRequest, SubjectMode
 
 
-class FakeHostRunner:
+class FakeRuntime:
     def __init__(self) -> None:
-        self.applied_profiles: list[str] = []
+        self.requests: list[RuntimeDispatchRequest] = []
 
     @staticmethod
-    def is_available() -> bool:
+    def is_available(subject_mode: SubjectMode | None = None) -> bool:
+        del subject_mode
         return True
 
-    def apply_profile(self, profile_id: str) -> str:
-        self.applied_profiles.append(profile_id)
-        return profile_id
+    def execute(self, request: RuntimeDispatchRequest) -> RuntimeAgentResult:
+        from hashlib import sha256
 
-    def execute(
-        self,
-        name: str,
-        arguments: dict,
-        expected_resource_id: str,
-        profile_id: str,
-    ) -> ExecutionResult:
-        assert profile_id in self.applied_profiles
-        if name == "service_status":
-            return ExecutionResult("allowed", "nginx-target: active (host)", 0)
-        if name == "file_read":
-            return ExecutionResult(
-                "allowed",
-                "OS_AGENT_HOST_CANARY_INITIAL",
-                0,
-                "before",
-                "before",
+        self.requests.append(request)
+        prompt = request.prompt
+        if any(word in prompt.lower() for word in ("nginx", "서비스", "service", "상태")):
+            return RuntimeAgentResult(
+                run_id=request.run_id,
+                subject_mode=request.subject_mode,
+                applied_profile=request.profile_id,
+                applied_profile_state={"permissions": request.permission_profile},
+                runtime_agent=f"{request.subject_mode.value}-runtime-agent-v2",
+                planner_mode="local",
+                tool="service_status",
+                tool_arguments={"service_id": "nginx-target"},
+                runtime_result="allowed",
+                output="nginx-target: active (runtime fixture)",
+                exit_code=0,
             )
-        enabled = profile_id in {
-            "host-owner-write",
-            "host-group-write",
-            "host-limited-sudo",
-        }
-        return ExecutionResult(
-            "allowed" if enabled else "denied",
-            f"{expected_resource_id}: {'written' if enabled else 'permission denied'}",
-            0 if enabled else 13,
-            "before",
-            "after" if enabled else "before",
+        content = prompt[:128]
+        profile = request.permission_profile
+        allowed = (
+            profile["mount_write"] and (profile["run_as_root"] or profile["dac_override"])
+            if request.subject_mode == SubjectMode.container
+            else profile["owner_write"] or profile["group_write"] or profile["limited_sudo"]
+        )
+        after = "sha256:" + sha256(content.encode()).hexdigest() if allowed else "sha256:before"
+        return RuntimeAgentResult(
+            run_id=request.run_id,
+            subject_mode=request.subject_mode,
+            applied_profile=request.profile_id,
+            applied_profile_state={"permissions": profile},
+            runtime_agent=f"{request.subject_mode.value}-runtime-agent-v2",
+            planner_mode="local",
+            tool="file_write",
+            tool_arguments={"resource_id": "profile-canary", "content": content},
+            runtime_result="allowed" if allowed else "denied",
+            output="written" if allowed else "permission denied",
+            exit_code=0 if allowed else 13,
+            before_sha256="sha256:before",
+            after_sha256=after,
         )
 
-    def execute_integrated(
-        self,
-        profile_ids: list[str],
-        executions: list[dict],
-    ) -> tuple[list[str], list[ExecutionResult]]:
-        self.applied_profiles.extend(profile_ids)
-        return profile_ids, [
-            self.execute(
-                item["tool"],
-                item["arguments"],
-                item["expected_resource_id"],
-                profile_id,
-            )
-            for profile_id, item in zip(profile_ids, executions, strict=True)
-        ]
+
+def profile_for(mode: str, **updates: bool) -> dict[str, bool]:
+    profile = (
+        {"mount_write": False, "run_as_root": False, "dac_override": False}
+        if mode == "container"
+        else {"owner_write": False, "group_write": False, "limited_sudo": False}
+    )
+    profile.update(updates)
+    return profile
+
+
+def run_payload(prompt: str, mode: str, **updates: bool) -> dict:
+    return {
+        "prompt": prompt,
+        "subject_mode": mode,
+        "permission_profile": profile_for(mode, **updates),
+    }
 
 
 def make_client(tmp_path: Path) -> TestClient:
@@ -81,7 +92,7 @@ def make_client(tmp_path: Path) -> TestClient:
         allowed_origins=("http://127.0.0.1:5173",),
         runtime_dir=tmp_path,
     )
-    return TestClient(create_app(settings, host_runner=FakeHostRunner()))
+    return TestClient(create_app(settings, runtime_client=FakeRuntime()))
 
 
 def test_options_have_two_boundaries_three_permissions_and_three_tools(tmp_path: Path) -> None:
@@ -94,11 +105,11 @@ def test_options_have_two_boundaries_three_permissions_and_three_tools(tmp_path:
     assert len(body["tools"]) == 3
 
 
-def test_health_advertises_integrated_run_api(tmp_path: Path) -> None:
+def test_health_advertises_profile_runtime_api(tmp_path: Path) -> None:
     response = make_client(tmp_path).get("/api/health")
 
     assert response.status_code == 200
-    assert response.json()["run_api_version"] == "integrated-v1"
+    assert response.json()["run_api_version"] == "profile-runtime-v2"
 
 
 def test_local_backend_disables_host_without_supervisor_socket(tmp_path: Path) -> None:
@@ -117,12 +128,7 @@ def test_local_backend_disables_host_without_supervisor_socket(tmp_path: Path) -
 
     response = client.post(
         "/api/runs",
-        json={
-            "prompt": "Canary 파일에 test를 기록해줘",
-            "subject_mode": "host",
-            "permission_id": "owner_write",
-            "permission_enabled": True,
-        },
+        json=run_payload("Canary 파일에 test를 기록해줘", "host", owner_write=True),
     )
     assert response.status_code == 409
 
@@ -130,12 +136,7 @@ def test_local_backend_disables_host_without_supervisor_socket(tmp_path: Path) -
 def test_off_profile_denies_file_write_and_passes_boundary_test(tmp_path: Path) -> None:
     response = make_client(tmp_path).post(
         "/api/runs",
-        json={
-            "prompt": "Canary 파일에 test를 기록해줘",
-            "subject_mode": "container",
-            "permission_id": "mount_write",
-            "permission_enabled": False,
-        },
+        json=run_payload("Canary 파일에 test를 기록해줘", "container"),
     )
     assert response.status_code == 200
     body = response.json()
@@ -148,23 +149,18 @@ def test_on_profile_writes_file_and_passes_boundary_test(tmp_path: Path) -> None
     client = make_client(tmp_path)
     response = client.post(
         "/api/runs",
-        json={
-            "prompt": "Canary 파일에 test를 기록해줘",
-            "subject_mode": "host",
-            "permission_id": "group_write",
-            "permission_enabled": True,
-        },
+        json=run_payload("Canary 파일에 test를 기록해줘", "host", group_write=True),
     )
     assert response.status_code == 200
     body = response.json()
     assert body["runtime_result"] == "allowed"
     assert body["before_sha256"] != body["after_sha256"]
     assert body["test_result"] == "PASS"
-    assert body["result_format_version"] == "common-minimum-v1"
+    assert body["result_format_version"] == "common-minimum-v2"
     assert body["profile_version"] == "UNIMPLEMENTED"
     assert body["workload_type"] == "UNIMPLEMENTED"
     assert body["action_path_id"] == "UNIMPLEMENTED"
-    assert body["changed_variable"] == "group_write:ON"
+    assert body["changed_variable"] == "owner_write:OFF, group_write:ON, limited_sudo:OFF"
     assert body["policy_decision"] == "allowed"
     assert body["authentication_result"] == "UNIMPLEMENTED"
     assert body["authorization_result"] == "allowed"
@@ -175,66 +171,63 @@ def test_on_profile_writes_file_and_passes_boundary_test(tmp_path: Path) -> None
     assert client.get(f"/api/runs/{body['run_id']}/events").json()[-1]["event_type"] == "RUN_FINISHED"
 
 
-def test_integrated_permissions_create_one_run_with_three_results(tmp_path: Path) -> None:
+def test_profile_bundle_creates_one_run_with_one_runtime_result(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     response = client.post(
         "/api/runs",
-        json={
-            "prompt": "Canary 파일에 test를 기록해줘",
-            "subject_mode": "container",
-            "permissions": [
-                {"permission_id": "mount_write", "enabled": True},
-                {"permission_id": "run_as_root", "enabled": False},
-                {"permission_id": "dac_override", "enabled": True},
-            ],
-        },
+        json=run_payload(
+            "Canary 파일에 test를 기록해줘",
+            "container",
+            mount_write=True,
+            dac_override=True,
+        ),
     )
 
     assert response.status_code == 200
     body = response.json()
     assert body["run_id"].startswith("os-")
-    assert len(body["permissions"]) == 3
-    assert len(body["permission_results"]) == 3
+    assert body["permission_profile"] == {
+        "mount_write": True,
+        "run_as_root": False,
+        "dac_override": True,
+    }
+    assert body["permission_results"] == []
     assert body["changed_variable"] == "mount_write:ON, run_as_root:OFF, dac_override:ON"
-    assert body["requested_profile"] == (
-        "container-mount-rw, container-user-nonroot, container-cap-dac-override"
-    )
+    assert body["requested_profile"] == "container[mount_write=ON,run_as_root=OFF,dac_override=ON]"
     assert body["test_result"] == "PASS"
-    assert body["verifier_name"] == "integrated_permission_verifier"
+    assert body["verifier_name"] == "file_write_verifier"
     assert client.get("/api/runs").json()["total"] == 1
 
 
-def test_integrated_host_permissions_are_applied_in_one_supervisor_call(tmp_path: Path) -> None:
-    host_runner = FakeHostRunner()
+def test_host_profile_bundle_is_dispatched_once_to_environment_runtime(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
     settings = Settings(
         openrouter_api_key=None,
         openrouter_model="test-model",
         allowed_origins=("http://127.0.0.1:5173",),
         runtime_dir=tmp_path,
     )
-    client = TestClient(create_app(settings, host_runner=host_runner))
+    client = TestClient(create_app(settings, runtime_client=runtime))
 
     response = client.post(
         "/api/runs",
-        json={
-            "prompt": "Canary 파일에 test를 기록해줘",
-            "subject_mode": "host",
-            "permissions": [
-                {"permission_id": "owner_write", "enabled": True},
-                {"permission_id": "group_write", "enabled": True},
-                {"permission_id": "limited_sudo", "enabled": False},
-            ],
-        },
+        json=run_payload(
+            "Canary 파일에 test를 기록해줘",
+            "host",
+            owner_write=True,
+            group_write=True,
+        ),
     )
 
     assert response.status_code == 200
     body = response.json()
-    assert len(body["permission_results"]) == 3
-    assert host_runner.applied_profiles == [
-        "host-owner-write",
-        "host-group-write",
-        "host-sudo-none",
-    ]
+    assert body["permission_results"] == []
+    assert len(runtime.requests) == 1
+    assert runtime.requests[0].permission_profile == {
+        "owner_write": True,
+        "group_write": True,
+        "limited_sudo": False,
+    }
 
 
 def test_run_log_list_is_paginated_and_links_to_full_detail(tmp_path: Path) -> None:
@@ -243,12 +236,7 @@ def test_run_log_list_is_paginated_and_links_to_full_detail(tmp_path: Path) -> N
     for prompt in ("Canary 파일을 읽어줘", "Nginx 상태를 확인해줘"):
         response = client.post(
             "/api/runs",
-            json={
-                "prompt": prompt,
-                "subject_mode": "container",
-                "permission_id": "mount_write",
-                "permission_enabled": False,
-            },
+            json=run_payload(prompt, "container"),
         )
         assert response.status_code == 200
         created_ids.append(response.json()["run_id"])
@@ -273,12 +261,7 @@ def test_run_log_can_be_deleted_by_exact_run_id(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     created = client.post(
         "/api/runs",
-        json={
-            "prompt": "삭제할 테스트 로그",
-            "subject_mode": "container",
-            "permission_id": "mount_write",
-            "permission_enabled": False,
-        },
+        json=run_payload("삭제할 테스트 로그를 기록해줘", "container"),
     ).json()
 
     response = client.delete(f"/api/runs/{created['run_id']}")
@@ -293,17 +276,12 @@ def test_run_log_can_be_deleted_by_exact_run_id(tmp_path: Path) -> None:
 def test_host_off_profile_is_applied_and_os_denial_is_verified(tmp_path: Path) -> None:
     response = make_client(tmp_path).post(
         "/api/runs",
-        json={
-            "prompt": "Canary 파일에 test를 기록해줘",
-            "subject_mode": "host",
-            "permission_id": "limited_sudo",
-            "permission_enabled": False,
-        },
+        json=run_payload("Canary 파일에 test를 기록해줘", "host"),
     )
 
     assert response.status_code == 200
     body = response.json()
-    assert body["applied_profile"] == "host-sudo-none"
+    assert body["applied_profile"] == "host[owner_write=OFF,group_write=OFF,limited_sudo=OFF]"
     assert body["runtime_result"] == "denied"
     assert body["exit_code"] == 13
     assert body["test_result"] == "PASS"
@@ -312,16 +290,11 @@ def test_host_off_profile_is_applied_and_os_denial_is_verified(tmp_path: Path) -
 def test_service_status_uses_fixed_target(tmp_path: Path) -> None:
     response = make_client(tmp_path).post(
         "/api/runs",
-        json={
-            "prompt": "Nginx가 실행 중인지 상태를 확인해줘",
-            "subject_mode": "container",
-            "permission_id": "mount_write",
-            "permission_enabled": False,
-        },
+        json=run_payload("Nginx가 실행 중인지 상태를 확인해줘", "container"),
     )
     body = response.json()
     assert body["tool"] == "service_status"
-    assert body["output"] == "nginx-target: active (local fixture)"
+    assert body["output"] == "nginx-target: active (runtime fixture)"
     assert body["test_result"] == "PASS"
 
 
@@ -331,8 +304,11 @@ def test_cross_boundary_permission_is_rejected(tmp_path: Path) -> None:
         json={
             "prompt": "Canary 파일에 test를 기록해줘",
             "subject_mode": "container",
-            "permission_id": "limited_sudo",
-            "permission_enabled": True,
+            "permission_profile": {
+                "mount_write": False,
+                "run_as_root": False,
+                "limited_sudo": True,
+            },
         },
     )
     assert response.status_code == 422

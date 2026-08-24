@@ -31,6 +31,7 @@ services:
 
 networks:
   control:
+    name: os-agent-runtime-control
     internal: true
   # Backend는 SSM으로 게시된 호스트 포트와 OpenRouter/Supabase outbound가 필요하다.
   # 실험 대상 nginx는 control 내부망에만 남겨 외부 연결을 허용하지 않는다.

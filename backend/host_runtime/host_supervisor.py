@@ -9,6 +9,7 @@ import http.server
 import json
 import os
 import pwd
+import re
 import socket
 import socketserver
 import stat
@@ -28,10 +29,15 @@ SUPERVISOR_GROUP = "os-agent-supervisor"
 BACKEND_UID = 10003
 SOCKET_PATH = Path("/run/os-agent/host-supervisor.sock")
 SCRIPT_PATH = Path("/opt/trial/host-supervisor.py")
+RUNTIME_AGENT_PATH = Path("/opt/trial/runtime-agent.py")
 CANARY_ROOT = Path("/opt/trial/host-canaries")
+HOST_PROFILE_CANARY = CANARY_ROOT / "profile-canary.txt"
+CONTAINER_RUN_ROOT = Path("/opt/trial/container-runs")
+AGENT_RUNTIME_IMAGE = os.environ.get("OS_AGENT_RUNTIME_IMAGE", "os-agent-backend:latest")
+AGENT_RUNTIME_NETWORK = os.environ.get("OS_AGENT_RUNTIME_NETWORK", "os-agent-runtime-control")
 SUDOERS_PATH = Path("/etc/sudoers.d/os-agent-limited")
 INITIAL_CONTENT = "OS_AGENT_HOST_CANARY_INITIAL\n"
-MAX_REQUEST_BYTES = 4096
+MAX_REQUEST_BYTES = 16384
 
 CANARIES = {
     "host-owner-canary": CANARY_ROOT / "owner.txt",
@@ -57,6 +63,7 @@ PROFILES = {
 }
 
 PROFILE_LOCK = threading.RLock()
+RUN_ID_PATTERN = re.compile(r"^os-[a-f0-9]{12}$")
 
 
 def _identity() -> tuple[int, int, int]:
@@ -108,6 +115,168 @@ def _write_sudoers(enabled: bool) -> None:
         temporary.unlink(missing_ok=True)
         raise RuntimeError(check.stderr.strip() or "sudoers 검증에 실패했습니다.")
     os.replace(temporary, SUDOERS_PATH)
+
+
+def _validate_profile_bundle(subject_mode: str, profile: Any) -> dict[str, bool]:
+    expected = (
+        {"mount_write", "run_as_root", "dac_override"}
+        if subject_mode == "container"
+        else {"owner_write", "group_write", "limited_sudo"}
+        if subject_mode == "host"
+        else set()
+    )
+    if not isinstance(profile, dict) or set(profile) != expected:
+        raise ValueError("선택 환경의 세 권한이 모두 포함된 프로파일 묶음이 필요합니다.")
+    if not all(isinstance(value, bool) for value in profile.values()):
+        raise ValueError("프로파일 값은 boolean이어야 합니다.")
+    return profile
+
+
+def _runtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    run_id = _required_text(payload, "run_id")
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        raise ValueError("run_id 형식이 올바르지 않습니다.")
+    subject_mode = _required_text(payload, "subject_mode")
+    profile = _validate_profile_bundle(subject_mode, payload.get("permission_profile"))
+    profile_id = _required_text(payload, "profile_id")
+    ordered_keys = (
+        ("mount_write", "run_as_root", "dac_override")
+        if subject_mode == "container"
+        else ("owner_write", "group_write", "limited_sudo")
+    )
+    expected_profile_id = (
+        f"{subject_mode}["
+        + ",".join(f"{key}={'ON' if profile[key] else 'OFF'}" for key in ordered_keys)
+        + "]"
+    )
+    if profile_id != expected_profile_id:
+        raise ValueError("profile_id가 권한 프로파일 묶음과 일치하지 않습니다.")
+    return {
+        "run_id": run_id,
+        "prompt": _required_text(payload, "prompt"),
+        "subject_mode": subject_mode,
+        "permission_profile": profile,
+        "profile_id": profile_id,
+    }
+
+
+def _parse_runtime_result(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "Runtime Agent 실행 실패"
+        try:
+            parsed = json.loads(detail)
+            detail = str(parsed.get("detail", detail))
+        except (ValueError, AttributeError):
+            pass
+        raise RuntimeError(detail)
+    try:
+        body = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Runtime Agent가 올바른 JSON을 반환하지 않았습니다.") from exc
+    if not isinstance(body, dict):
+        raise RuntimeError("Runtime Agent 응답이 JSON 객체가 아닙니다.")
+    return body
+
+
+def _execute_container_runtime(payload: dict[str, Any]) -> dict[str, Any]:
+    profile = payload["permission_profile"]
+    run_root = CONTAINER_RUN_ROOT / payload["run_id"]
+    run_root.mkdir(mode=0o755, parents=True, exist_ok=False)
+    canary = run_root / "canary.txt"
+    canary.write_text(INITIAL_CONTENT, encoding="utf-8")
+    os.chown(canary, 0, 0)
+    os.chmod(canary, 0o600)
+
+    command = [
+        "/usr/bin/docker", "run", "--rm", "--network", AGENT_RUNTIME_NETWORK,
+        "--read-only", "--pids-limit", "64", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges",
+        "--user", "0:0" if profile["run_as_root"] else "10003:10003",
+        "--env", "OS_AGENT_CANARY_PATH=/trial/canary.txt",
+        "--env", "OS_AGENT_SERVICE_URL=http://nginx-target",
+        "--volume", f"{run_root}:/trial:{'rw' if profile['mount_write'] else 'ro'}",
+    ]
+    if profile["dac_override"]:
+        command.extend(["--cap-add", "DAC_OVERRIDE"])
+    command.extend([AGENT_RUNTIME_IMAGE, "python", "-m", "runtime_agent.runtime"])
+    result = _run(command, input_text=json.dumps(payload, ensure_ascii=False))
+    body = _parse_runtime_result(result)
+    body["applied_profile_state"] = {
+        "permissions": profile,
+        "mount_mode": "rw" if profile["mount_write"] else "ro",
+        "uid": 0 if profile["run_as_root"] else 10003,
+        "capabilities": ["CAP_DAC_OVERRIDE"] if profile["dac_override"] else [],
+        "image": AGENT_RUNTIME_IMAGE,
+        "network": AGENT_RUNTIME_NETWORK,
+    }
+    return body
+
+
+def _apply_host_profile_bundle(profile: dict[str, bool]) -> dict[str, Any]:
+    uid, _, trial_gid = _identity()
+    _set_trial_group_membership(profile["group_write"])
+    _write_sudoers(profile["limited_sudo"])
+    CANARY_ROOT.mkdir(mode=0o755, parents=True, exist_ok=True)
+    HOST_PROFILE_CANARY.write_text(INITIAL_CONTENT, encoding="utf-8")
+    owner_uid = uid if profile["owner_write"] else 0
+    mode = 0o444 | (0o200 if profile["owner_write"] else 0) | (0o020 if profile["group_write"] else 0)
+    os.chown(HOST_PROFILE_CANARY, owner_uid, trial_gid)
+    os.chmod(HOST_PROFILE_CANARY, mode)
+    metadata = HOST_PROFILE_CANARY.stat()
+    if (
+        metadata.st_uid != owner_uid
+        or metadata.st_gid != trial_gid
+        or stat.S_IMODE(metadata.st_mode) != mode
+        or _is_trial_group_member() != profile["group_write"]
+        or SUDOERS_PATH.exists() != profile["limited_sudo"]
+    ):
+        raise RuntimeError("Host 권한 프로파일 묶음의 실제 OS 상태 검증에 실패했습니다.")
+    return {
+        "permissions": profile,
+        "uid": uid,
+        "file_uid": metadata.st_uid,
+        "file_gid": metadata.st_gid,
+        "file_mode": oct(stat.S_IMODE(metadata.st_mode)),
+        "trial_group_member": _is_trial_group_member(),
+        "limited_sudo_rule": SUDOERS_PATH.exists(),
+    }
+
+
+def _execute_host_runtime(payload: dict[str, Any]) -> dict[str, Any]:
+    applied_state = _apply_host_profile_bundle(payload["permission_profile"])
+    nginx_ip = _run(
+        [
+            "/usr/bin/docker", "inspect", "--format",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+            "nginx-target",
+        ]
+    )
+    service_url = (
+        f"http://{nginx_ip.stdout.strip()}"
+        if nginx_ip.returncode == 0 and nginx_ip.stdout.strip()
+        else "http://127.0.0.1:9"
+    )
+    result = _run(
+        [
+            "/usr/sbin/runuser", "-u", AGENT_USER, "--", "/usr/bin/env",
+            f"OS_AGENT_CANARY_PATH={HOST_PROFILE_CANARY}",
+            f"OS_AGENT_SUDO_HELPER={SCRIPT_PATH}",
+            f"OS_AGENT_SERVICE_URL={service_url}",
+            "/usr/bin/python3", str(RUNTIME_AGENT_PATH),
+        ],
+        input_text=json.dumps(payload, ensure_ascii=False),
+    )
+    body = _parse_runtime_result(result)
+    body["applied_profile_state"] = applied_state
+    return body
+
+
+def execute_runtime_run(payload: dict[str, Any]) -> dict[str, Any]:
+    request = _runtime_payload(payload)
+    with PROFILE_LOCK:
+        if request["subject_mode"] == "container":
+            return _execute_container_runtime(request)
+        return _execute_host_runtime(request)
 
 
 def _reset_canary(profile: Profile) -> Path:
@@ -358,8 +527,8 @@ def run_sudo_helper() -> int:
     content = sys.stdin.read(513)
     if len(content) > 128 or "\x00" in content:
         return 2
-    CANARIES["host-sudo-canary"].write_text(content, encoding="utf-8")
-    print(f"host-sudo-canary에 {len(content)}자를 기록했습니다.")
+    HOST_PROFILE_CANARY.write_text(content, encoding="utf-8")
+    print(f"host-profile-canary에 {len(content)}자를 기록했습니다.")
     return 0
 
 
@@ -388,6 +557,8 @@ class SupervisorHandler(http.server.BaseHTTPRequestHandler):
                 body = execute(payload)
             elif self.path == "/v1/execute-integrated":
                 body = execute_integrated(payload)
+            elif self.path == "/v2/runs":
+                body = execute_runtime_run(payload)
             else:
                 self._respond(404, {"detail": "존재하지 않는 Supervisor API입니다."})
                 return

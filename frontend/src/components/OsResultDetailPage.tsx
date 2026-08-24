@@ -23,6 +23,10 @@ function collectedValue(value: string | null | undefined): string {
 function changedVariableValue(run: RunRecord): string {
   const storedValue = collectedValue(run.changed_variable);
   if (storedValue !== UNIMPLEMENTED) return storedValue;
+  const profileEntries = Object.entries(run.permission_profile ?? {});
+  if (profileEntries.length > 0) {
+    return profileEntries.map(([name, enabled]) => `${name}:${enabled ? "ON" : "OFF"}`).join(", ");
+  }
   if (!run.permission_id) return UNIMPLEMENTED;
   return `${run.permission_id}:${run.permission_enabled ? "ON" : "OFF"}`;
 }
@@ -101,7 +105,6 @@ function ResultValue({ children }: { children: string }) {
 }
 
 function RunDetail({ run }: { run: RunRecord }) {
-  const integratedRun = run.permission_results.length > 1;
   const profile = run.applied_profile ?? run.requested_profile;
   const profileValue = `${profile} · 버전: ${collectedValue(run.profile_version)}`;
   const workloadType =
@@ -131,39 +134,31 @@ function RunDetail({ run }: { run: RunRecord }) {
         </div>
       </header>
 
-      {run.permission_results.length > 0 ? (
-        <section className="common-result-section" aria-labelledby="permission-results-title">
+      {Object.keys(run.permission_profile ?? {}).length > 0 ? (
+        <section className="common-result-section" aria-labelledby="permission-profile-title">
           <div className="common-result-heading">
             <div>
               <span className="section-index">PROFILE</span>
-              <h2 id="permission-results-title">통합 권한 프로파일 결과</h2>
+              <h2 id="permission-profile-title">적용 권한 프로파일 묶음</h2>
             </div>
-            <p><strong>1 Run</strong> · {run.permission_results.length}개 권한 동시 적용</p>
+            <p><strong>1 Run ID</strong> · 프로파일 적용 1회 · Tool 실행 1회</p>
           </div>
-          <ul className="batch-result-list">
-            {run.permission_results.map((item) => (
-              <li key={item.permission_id}>
-                <div>
-                  <span>{item.permission_id}:{item.permission_enabled ? "ON" : "OFF"}</span>
-                  <strong>{item.applied_profile ?? item.requested_profile}</strong>
-                  <small>{item.resource_id} · {item.output ?? UNIMPLEMENTED}</small>
-                  <dl className="permission-hash-grid">
-                    <div>
-                      <dt>Before SHA-256</dt>
-                      <dd>{item.before_sha256 ?? UNIMPLEMENTED}</dd>
-                    </div>
-                    <div>
-                      <dt>After SHA-256</dt>
-                      <dd>{item.after_sha256 ?? UNIMPLEMENTED}</dd>
-                    </div>
-                  </dl>
-                </div>
-                <span className={`result-label ${item.test_result?.toLowerCase() ?? "unimplemented"}`}>
-                  {translateVerdict(item.test_result)}
-                </span>
-              </li>
-            ))}
-          </ul>
+          <div className="profile-bundle-detail">
+            <div>
+              <span>Profile ID</span>
+              <strong>{profile}</strong>
+              <small>Runtime Agent: {collectedValue(run.runtime_agent)}</small>
+            </div>
+            <ul>
+              {Object.entries(run.permission_profile).map(([name, enabled]) => (
+                <li key={name}><span>{name}</span><strong>{enabled ? "ON" : "OFF"}</strong></li>
+              ))}
+            </ul>
+            <details>
+              <summary>Supervisor 적용 상태</summary>
+              <pre>{JSON.stringify(run.applied_profile_state ?? {}, null, 2)}</pre>
+            </details>
+          </div>
         </section>
       ) : null}
 
@@ -186,7 +181,7 @@ function RunDetail({ run }: { run: RunRecord }) {
                 <th scope="col">profile·버전</th>
                 <th scope="col">정상/공격 workload</th>
                 <th scope="col">Agent 행동·경로 ID</th>
-                <th scope="col">변경 변수 1개</th>
+                <th scope="col">권한 프로파일 묶음</th>
                 <th scope="col">정책 판정</th>
                 <th scope="col">실제 인증·인가 및 실행 결과</th>
                 <th scope="col">독립 Verifier 실제 효과</th>
@@ -230,11 +225,11 @@ function RunDetail({ run }: { run: RunRecord }) {
           <div><dt>Executor output</dt><dd>{run.output ?? UNIMPLEMENTED}</dd></div>
           <div>
             <dt>Before SHA-256</dt>
-            <dd>{integratedRun ? "통합 Run — 권한별 해시 참조" : run.before_sha256 ?? UNIMPLEMENTED}</dd>
+            <dd>{run.before_sha256 ?? UNIMPLEMENTED}</dd>
           </div>
           <div>
             <dt>After SHA-256</dt>
-            <dd>{integratedRun ? "통합 Run — 권한별 해시 참조" : run.after_sha256 ?? UNIMPLEMENTED}</dd>
+            <dd>{run.after_sha256 ?? UNIMPLEMENTED}</dd>
           </div>
           <div><dt>시작 시각</dt><dd>{formatTimestamp(run.created_at)}</dd></div>
           <div><dt>완료 시각</dt><dd>{formatTimestamp(run.completed_at)}</dd></div>
