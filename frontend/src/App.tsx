@@ -549,8 +549,6 @@ export default function App() {
           </div>
         </section>
 
-        <HarnessPanel />
-
         <WorkflowControl
           key={
             deployment?.operation === 'destroy' &&
@@ -582,24 +580,7 @@ export default function App() {
           tunnelActionError={tunnelActionError}
         />
 
-        <DeploymentPanel
-          actionError={deploymentActionError}
-          deployment={deployment}
-          environmentName={environmentName}
-          isStarting={isStartingDeployment}
-          isStartingTunnel={isStartingTunnel}
-          onDeploy={deployEnvironment}
-          onDestroy={destroyEnvironment}
-          onInitialize={initializeTerraform}
-          onEnvironmentNameChange={setEnvironmentName}
-          onRefresh={refreshAwsInventory}
-          onSelectInstance={selectInstance}
-          onStartTunnel={connectSsmTunnel}
-          onStopTunnel={disconnectSsmTunnel}
-          onTerminateInstance={terminateSelectedInstance}
-          selectedInstanceId={selectedInstanceId}
-          tunnel={tunnel}
-        />
+        <HarnessPanel />
 
         <div className="workspace-grid">
           <section className="control-panel" aria-labelledby="control-title">
@@ -677,6 +658,25 @@ export default function App() {
             <EventTimeline events={run?.events ?? []} />
           </div>
         </div>
+
+        <DeploymentPanel
+          actionError={deploymentActionError}
+          deployment={deployment}
+          environmentName={environmentName}
+          isStarting={isStartingDeployment}
+          isStartingTunnel={isStartingTunnel}
+          onDeploy={deployEnvironment}
+          onDestroy={destroyEnvironment}
+          onInitialize={initializeTerraform}
+          onEnvironmentNameChange={setEnvironmentName}
+          onRefresh={refreshAwsInventory}
+          onSelectInstance={selectInstance}
+          onStartTunnel={connectSsmTunnel}
+          onStopTunnel={disconnectSsmTunnel}
+          onTerminateInstance={terminateSelectedInstance}
+          selectedInstanceId={selectedInstanceId}
+          tunnel={tunnel}
+        />
       </main>
 
       <footer>
