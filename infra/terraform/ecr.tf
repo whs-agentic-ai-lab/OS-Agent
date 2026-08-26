@@ -1,7 +1,27 @@
-resource "aws_ecr_repository" "agent_backend" {
-  name                 = "${var.project_name}-backend"
+locals {
+  image_repository_names = toset(["runtime", "container1", "target"])
+  image_digests = {
+    runtime    = var.runtime_image_digest
+    container1 = var.container1_image_digest
+    target     = var.target_image_digest
+  }
+}
+
+data "aws_ecr_image" "pinned" {
+  for_each = {
+    for name, digest in local.image_digests : name => digest if digest != ""
+  }
+
+  repository_name = aws_ecr_repository.images[each.key].name
+  image_digest    = each.value
+}
+
+resource "aws_ecr_repository" "images" {
+  for_each = local.image_repository_names
+
+  name                 = "${local.resource_prefix}-${each.key}"
   image_tag_mutability = "IMMUTABLE"
-  force_delete         = true
+  force_delete         = false
 
   image_scanning_configuration {
     scan_on_push = true
@@ -10,21 +30,8 @@ resource "aws_ecr_repository" "agent_backend" {
   encryption_configuration {
     encryption_type = "AES256"
   }
-}
 
-resource "aws_ecr_lifecycle_policy" "agent_backend" {
-  repository = aws_ecr_repository.agent_backend.name
-
-  policy = jsonencode({
-    rules = [{
-      rulePriority = 1
-      description  = "최근 이미지 5개만 유지"
-      selection = {
-        tagStatus   = "any"
-        countType   = "imageCountMoreThan"
-        countNumber = 5
-      }
-      action = { type = "expire" }
-    }]
-  })
+  tags = {
+    Component = each.key
+  }
 }

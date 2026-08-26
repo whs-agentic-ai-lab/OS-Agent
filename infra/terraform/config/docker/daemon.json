@@ -1,0 +1,10 @@
+{
+  "live-restore": true,
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "20m",
+    "max-file": "5",
+    "labels": "os_agent.endpoint_id,os_agent.owner_id,os_agent.role,os_agent.topology_revision"
+  },
+  "userland-proxy": false
+}

@@ -1,0 +1,35 @@
+[Unit]
+Description=Vector evidence collector
+Wants=auditd.service
+After=auditd.service systemd-journald.service os-agent-docker-events.service
+Wants=os-agent-docker-logs.service
+
+[Service]
+Type=simple
+User=vector
+Group=vector
+SupplementaryGroups=adm systemd-journal
+UMask=0027
+ExecStartPre=/usr/local/bin/vector validate --skip-healthchecks /etc/vector/vector.yaml
+ExecStart=/usr/local/bin/vector --config /etc/vector/vector.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/vector /var/lib/os-agent/evidence/collected
+ReadOnlyPaths=/var/log/audit /var/log/journal -/run/log/journal /var/log/os-agent /etc/vector
+
+[Install]
+WantedBy=multi-user.target
