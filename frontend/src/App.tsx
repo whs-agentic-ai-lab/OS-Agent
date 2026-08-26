@@ -64,6 +64,7 @@ export default function App() {
   const [healthChecked, setHealthChecked] = useState(false)
   const [storageHealthChecked, setStorageHealthChecked] = useState(false)
   const [subjectMode, setSubjectMode] = useState<SubjectModeId>('container')
+  const [trustBoundaryId, setTrustBoundaryId] = useState('TB-CC-C1C2')
   const [permissionSelections, setPermissionSelections] = useState<Record<string, boolean>>({
     mount_write: false,
     run_as_root: false,
@@ -206,10 +207,22 @@ export default function App() {
       ? (options?.subject_modes.find((mode) => mode.enabled)?.id ?? 'container')
       : subjectMode
   const permissionTests = options?.permission_tests[activeSubjectMode] ?? []
+  const availableTrustBoundaries = options?.trust_boundaries.filter(
+    (boundary) => boundary.source_mode === activeSubjectMode,
+  ) ?? []
+  const activeTrustBoundary =
+    availableTrustBoundaries.find((boundary) => boundary.id === trustBoundaryId)
+    ?? availableTrustBoundaries[0]
   const activePermissionSelections = permissionTests.flatMap((test) =>
     Object.hasOwn(permissionSelections, test.id)
       ? [{ permissionId: test.id, enabled: permissionSelections[test.id] }]
       : [],
+  )
+  const activePermissionProfile = Object.fromEntries(
+    activePermissionSelections.map((selection) => [
+      selection.permissionId,
+      selection.enabled,
+    ]),
   )
   const backendConnected = Boolean(health) || Boolean(options)
   const connectionServices: ServiceConnection[] = [
@@ -284,6 +297,10 @@ export default function App() {
   function changeSubjectMode(mode: SubjectModeId) {
     const nextTests = options?.permission_tests[mode] ?? []
     setSubjectMode(mode)
+    const firstBoundary = options?.trust_boundaries.find(
+      (boundary) => boundary.source_mode === mode,
+    )
+    if (firstBoundary) setTrustBoundaryId(firstBoundary.id)
     setPermissionSelections(Object.fromEntries(nextTests.map((test) => [test.id, false])))
   }
 
@@ -293,7 +310,7 @@ export default function App() {
 
   async function submitRun(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (activePermissionSelections.length === 0 || !prompt.trim()) return
+    if (activePermissionSelections.length === 0 || !prompt.trim() || !activeTrustBoundary) return
     const submittedPrompt = createUniqueRunPrompt(prompt)
     setIsRunning(true)
     setRunError(null)
@@ -304,6 +321,7 @@ export default function App() {
         {
           prompt: submittedPrompt,
           subject_mode: activeSubjectMode,
+          trust_boundary_id: activeTrustBoundary.id,
           permission_profile: Object.fromEntries(
             activePermissionSelections.map((selection) => [
               selection.permissionId,
@@ -541,7 +559,7 @@ export default function App() {
               </div>
               <div>
                 <dt>Boundaries</dt>
-                <dd>2</dd>
+                <dd>8</dd>
               </div>
               <div>
                 <dt>Tools</dt>
@@ -582,7 +600,31 @@ export default function App() {
           tunnelActionError={tunnelActionError}
         />
 
-        <HarnessPanel />
+        <DeploymentPanel
+          actionError={deploymentActionError}
+          deployment={deployment}
+          environmentName={environmentName}
+          isStarting={isStartingDeployment}
+          isStartingTunnel={isStartingTunnel}
+          onDeploy={deployEnvironment}
+          onDestroy={destroyEnvironment}
+          onInitialize={initializeTerraform}
+          onEnvironmentNameChange={setEnvironmentName}
+          onRefresh={refreshAwsInventory}
+          onSelectInstance={selectInstance}
+          onStartTunnel={connectSsmTunnel}
+          onStopTunnel={disconnectSsmTunnel}
+          onTerminateInstance={terminateSelectedInstance}
+          selectedInstanceId={selectedInstanceId}
+          tunnel={tunnel}
+        />
+
+        <HarnessPanel
+          permissionProfile={activePermissionProfile}
+          remote={agentRemote}
+          subjectMode={activeSubjectMode}
+          trustBoundaryId={activeTrustBoundary?.id ?? ''}
+        />
 
         <div className="workspace-grid">
           <section className="control-panel" aria-labelledby="control-title">
@@ -608,6 +650,27 @@ export default function App() {
                   selected={activeSubjectMode}
                 />
 
+                <div className="field-group">
+                  <label className="field-label" htmlFor="trust-boundary">
+                    환경 Trust Boundary
+                  </label>
+                  <select
+                    id="trust-boundary"
+                    onChange={(event) => setTrustBoundaryId(event.target.value)}
+                    value={activeTrustBoundary?.id ?? ''}
+                  >
+                    {availableTrustBoundaries.map((boundary) => (
+                      <option key={boundary.id} value={boundary.id}>
+                        {boundary.id} · {boundary.label}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="input-meta">
+                    <span>{activeTrustBoundary?.description ?? '경계를 선택하세요.'}</span>
+                    <span>{activeTrustBoundary?.boundary_type ?? '—'}</span>
+                  </div>
+                </div>
+
                 <div className="field-group prompt-field">
                   <label className="field-label" htmlFor="prompt">
                     Prompt
@@ -620,7 +683,7 @@ export default function App() {
                     value={prompt}
                   />
                   <div className="input-meta">
-                    <span>Planner는 선택한 환경 Runtime 내부에서 실행됩니다.</span>
+                    <span>Model Gateway의 Tool Call이 선택된 Executor에서 실행됩니다.</span>
                     <span>{prompt.length} / 4000</span>
                   </div>
                 </div>
@@ -639,11 +702,19 @@ export default function App() {
 
                 <button
                   className="run-button"
-                  disabled={isRunning || activePermissionSelections.length === 0}
+                  disabled={
+                    isRunning
+                    || Boolean(health?.active_executor)
+                    || activePermissionSelections.length === 0
+                  }
                   type="submit"
                 >
                   <span>
-                    {isRunning ? '통합 프로파일 실행 중' : '통합 실험 실행'}
+                    {isRunning
+                      ? '통합 프로파일 실행 중'
+                      : health?.active_executor
+                        ? `${health.active_executor} Executor 실행 중`
+                        : '통합 실험 실행'}
                   </span>
                   <span aria-hidden="true">↗</span>
                 </button>
@@ -661,24 +732,6 @@ export default function App() {
           </div>
         </div>
 
-        <DeploymentPanel
-          actionError={deploymentActionError}
-          deployment={deployment}
-          environmentName={environmentName}
-          isStarting={isStartingDeployment}
-          isStartingTunnel={isStartingTunnel}
-          onDeploy={deployEnvironment}
-          onDestroy={destroyEnvironment}
-          onInitialize={initializeTerraform}
-          onEnvironmentNameChange={setEnvironmentName}
-          onRefresh={refreshAwsInventory}
-          onSelectInstance={selectInstance}
-          onStartTunnel={connectSsmTunnel}
-          onStopTunnel={disconnectSsmTunnel}
-          onTerminateInstance={terminateSelectedInstance}
-          selectedInstanceId={selectedInstanceId}
-          tunnel={tunnel}
-        />
       </main>
 
       <footer>

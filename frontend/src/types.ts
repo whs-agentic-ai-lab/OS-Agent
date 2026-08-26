@@ -1,4 +1,5 @@
 export type SubjectModeId = "container" | "host";
+export type EnvironmentNodeId = "u1" | "u2" | "c1" | "c2" | "c3";
 export type TestResult = "PASS" | "FAIL" | "INCONCLUSIVE";
 
 export interface SubjectMode {
@@ -22,20 +23,32 @@ export interface ToolOption {
   description: string;
 }
 
+export interface TrustBoundaryOption {
+  id: string;
+  boundary_type: "HH" | "HC" | "CC";
+  source_mode: SubjectModeId;
+  source_environment: EnvironmentNodeId;
+  target_environment: EnvironmentNodeId;
+  label: string;
+  description: string;
+}
+
 export interface OptionsResponse {
   subject_modes: SubjectMode[];
   permission_tests: Record<SubjectModeId, PermissionTest[]>;
   tools: ToolOption[];
-  planner_mode: "environment";
+  trust_boundaries: TrustBoundaryOption[];
+  planner_mode: "local" | "openrouter";
 }
 
 export interface HealthResponse {
   status: string;
-  run_api_version?: "profile-runtime-v2";
+  run_api_version?: "profile-runtime-v3";
   harness_api_version?: "os-harness-v1";
   planner: string;
   storage: string;
   host_supervisor: "connected" | "unavailable";
+  active_executor?: SubjectModeId | null;
 }
 
 export type HarnessComponentName =
@@ -73,8 +86,10 @@ export interface HarnessBudget {
 export interface HarnessRunRequest {
   objective: string;
   subject_mode: SubjectModeId;
+  trust_boundary_id?: string;
   scenario_id: string;
-  permission_profile_id: string;
+  permission_profile?: Record<string, boolean>;
+  permission_profile_id?: string;
   budget?: HarnessBudget;
 }
 
@@ -91,6 +106,12 @@ export interface HarnessActionRecord {
     success: boolean;
     output: string;
     error_code: string | null;
+    evidence: {
+      runtime_result?: {
+        tool?: string;
+      };
+      [key: string]: unknown;
+    };
   };
   verification: {
     status: "VERIFIED" | "REJECTED" | "INCONCLUSIVE";
@@ -109,6 +130,9 @@ export interface HarnessRunRecord {
   status: "RECEIVED" | "RUNNING" | "COMPLETED" | "BLOCKED" | "FAILED";
   objective: string;
   subject_mode: SubjectModeId;
+  trust_boundary_id: string | null;
+  source_environment: EnvironmentNodeId | null;
+  target_environment: EnvironmentNodeId | null;
   scenario_id: string;
   budget: HarnessBudget;
   missing_components: HarnessComponentName[];
@@ -119,6 +143,7 @@ export interface HarnessRunRecord {
 export interface RunRequest {
   prompt: string;
   subject_mode: SubjectModeId;
+  trust_boundary_id: string;
   permission_profile: Record<string, boolean>;
 }
 
@@ -155,6 +180,9 @@ export interface RunEvent {
 export interface RunRecord {
   prompt: string;
   subject_mode: SubjectModeId;
+  trust_boundary_id: string;
+  source_environment: EnvironmentNodeId | null;
+  target_environment: EnvironmentNodeId | null;
   permission_id: string;
   permission_enabled: boolean;
   permission_profile: Record<string, boolean>;

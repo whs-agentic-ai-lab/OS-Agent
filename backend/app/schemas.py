@@ -14,6 +14,20 @@ class SubjectMode(str, Enum):
     host = "host"
 
 
+class EnvironmentNode(str, Enum):
+    u1 = "u1"
+    u2 = "u2"
+    c1 = "c1"
+    c2 = "c2"
+    c3 = "c3"
+
+
+class BoundaryType(str, Enum):
+    hh = "HH"
+    hc = "HC"
+    cc = "CC"
+
+
 class PermissionTest(BaseModel):
     id: str
     label: str
@@ -35,11 +49,22 @@ class ToolOption(BaseModel):
     description: str
 
 
+class TrustBoundaryOption(BaseModel):
+    id: str
+    boundary_type: BoundaryType
+    source_mode: SubjectMode
+    source_environment: EnvironmentNode
+    target_environment: EnvironmentNode
+    label: str
+    description: str
+
+
 class OptionsResponse(BaseModel):
     subject_modes: list[SubjectOption]
     permission_tests: dict[str, list[PermissionTest]]
     tools: list[ToolOption]
-    planner_mode: Literal["environment"] = "environment"
+    trust_boundaries: list[TrustBoundaryOption]
+    planner_mode: Literal["local", "openrouter"] = "local"
 
 
 class PermissionSelection(BaseModel):
@@ -56,6 +81,7 @@ PROFILE_KEYS: dict[SubjectMode, tuple[str, str, str]] = {
 class RunRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
     subject_mode: SubjectMode
+    trust_boundary_id: str | None = None
     permission_profile: dict[str, bool] = Field(default_factory=dict)
     # v1 로그/클라이언트를 읽기 위한 호환 필드입니다. 신규 요청의 기준은
     # permission_profile 객체 하나이며 목록 단위 실행은 하지 않습니다.
@@ -146,13 +172,34 @@ class RuntimeDispatchRequest(BaseModel):
     run_id: str
     prompt: str
     subject_mode: SubjectMode
+    trust_boundary_id: str
+    source_environment: EnvironmentNode
+    target_environment: EnvironmentNode
     permission_profile: dict[str, bool]
     profile_id: str
+    tool_decision: ToolDecision | None = None
+    planner_mode: Literal["local", "openrouter"] = "local"
+
+
+class RuntimeResetRequest(BaseModel):
+    run_id: str
+    subject_mode: SubjectMode
+    trust_boundary_id: str | None = None
+    target_environment: EnvironmentNode | None = None
+
+
+class RuntimeResetResult(BaseModel):
+    status: Literal["RESET", "RESET_FAILED"]
+    evidence_refs: list[str] = Field(default_factory=list)
+    restored_state: dict[str, Any] = Field(default_factory=dict)
 
 
 class RuntimeAgentResult(BaseModel):
     run_id: str
     subject_mode: SubjectMode
+    trust_boundary_id: str = "UNASSIGNED"
+    source_environment: EnvironmentNode | None = None
+    target_environment: EnvironmentNode | None = None
     applied_profile: str
     applied_profile_state: dict[str, Any]
     runtime_agent: str
@@ -173,6 +220,9 @@ class RunRecord(BaseModel):
     status: str
     prompt: str
     subject_mode: SubjectMode
+    trust_boundary_id: str = "UNASSIGNED"
+    source_environment: EnvironmentNode | None = None
+    target_environment: EnvironmentNode | None = None
     permission_id: str = "profile_bundle"
     permission_enabled: bool = True
     permission_profile: dict[str, bool] = Field(default_factory=dict)

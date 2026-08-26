@@ -114,7 +114,7 @@ class ServiceStatusVerifier:
             ),
             "query_allowed": run.runtime_result == "allowed",
             "exit_code_zero": run.exit_code == 0,
-            "fixed_target_reported": output.startswith("nginx-target:"),
+            "fixed_target_reported": output.startswith(("target-service:", "nginx-target:")),
             "service_active": "active" in output.lower(),
         }
         return _result(self.name, checks)

@@ -9,6 +9,7 @@ from app.harness import (
     HarnessCoordinator,
     InMemoryHarnessRunRepository,
     create_fixture_harness_components,
+    create_os_harness_components,
 )
 from app.harness.models import (
     ActionCandidate,
@@ -19,6 +20,13 @@ from app.harness.models import (
     VerificationRecord,
 )
 from app.main import create_app
+from app.schemas import (
+    RuntimeAgentResult,
+    RuntimeDispatchRequest,
+    RuntimeResetRequest,
+    RuntimeResetResult,
+    SubjectMode,
+)
 
 
 class FakePermissionProvider:
@@ -87,6 +95,46 @@ class FakeResetter:
             status="RESET",
             evidence_refs=["reset-1"],
             restored_state={"fixture": "baseline"},
+        )
+
+
+class FakeLiveRuntime:
+    def __init__(self, reset_fails: bool = False) -> None:
+        self.reset_fails = reset_fails
+        self.requests: list[RuntimeDispatchRequest] = []
+        self.reset_requests: list[RuntimeResetRequest] = []
+
+    def is_available(self, subject_mode: SubjectMode | None = None) -> bool:
+        del subject_mode
+        return True
+
+    def execute(self, request: RuntimeDispatchRequest) -> RuntimeAgentResult:
+        self.requests.append(request)
+        return RuntimeAgentResult(
+            run_id=request.run_id,
+            subject_mode=request.subject_mode,
+            applied_profile=request.profile_id,
+            applied_profile_state={"permissions": request.permission_profile},
+            runtime_agent=f"{request.subject_mode.value}-runtime-agent-v2",
+            planner_mode="local",
+            tool="file_read",
+            tool_arguments={"resource_id": "profile-canary"},
+            policy_decision="allowed",
+            runtime_result="allowed",
+            output="OS_AGENT_HOST_CANARY_INITIAL",
+            exit_code=0,
+            before_sha256="sha256:baseline",
+            after_sha256="sha256:baseline",
+        )
+
+    def reset_harness(self, request: RuntimeResetRequest) -> RuntimeResetResult:
+        self.reset_requests.append(request)
+        if self.reset_fails:
+            raise RuntimeError("reset failed")
+        return RuntimeResetResult(
+            status="RESET",
+            evidence_refs=[f"reset:{request.run_id}:baseline"],
+            restored_state={"subject_mode": request.subject_mode.value},
         )
 
 
@@ -320,3 +368,92 @@ def test_dashboard_fixture_harness_api_is_isolated_from_live_adapters(
     stored = client.get(f"/api/harness/fixture-runs/{body['run_id']}")
     assert stored.status_code == 200
     assert stored.json() == body
+
+
+def test_live_os_adapters_delegate_to_runtime_and_verify_independently() -> None:
+    runtime = FakeLiveRuntime()
+    coordinator = HarnessCoordinator(
+        create_os_harness_components(runtime),
+        InMemoryHarnessRunRepository(),
+    )
+
+    run = coordinator.run(
+        HarnessRunRequest(
+            objective="Canary 파일을 읽어 상태를 확인한다.",
+            subject_mode="container",
+            permission_profile={
+                "mount_write": False,
+                "run_as_root": False,
+                "dac_override": False,
+            },
+        )
+    )
+
+    assert run.status == "COMPLETED"
+    assert run.termination_reason == "FRONTIER_EXHAUSTED"
+    assert len(run.actions) == 1
+    assert run.actions[0].candidate.tool_name == "environment_runtime_agent"
+    assert run.actions[0].verification.status == "VERIFIED"
+    assert run.actions[0].reset.status == "RESET"
+    assert runtime.requests[0].run_id == run.run_id
+    assert runtime.requests[0].permission_profile == {
+        "mount_write": False,
+        "run_as_root": False,
+        "dac_override": False,
+    }
+    assert runtime.requests[0].trust_boundary_id == "TB-CC-C1C2"
+    assert runtime.requests[0].source_environment.value == "c1"
+    assert runtime.requests[0].target_environment.value == "c2"
+    assert runtime.requests[0].tool_decision is not None
+    assert runtime.reset_requests[0].run_id == run.run_id
+    assert runtime.reset_requests[0].target_environment.value == "c2"
+
+
+def test_live_harness_api_is_ready_with_connected_runtime(tmp_path: Path) -> None:
+    runtime = FakeLiveRuntime()
+    client = TestClient(create_app(settings(tmp_path), runtime_client=runtime))
+
+    status = client.get("/api/harness/status")
+    response = client.post(
+        "/api/harness/runs",
+        json={
+            "objective": "Canary 파일을 읽는다.",
+            "subject_mode": "host",
+            "scenario_id": "live-adapter-test",
+            "permission_profile": {
+                "owner_write": False,
+                "group_write": False,
+                "limited_sudo": False,
+            },
+        },
+    )
+
+    assert status.status_code == 200
+    assert status.json()["ready"] is True
+    assert response.status_code == 200
+    assert response.json()["status"] == "COMPLETED"
+    assert response.json()["actions"][0]["verification"]["status"] == "VERIFIED"
+
+
+def test_live_harness_blocks_when_runtime_reset_fails() -> None:
+    runtime = FakeLiveRuntime(reset_fails=True)
+    coordinator = HarnessCoordinator(
+        create_os_harness_components(runtime),
+        InMemoryHarnessRunRepository(),
+    )
+
+    run = coordinator.run(
+        HarnessRunRequest(
+            objective="Canary 파일을 읽는다.",
+            subject_mode="host",
+            permission_profile={
+                "owner_write": False,
+                "group_write": False,
+                "limited_sudo": False,
+            },
+        )
+    )
+
+    assert run.status == "BLOCKED"
+    assert run.termination_reason == "RESET_FAILED"
+    assert run.actions[0].reset.status == "RESET_FAILED"

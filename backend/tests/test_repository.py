@@ -2,8 +2,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from app.repository import SupabaseRunRepository, create_run_repository
-from app.schemas import RunEvent, RunRecord
+from app.repository import InMemoryRunRepository, SupabaseRunRepository, create_run_repository
+from app.schemas import RunEvent, RunRecord, SubjectMode
 
 
 def make_run() -> RunRecord:
@@ -61,7 +61,11 @@ def test_supabase_repository_upserts_run_and_events() -> None:
     client = Mock()
     runs_query = fluent_query([])
     events_query = fluent_query([])
-    client.table.side_effect = lambda name: runs_query if name == "runs" else events_query
+    client.table.side_effect = (
+        lambda name: runs_query
+        if name == "container_executor_runs"
+        else events_query
+    )
     repository = SupabaseRunRepository("https://example.supabase.co", "secret", client=client)
 
     repository.save(make_run())
@@ -74,6 +78,8 @@ def test_supabase_repository_upserts_run_and_events() -> None:
     assert event_payload[0]["run_id"] == "os-repository-test"
     assert event_payload[0]["sequence"] == 1
     assert events_query.upsert.call_args.kwargs["on_conflict"] == "run_id,sequence"
+    assert client.table.call_args_list[0].args[0] == "container_executor_runs"
+    assert client.table.call_args_list[1].args[0] == "container_executor_run_events"
 
 
 def test_supabase_repository_rebuilds_run_with_ordered_events() -> None:
@@ -81,7 +87,12 @@ def test_supabase_repository_rebuilds_run_with_ordered_events() -> None:
     client = Mock()
     runs_query = fluent_query([run.model_dump(mode="json", exclude={"events"})])
     events_query = fluent_query([run.events[0].model_dump(mode="json")])
-    client.table.side_effect = lambda name: runs_query if name == "runs" else events_query
+    empty_host_query = fluent_query([])
+    client.table.side_effect = lambda name: {
+        "host_executor_runs": empty_host_query,
+        "container_executor_runs": runs_query,
+        "container_executor_run_events": events_query,
+    }[name]
     repository = SupabaseRunRepository("https://example.supabase.co", "secret", client=client)
 
     restored = repository.get(run.run_id)
@@ -102,7 +113,11 @@ def test_supabase_repository_lists_latest_runs_with_exact_count() -> None:
     client.table.return_value = runs_query
     repository = SupabaseRunRepository("https://example.supabase.co", "secret", client=client)
 
-    items, total = repository.list_runs(page=2, page_size=20)
+    items, total = repository.list_runs(
+        subject_mode="container",
+        page=2,
+        page_size=20,
+    )
 
     assert items[0].run_id == run.run_id
     assert items[0].events == []
@@ -110,6 +125,7 @@ def test_supabase_repository_lists_latest_runs_with_exact_count() -> None:
     runs_query.select.assert_called_once_with("*", count="exact")
     runs_query.order.assert_called_once_with("created_at", desc=True)
     runs_query.range.assert_called_once_with(20, 39)
+    client.table.assert_called_once_with("container_executor_runs")
 
 
 def test_supabase_repository_restores_legacy_changed_variable() -> None:
@@ -123,7 +139,11 @@ def test_supabase_repository_restores_legacy_changed_variable() -> None:
     client.table.return_value = runs_query
     repository = SupabaseRunRepository("https://example.supabase.co", "secret", client=client)
 
-    items, total = repository.list_runs(page=1, page_size=20)
+    items, total = repository.list_runs(
+        subject_mode="container",
+        page=1,
+        page_size=20,
+    )
 
     assert total == 1
     assert items[0].changed_variable == "group_write:ON"
@@ -132,7 +152,10 @@ def test_supabase_repository_restores_legacy_changed_variable() -> None:
 def test_supabase_repository_deletes_only_the_selected_run() -> None:
     client = Mock()
     runs_query = fluent_query([{"run_id": "os-repository-test"}])
-    client.table.return_value = runs_query
+    empty_query = fluent_query([])
+    client.table.side_effect = lambda name: (
+        runs_query if name == "host_executor_runs" else empty_query
+    )
     repository = SupabaseRunRepository("https://example.supabase.co", "secret", client=client)
 
     deleted = repository.delete("os-repository-test")
@@ -150,3 +173,32 @@ def test_repository_requires_complete_supabase_configuration() -> None:
         assert "모두 설정" in str(error)
     else:
         raise AssertionError("부분 Supabase 설정은 거부해야 합니다.")
+
+
+def test_memory_repository_lists_executor_results_separately() -> None:
+    repository = InMemoryRunRepository()
+    container_run = make_run()
+    host_run = container_run.model_copy(
+        update={
+            "run_id": "os-host-repository-test",
+            "subject_mode": SubjectMode.host,
+        }
+    )
+    repository.save(container_run)
+    repository.save(host_run)
+
+    container_items, container_total = repository.list_runs(
+        SubjectMode.container,
+        page=1,
+        page_size=20,
+    )
+    host_items, host_total = repository.list_runs(
+        SubjectMode.host,
+        page=1,
+        page_size=20,
+    )
+
+    assert container_total == 1
+    assert [item.run_id for item in container_items] == [container_run.run_id]
+    assert host_total == 1
+    assert [item.run_id for item in host_items] == [host_run.run_id]

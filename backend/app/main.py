@@ -4,7 +4,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from .catalog import PERMISSION_TESTS, SUBJECT_MODES, TOOLS
+from .catalog import PERMISSION_TESTS, SUBJECT_MODES, TOOLS, TRUST_BOUNDARIES
 from .config import Settings, get_settings
 from .deployment import (
     DeploymentManager,
@@ -15,6 +15,8 @@ from .deployment import (
     TerminateInstanceRequest,
 )
 from .executor import RunCoordinator
+from .execution_gate import ExclusiveExecutorGate, ExecutorBusyError
+from .model_gateway import ModelGateway
 from .harness import (
     HarnessComponents,
     HarnessCoordinator,
@@ -23,6 +25,7 @@ from .harness import (
     HarnessStatus,
     InMemoryHarnessRunRepository,
     create_fixture_harness_components,
+    create_os_harness_components,
 )
 from .repository import create_run_repository
 from .runtime_client import EnvironmentRuntime, SupervisorRuntimeClient
@@ -33,6 +36,7 @@ from .schemas import (
     RunListResponse,
     RunRecord,
     RunRequest,
+    SubjectMode,
 )
 from .tunnel import SsmTunnelManager, TunnelRequest, TunnelStatus, TunnelStopRequest
 
@@ -50,10 +54,12 @@ def create_app(
     active_runtime = runtime_client or SupervisorRuntimeClient(
         active_settings.host_supervisor_socket
     )
-    coordinator = RunCoordinator(active_runtime, repository)
+    model_gateway = ModelGateway(active_settings)
+    coordinator = RunCoordinator(active_runtime, repository, model_gateway)
+    executor_gate = ExclusiveExecutorGate()
     harness_repository = InMemoryHarnessRunRepository()
     harness_coordinator = HarnessCoordinator(
-        harness_components or HarnessComponents(),
+        harness_components or create_os_harness_components(active_runtime, model_gateway),
         harness_repository,
     )
     fixture_harness_repository = InMemoryHarnessRunRepository()
@@ -75,15 +81,19 @@ def create_app(
     application.add_event_handler("shutdown", tunnel_manager.close)
 
     @application.get("/api/health")
-    def health() -> dict[str, str]:
+    def health() -> dict[str, str | None]:
+        active_executor = executor_gate.active_mode
         return {
             "status": "ok",
-            "run_api_version": "profile-runtime-v2",
+            "run_api_version": "profile-runtime-v3",
             "harness_api_version": "os-harness-v1",
-            "planner": "environment-runtime",
+            "planner": model_gateway.planner_mode,
             "storage": repository.storage_name,
             "host_supervisor": (
                 "connected" if active_runtime.is_available() else "unavailable"
+            ),
+            "active_executor": (
+                active_executor.value if active_executor is not None else None
             ),
         }
 
@@ -100,7 +110,8 @@ def create_app(
             ],
             permission_tests={key.value: value for key, value in PERMISSION_TESTS.items()},
             tools=TOOLS,
-            planner_mode="environment",
+            trust_boundaries=TRUST_BOUNDARIES,
+            planner_mode=model_gateway.planner_mode,
         )
 
     @application.get("/api/harness/status", response_model=HarnessStatus)
@@ -109,7 +120,11 @@ def create_app(
 
     @application.post("/api/harness/runs", response_model=HarnessRunRecord)
     def create_harness_run(request: HarnessRunRequest) -> HarnessRunRecord:
-        return harness_coordinator.run(request)
+        try:
+            with executor_gate.claim(request.subject_mode):
+                return harness_coordinator.run(request)
+        except ExecutorBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @application.get("/api/harness/runs/{run_id}", response_model=HarnessRunRecord)
     def get_harness_run(run_id: str) -> HarnessRunRecord:
@@ -195,7 +210,12 @@ def create_app(
         del request
         return tunnel_manager.stop()
 
-    def remote_request(method: str, path: str, payload: dict | None = None) -> dict:
+    def remote_request(
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        timeout: float = 30,
+    ) -> dict:
         tunnel = tunnel_manager.refresh()
         if tunnel.status != "connected":
             raise HTTPException(status_code=409, detail="SSM 터널을 먼저 연결하세요.")
@@ -204,7 +224,7 @@ def create_app(
                 method,
                 f"http://127.0.0.1:{tunnel.local_port}{path}",
                 json=payload,
-                timeout=30,
+                timeout=timeout,
             )
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"AWS 백엔드 연결 실패: {exc}") from exc
@@ -225,27 +245,73 @@ def create_app(
     def remote_options() -> OptionsResponse:
         return OptionsResponse.model_validate(remote_request("GET", "/api/options"))
 
-    @application.post("/api/remote/runs", response_model=RunRecord)
-    def remote_run(request: RunRequest) -> RunRecord:
+    @application.get("/api/remote/harness/status", response_model=HarnessStatus)
+    def remote_harness_status() -> HarnessStatus:
+        return HarnessStatus.model_validate(
+            remote_request("GET", "/api/harness/status")
+        )
+
+    @application.post(
+        "/api/remote/harness/runs",
+        response_model=HarnessRunRecord,
+    )
+    def remote_harness_run(request: HarnessRunRequest) -> HarnessRunRecord:
         remote_health_payload = remote_request("GET", "/api/health")
-        if remote_health_payload.get("run_api_version") != "profile-runtime-v2":
+        if remote_health_payload.get("harness_api_version") != "os-harness-v1":
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "AWS 백엔드가 환경 Runtime v2 API를 지원하지 않습니다. "
+                    "AWS 백엔드가 OS Harness API를 지원하지 않습니다. "
+                    "원격 Backend와 Supervisor를 먼저 갱신하세요."
+                ),
+            )
+        try:
+            with executor_gate.claim(request.subject_mode):
+                return HarnessRunRecord.model_validate(
+                    remote_request(
+                        "POST",
+                        "/api/harness/runs",
+                        request.model_dump(mode="json"),
+                        timeout=request.budget.max_elapsed_seconds + 15,
+                    )
+                )
+        except ExecutorBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @application.get(
+        "/api/remote/harness/runs/{run_id}",
+        response_model=HarnessRunRecord,
+    )
+    def remote_get_harness_run(run_id: str) -> HarnessRunRecord:
+        return HarnessRunRecord.model_validate(
+            remote_request("GET", f"/api/harness/runs/{run_id}")
+        )
+
+    @application.post("/api/remote/runs", response_model=RunRecord)
+    def remote_run(request: RunRequest) -> RunRecord:
+        remote_health_payload = remote_request("GET", "/api/health")
+        if remote_health_payload.get("run_api_version") != "profile-runtime-v3":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "AWS 백엔드가 방향성 TB Runtime v3 API를 지원하지 않습니다. "
                     "원격 Backend 이미지와 Supervisor를 먼저 갱신하세요."
                 ),
             )
-        run = RunRecord.model_validate(
-            remote_request(
-                "POST",
-                "/api/runs",
-                request.model_dump(
-                    mode="json",
-                    exclude={"permission_id", "permission_enabled", "permissions"},
-                ),
-            )
-        )
+        try:
+            with executor_gate.claim(request.subject_mode):
+                run = RunRecord.model_validate(
+                    remote_request(
+                        "POST",
+                        "/api/runs",
+                        request.model_dump(
+                            mode="json",
+                            exclude={"permission_id", "permission_enabled", "permissions"},
+                        ),
+                    )
+                )
+        except ExecutorBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if run.permission_profile != request.permission_profile:
             raise HTTPException(
                 status_code=502,
@@ -271,16 +337,20 @@ def create_app(
                 detail="실제 권한 실험은 SSM으로 연결된 AWS 환경 Runtime에서만 실행할 수 있습니다.",
             )
         try:
-            return coordinator.run(request)
+            with executor_gate.claim(request.subject_mode):
+                return coordinator.run(request)
+        except ExecutorBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @application.get("/api/runs", response_model=RunListResponse)
     def list_runs(
+        subject_mode: SubjectMode,
         page: int = Query(default=1, ge=1),
         page_size: int = Query(default=20, ge=1, le=100),
     ) -> RunListResponse:
-        items, total = repository.list_runs(page, page_size)
+        items, total = repository.list_runs(subject_mode, page, page_size)
         return RunListResponse(
             items=items,
             total=total,

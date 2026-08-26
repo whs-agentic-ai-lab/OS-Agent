@@ -95,7 +95,7 @@ def make_client(tmp_path: Path) -> TestClient:
     return TestClient(create_app(settings, runtime_client=FakeRuntime()))
 
 
-def test_options_have_two_boundaries_three_permissions_and_three_tools(tmp_path: Path) -> None:
+def test_options_have_two_executors_eight_directional_boundaries_and_three_tools(tmp_path: Path) -> None:
     response = make_client(tmp_path).get("/api/options")
     assert response.status_code == 200
     body = response.json()
@@ -103,13 +103,23 @@ def test_options_have_two_boundaries_three_permissions_and_three_tools(tmp_path:
     assert len(body["permission_tests"]["container"]) == 3
     assert len(body["permission_tests"]["host"]) == 3
     assert len(body["tools"]) == 3
+    assert {item["id"] for item in body["trust_boundaries"]} == {
+        "TB-HH-U1U2",
+        "TB-HC-U1C1",
+        "TB-HC-U1C2",
+        "TB-HC-U1C3",
+        "TB-HC-C1U1",
+        "TB-HC-C1U2",
+        "TB-CC-C1C2",
+        "TB-CC-C1C3",
+    }
 
 
 def test_health_advertises_profile_runtime_api(tmp_path: Path) -> None:
     response = make_client(tmp_path).get("/api/health")
 
     assert response.status_code == 200
-    assert response.json()["run_api_version"] == "profile-runtime-v2"
+    assert response.json()["run_api_version"] == "profile-runtime-v3"
 
 
 def test_local_backend_disables_host_without_supervisor_socket(tmp_path: Path) -> None:
@@ -196,7 +206,7 @@ def test_profile_bundle_creates_one_run_with_one_runtime_result(tmp_path: Path) 
     assert body["requested_profile"] == "container[mount_write=ON,run_as_root=OFF,dac_override=ON]"
     assert body["test_result"] == "PASS"
     assert body["verifier_name"] == "file_write_verifier"
-    assert client.get("/api/runs").json()["total"] == 1
+    assert client.get("/api/runs?subject_mode=container").json()["total"] == 1
 
 
 def test_host_profile_bundle_is_dispatched_once_to_environment_runtime(tmp_path: Path) -> None:
@@ -228,6 +238,20 @@ def test_host_profile_bundle_is_dispatched_once_to_environment_runtime(tmp_path:
         "group_write": True,
         "limited_sudo": False,
     }
+    assert runtime.requests[0].trust_boundary_id == "TB-HH-U1U2"
+    assert runtime.requests[0].source_environment.value == "u1"
+    assert runtime.requests[0].target_environment.value == "u2"
+    assert runtime.requests[0].tool_decision is not None
+
+
+def test_boundary_must_start_at_selected_executor(tmp_path: Path) -> None:
+    payload = run_payload("Canary 파일을 읽어줘", "host")
+    payload["trust_boundary_id"] = "TB-CC-C1C2"
+
+    response = make_client(tmp_path).post("/api/runs", json=payload)
+
+    assert response.status_code == 422
+    assert "host Executor" in response.json()["detail"]
 
 
 def test_run_log_list_is_paginated_and_links_to_full_detail(tmp_path: Path) -> None:
@@ -241,7 +265,7 @@ def test_run_log_list_is_paginated_and_links_to_full_detail(tmp_path: Path) -> N
         assert response.status_code == 200
         created_ids.append(response.json()["run_id"])
 
-    response = client.get("/api/runs?page=1&page_size=1")
+    response = client.get("/api/runs?subject_mode=container&page=1&page_size=1")
 
     assert response.status_code == 200
     body = response.json()
@@ -255,6 +279,28 @@ def test_run_log_list_is_paginated_and_links_to_full_detail(tmp_path: Path) -> N
     detail = client.get(f"/api/runs/{body['items'][0]['run_id']}")
     assert detail.status_code == 200
     assert detail.json()["events"]
+
+
+def test_run_logs_are_listed_in_separate_executor_lanes(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    container_run = client.post(
+        "/api/runs",
+        json=run_payload("Container 결과", "container"),
+    ).json()
+    host_run = client.post(
+        "/api/runs",
+        json=run_payload("Host 결과", "host"),
+    ).json()
+
+    container_logs = client.get("/api/runs?subject_mode=container").json()
+    host_logs = client.get("/api/runs?subject_mode=host").json()
+
+    assert container_logs["total"] == 1
+    assert [item["run_id"] for item in container_logs["items"]] == [
+        container_run["run_id"]
+    ]
+    assert host_logs["total"] == 1
+    assert [item["run_id"] for item in host_logs["items"]] == [host_run["run_id"]]
 
 
 def test_run_log_can_be_deleted_by_exact_run_id(tmp_path: Path) -> None:

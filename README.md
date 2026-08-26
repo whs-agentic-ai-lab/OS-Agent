@@ -1,6 +1,6 @@
 # OS Agent Minimum Test
 
-고정된 AWS 인프라에서 Container와 Ubuntu Host 권한 경계를 비교하기 위한 최소 테스트 프로젝트다. 모든 구현과 테스트 파일은 이 디렉터리 안에만 둔다.
+하나의 EC2 Ubuntu 안에서 Host 사용자와 Docker Container 사이의 방향성 환경 경계를 시험하는 프로젝트다. 모든 구현과 테스트 파일은 이 디렉터리 안에만 둔다.
 
 ## 구조
 
@@ -19,15 +19,18 @@ os-Agent-test/
 
 ## 현재 동작 범위
 
-- 실행 경계: `Container`, `Ubuntu Host`
+- 환경 노드: Host `U1`, `U2`와 Container `C1`, `C2`, `C3`
+- 시작 Executor: Host Executor=`U1`, Container Executor=`C1`이며 공통 실행 잠금으로 한 Trial에는 반드시 하나만 활성화
+- 환경 TB: `U1→U2`, `U1→C1/C2/C3`, `C1→U1/U2`, `C1→C2/C3`의 8개 방향
 - 경계별 권한 시험: 세 OFF/ON 값을 하나의 `permission_profile` 묶음으로 적용
 - Run 의미: 권한 프로파일 묶음 1개 + 환경 Runtime 1회 실행 + 독립 판정 1개 = `run_id` 1개
 - Tool: `file_read`, `file_write`, `service_status`
-- Agent Runtime: Container/Host 각각의 경계 안에서 Planner → Executor → Tool 실행
-- Control Backend: Run 배포·결과 수집·독립 Verifier·Supabase 저장만 담당하며 Canary를 직접 읽거나 쓰지 않음
-- 로그: Profile → Supervisor → 환경 Planner/Tool/Executor → Control Verifier 이벤트
-- 저장소: Supabase 설정 시 `runs`·`run_events` 영구 저장, 미설정 시 로컬 메모리 fallback
-- 로그 조회: 메인 네비게이션의 `로그 조회`에서 Supabase 전체 실행을 최신순·20건 단위로 탐색하고 실행별 공통 결과와 모든 이벤트 확인
+- Tool Call: Backend의 Model Gateway가 OpenRouter 응답(키가 없으면 결정적 로컬 fallback)을 검증해 선택된 Executor로 전달
+- Agent Runtime: U1/C1에서 동일한 Executor artifact가 allowlist Tool만 실행하며 프롬프트를 다시 해석하지 않음
+- Control Backend: Model Gateway·Harness·Run 배포·결과 수집·독립 Verifier·Supabase 저장을 담당하며 Canary를 직접 읽거나 쓰지 않음
+- 로그: Profile → Model Tool Call → Supervisor → U1/C1 Executor·Tool → Control Verifier 이벤트
+- 저장소: Supabase 설정 시 Host 결과는 `host_executor_runs/events`, Container 결과는 `container_executor_runs/events`에 물리 분리 저장하고, 미설정 시 로컬 메모리도 두 실행 레인으로 분리
+- 로그 조회: 메인 네비게이션의 `로그 조회`에서 U1 Host/C1 Container 탭을 전환해 각 Executor 결과와 이벤트를 별도로 확인
 - 로그 삭제: 목록에서 Run ID를 다시 입력해 단일 실행을 삭제하며 연결된 `run_events`도 함께 삭제
 - OS 권한: Container는 실제 mount mode·UID·capability, Ubuntu Host는 실제 소유자·그룹·제한된 sudo 상태로 검증
 - 환경 배포: 로컬 대시보드 → 로컬 FastAPI → 고정 Terraform 순서로 AWS 환경과 백엔드 이미지를 자동 배포
@@ -37,19 +40,21 @@ os-Agent-test/
 
 ## Agent Harness Core
 
-기존 단일 권한 Run과 실행 경계를 변경하지 않고, 향후 OS 권한·Tool·Verifier를 연결할 `os-harness-v1` Core를 별도 API로 제공한다.
+기존 단일 권한 Run과 실행 경계를 변경하지 않고, 현재 OS 권한·Tool·Verifier를 조정하는 `os-harness-v1` Core와 Live Adapter를 별도 API로 제공한다.
 
 - `GET /api/harness/status`: Permission Provider, Tool Catalog, Planner, Executor, Verifier, Resetter 연결 상태 조회
 - `POST /api/harness/runs`: Harness Run 생성과 상태·Budget·종료 수명주기 실행
 - `GET /api/harness/runs/{run_id}`: In-memory Harness 실행 기록 조회
 - `GET /api/harness/fixtures/status`: 메모리 전용 Fixture 자가진단 준비 상태 조회
 - `POST /api/harness/fixture-runs`: Dashboard에서 안전한 Fixture 수명주기 실행
-- 현재 실제 OS Adapter는 연결 전이므로 Harness Run은 Tool을 실행하지 않고 `BLOCKED / MISSING_REQUIRED_COMPONENTS`로 종료
+- 실제 OS Adapter는 기존 Supervisor/Environment Runtime 경로에 연결되며, Supervisor socket이 없으면 `BLOCKED / MISSING_REQUIRED_COMPONENTS`로 종료
+- Live Harness는 현재 화면의 TB와 완전한 권한 Profile을 적용하고, Backend Model Gateway의 Tool Call을 U1/C1 Executor에 위임한 뒤 Control Backend에서 검증하고 Supervisor로 Reset
+- SSM 연결 시 `/api/remote/harness/*`를 통해 EC2 Backend의 동일 Harness를 실행하며, 로컬 Backend가 원격 Tool을 대신 실행하지 않음
 - `create_fixture_harness_components()`를 테스트에서 주입하면 State → Frontier → Planner → Execute → Verify → Reset 전체 흐름 실행
 - Dashboard의 `Agent Harness` Panel에서 실제 Adapter 상태와 Fixture 실행 결과를 분리해 표시
 - 기존 `POST /api/runs`, Runtime Agent, root Supervisor, Terraform, SSM, Supabase 실행 경로는 그대로 유지
 
-OS 권한 모델, 최종 Tool과 Independent Verifier가 확정되면 각각의 Harness Port에 Adapter로 연결한다. Harness Core가 Domain 구현을 직접 import하거나 임시 권한 규칙을 만들지 않는다.
+현재 Live Adapter는 기존 세 권한과 세 Tool의 최소 수직 경로만 재사용한다. 추가 Recon·Capability·최종 Tool 계약은 후속 단계에서 확장하며, Harness가 root 작업이나 환경 내부 Tool 선택을 가져오지 않는다.
 
 ### 메모리 전용 Fixture Adapter
 
@@ -82,8 +87,15 @@ OS 권한 모델, 최종 Tool과 Independent Verifier가 확정되면 각각의 
 - Compute: `t3.small` 1대
 - Network: private subnet, public inbound 없음
 - Access: AWS Systems Manager(SSM) 전용
-- Runtime: 한 EC2 안에서 Container와 Ubuntu Host 경계를 시험
-- Network: 테스트 대상은 내부 `control` 망에 격리하고, 백엔드만 OpenRouter·Supabase 통신용 `egress` 망 사용
+- Runtime: 한 EC2 안에 U1/U2/C1/C2/C3 논리 환경을 두고 방향성 환경 TB를 시험
+- Network: C1/C2/C3 Target 서비스는 내부 `control` 망에 격리하고, 백엔드만 OpenRouter·Supabase 통신용 `egress` 망 사용
+
+| 시작 Executor | 환경 TB |
+| --- | --- |
+| Host Executor (`U1`) | `TB-HH-U1U2`, `TB-HC-U1C1`, `TB-HC-U1C2`, `TB-HC-U1C3` |
+| Container Executor (`C1`) | `TB-HC-C1U1`, `TB-HC-C1U2`, `TB-CC-C1C2`, `TB-CC-C1C3` |
+
+두 Executor Run은 동시에 실행되지 않는다. 표준 Run과 Live Harness가 같은 공통 잠금을 사용하며, 다른 Executor 실행 중 새 요청은 대기열에 넣지 않고 HTTP `409`로 거부한다. 이렇게 해야 한 Executor가 적용한 권한 Profile이나 Reset 과정이 다른 Executor Trial의 Evidence에 섞이지 않는다.
 
 ### Ubuntu Host 실행 경계
 

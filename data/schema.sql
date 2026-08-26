@@ -5,6 +5,9 @@ create table if not exists public.runs (
   run_id text primary key,
   prompt text not null check (char_length(prompt) between 1 and 4000),
   subject_mode text not null check (subject_mode in ('container', 'host')),
+  trust_boundary_id text not null default 'UNASSIGNED',
+  source_environment text check (source_environment in ('u1', 'c1')),
+  target_environment text check (target_environment in ('u1', 'u2', 'c1', 'c2', 'c3')),
   permission_id text not null,
   permission_enabled boolean not null,
   permission_profile jsonb not null default '{}'::jsonb
@@ -80,6 +83,11 @@ alter table public.runs add column if not exists verifier_effect jsonb not null 
   check (jsonb_typeof(verifier_effect) = 'object');
 alter table public.runs add column if not exists evidence_references jsonb not null default '[]'::jsonb
   check (jsonb_typeof(evidence_references) = 'array');
+alter table public.runs add column if not exists trust_boundary_id text not null default 'UNASSIGNED';
+alter table public.runs add column if not exists source_environment text
+  check (source_environment in ('u1', 'c1'));
+alter table public.runs add column if not exists target_environment text
+  check (target_environment in ('u1', 'u2', 'c1', 'c2', 'c3'));
 
 create table if not exists public.run_events (
   event_id uuid primary key default gen_random_uuid(),
@@ -104,8 +112,80 @@ alter table public.run_events drop constraint if exists run_events_source_check;
 alter table public.run_events add constraint run_events_source_check
   check (source in ('profile', 'model', 'tool_runner', 'executor', 'runtime_agent', 'supervisor', 'verifier'));
 
+-- U1 Host Executor와 C1 Container Executor 결과는 물리적으로 다른 테이블에 저장한다.
+-- public.runs/run_events는 기존 로그를 한 번 이관하기 위한 legacy source로만 유지한다.
+create table if not exists public.host_executor_runs
+  (like public.runs including all);
+create table if not exists public.container_executor_runs
+  (like public.runs including all);
+create table if not exists public.host_executor_run_events
+  (like public.run_events including all);
+create table if not exists public.container_executor_run_events
+  (like public.run_events including all);
+
+alter table public.host_executor_runs drop constraint if exists host_executor_runs_subject_mode_check;
+alter table public.host_executor_runs add constraint host_executor_runs_subject_mode_check
+  check (subject_mode = 'host');
+alter table public.container_executor_runs drop constraint if exists container_executor_runs_subject_mode_check;
+alter table public.container_executor_runs add constraint container_executor_runs_subject_mode_check
+  check (subject_mode = 'container');
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'host_executor_run_events_run_id_fkey'
+  ) then
+    alter table public.host_executor_run_events
+      add constraint host_executor_run_events_run_id_fkey
+      foreign key (run_id) references public.host_executor_runs(run_id) on delete cascade;
+  end if;
+  if not exists (
+    select 1 from pg_constraint where conname = 'container_executor_run_events_run_id_fkey'
+  ) then
+    alter table public.container_executor_run_events
+      add constraint container_executor_run_events_run_id_fkey
+      foreign key (run_id) references public.container_executor_runs(run_id) on delete cascade;
+  end if;
+end $$;
+
+insert into public.host_executor_runs
+  select * from public.runs where subject_mode = 'host'
+  on conflict (run_id) do nothing;
+insert into public.container_executor_runs
+  select * from public.runs where subject_mode = 'container'
+  on conflict (run_id) do nothing;
+insert into public.host_executor_run_events
+  select events.*
+  from public.run_events as events
+  join public.runs as runs using (run_id)
+  where runs.subject_mode = 'host'
+  on conflict (run_id, sequence) do nothing;
+insert into public.container_executor_run_events
+  select events.*
+  from public.run_events as events
+  join public.runs as runs using (run_id)
+  where runs.subject_mode = 'container'
+  on conflict (run_id, sequence) do nothing;
+
+alter table public.host_executor_runs enable row level security;
+alter table public.container_executor_runs enable row level security;
+alter table public.host_executor_run_events enable row level security;
+alter table public.container_executor_run_events enable row level security;
+
 revoke all on table public.runs from anon, authenticated;
 revoke all on table public.run_events from anon, authenticated;
+revoke all on table public.host_executor_runs from anon, authenticated;
+revoke all on table public.container_executor_runs from anon, authenticated;
+revoke all on table public.host_executor_run_events from anon, authenticated;
+revoke all on table public.container_executor_run_events from anon, authenticated;
+revoke all on table public.host_executor_runs from service_role;
+revoke all on table public.container_executor_runs from service_role;
+revoke all on table public.host_executor_run_events from service_role;
+revoke all on table public.container_executor_run_events from service_role;
 
 grant select, insert, update, delete on table public.runs to service_role;
 grant select, insert, update, delete on table public.run_events to service_role;
+grant select, insert, update, delete on table public.host_executor_runs to service_role;
+grant select, insert, update, delete on table public.container_executor_runs to service_role;
+grant select, insert, update, delete on table public.host_executor_run_events to service_role;
+grant select, insert, update, delete on table public.container_executor_run_events to service_role;

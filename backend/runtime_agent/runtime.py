@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Planner + Executor + Tool process that runs inside the selected boundary.
+"""Executor + Tool process that runs at the selected U1 or C1 start point.
 
 The module intentionally uses only the Python standard library so the exact same
 artifact can run in the container image and as the unprivileged ``agent-host``
@@ -56,8 +56,11 @@ def _decide(prompt: str) -> tuple[str, dict[str, Any]]:
 
 
 def _execute_file(tool: str, arguments: dict[str, Any], subject_mode: str) -> dict[str, Any]:
-    if arguments.get("resource_id") != "profile-canary":
+    if arguments.get("resource_id") != "target-canary":
         raise ValueError("허용 목록에 없는 Resource ID입니다.")
+    expected_arguments = {"resource_id"} if tool == "file_read" else {"resource_id", "content"}
+    if set(arguments) != expected_arguments:
+        raise ValueError("Tool Call에 허용되지 않은 인자가 포함됐습니다.")
     canary = Path(os.environ.get("OS_AGENT_CANARY_PATH", "/trial/canary.txt"))
     before = _hash(canary)
     if tool == "file_read":
@@ -75,7 +78,7 @@ def _execute_file(tool: str, arguments: dict[str, Any], subject_mode: str) -> di
         raise ValueError("기록 내용은 NUL 없는 128자 이하 문자열이어야 합니다.")
     try:
         canary.write_text(content, encoding="utf-8")
-        output = f"profile-canary에 {len(content)}자를 기록했습니다."
+        output = f"target-canary에 {len(content)}자를 기록했습니다."
         exit_code = 0
     except OSError as exc:
         if subject_mode == "host":
@@ -83,8 +86,16 @@ def _execute_file(tool: str, arguments: dict[str, Any], subject_mode: str) -> di
                 "OS_AGENT_SUDO_HELPER",
                 "/opt/trial/host-supervisor.py",
             )
+            target_node = os.environ.get("OS_AGENT_TARGET_NODE", "u2")
             attempted = subprocess.run(
-                ["/usr/bin/sudo", "-n", "/usr/bin/python3", helper, "--sudo-helper"],
+                [
+                    "/usr/bin/sudo",
+                    "-n",
+                    "/usr/bin/python3",
+                    helper,
+                    "--sudo-helper",
+                    target_node,
+                ],
                 input=content,
                 text=True,
                 capture_output=True,
@@ -112,15 +123,15 @@ def _execute_file(tool: str, arguments: dict[str, Any], subject_mode: str) -> di
 
 
 def _execute_service(arguments: dict[str, Any]) -> dict[str, Any]:
-    if arguments != {"service_id": "nginx-target"}:
+    if arguments != {"resource_id": "target-service"}:
         raise ValueError("허용 목록에 없는 서비스입니다.")
-    service_url = os.environ.get("OS_AGENT_SERVICE_URL", "http://nginx-target")
+    service_url = os.environ.get("OS_AGENT_SERVICE_URL", "http://c2-target")
     try:
         with urllib.request.urlopen(service_url, timeout=3) as response:
             active = 200 <= response.status < 500
         return {
             "runtime_result": "allowed" if active else "error",
-            "output": "nginx-target: active" if active else "nginx-target: inactive",
+            "output": "target-service: active" if active else "target-service: inactive",
             "exit_code": 0 if active else 1,
             "before_sha256": None,
             "after_sha256": None,
@@ -128,7 +139,7 @@ def _execute_service(arguments: dict[str, Any]) -> dict[str, Any]:
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return {
             "runtime_result": "error",
-            "output": f"nginx-target: inactive ({exc})",
+            "output": f"target-service: inactive ({exc})",
             "exit_code": 1,
             "before_sha256": None,
             "after_sha256": None,
@@ -139,20 +150,50 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     run_id = payload.get("run_id")
     prompt = payload.get("prompt")
     subject_mode = payload.get("subject_mode")
+    trust_boundary_id = payload.get("trust_boundary_id")
+    source_environment = payload.get("source_environment")
+    target_environment = payload.get("target_environment")
     permission_profile = payload.get("permission_profile")
     profile_id = payload.get("profile_id")
-    if not all(isinstance(value, str) and value for value in (run_id, prompt, profile_id)):
-        raise ValueError("run_id, prompt, profile_id가 필요합니다.")
+    if not all(
+        isinstance(value, str) and value
+        for value in (
+            run_id,
+            prompt,
+            profile_id,
+            trust_boundary_id,
+            source_environment,
+            target_environment,
+        )
+    ):
+        raise ValueError("run_id, prompt, profile_id, Trust Boundary 정보가 필요합니다.")
     expected_keys = CONTAINER_KEYS if subject_mode == "container" else HOST_KEYS if subject_mode == "host" else set()
     if not isinstance(permission_profile, dict) or set(permission_profile) != expected_keys:
         raise ValueError("환경의 완전한 권한 프로파일 묶음이 필요합니다.")
     if not all(isinstance(value, bool) for value in permission_profile.values()):
         raise ValueError("권한 프로파일 값은 boolean이어야 합니다.")
 
-    tool, arguments = _decide(prompt)
+    decision = payload.get("tool_decision")
+    if decision is None:
+        tool, arguments = _decide(prompt)
+        # 구버전 Supervisor 호환. 신규 Backend는 항상 Tool Call을 전달한다.
+        if tool == "service_status":
+            arguments = {"resource_id": "target-service"}
+        else:
+            arguments["resource_id"] = "target-canary"
+    elif isinstance(decision, dict):
+        tool = decision.get("name")
+        arguments = decision.get("arguments")
+    else:
+        raise ValueError("tool_decision은 JSON 객체여야 합니다.")
+    if tool not in {"file_read", "file_write", "service_status"} or not isinstance(arguments, dict):
+        raise ValueError("허용 목록에 없는 Tool Call입니다.")
+    planner_mode = payload.get("planner_mode", "local")
+    if planner_mode not in {"local", "openrouter"}:
+        raise ValueError("지원하지 않는 Model Gateway 모드입니다.")
     events = [
-        _event("model", "TOOL_REQUESTED", f"환경 Planner가 {tool}을 선택했습니다.", {"tool": tool, "arguments": arguments}),
-        _event("tool_runner", "TOOL_ALLOWED", "환경 Tool allowlist와 인수를 검증했습니다."),
+        _event("tool_runner", "TOOL_RECEIVED", f"Backend에서 {tool} Tool Call을 받았습니다.", {"tool": tool, "arguments": arguments}),
+        _event("tool_runner", "TOOL_ALLOWED", "Executor가 Tool allowlist와 인수를 검증했습니다."),
     ]
     if tool == "service_status":
         raw = _execute_service(arguments)
@@ -169,10 +210,13 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "run_id": run_id,
         "subject_mode": subject_mode,
+        "trust_boundary_id": trust_boundary_id,
+        "source_environment": source_environment,
+        "target_environment": target_environment,
         "applied_profile": profile_id,
         "applied_profile_state": {},
-        "runtime_agent": f"{subject_mode}-runtime-agent-v2",
-        "planner_mode": "local",
+        "runtime_agent": f"{source_environment}-executor-v3",
+        "planner_mode": planner_mode,
         "tool": tool,
         "tool_arguments": arguments,
         "policy_decision": "allowed",

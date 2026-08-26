@@ -3,6 +3,8 @@ from __future__ import annotations
 from time import monotonic
 from uuid import uuid4
 
+from ..schemas import EnvironmentNode
+
 from .models import (
     ActionCandidate,
     HarnessActionRecord,
@@ -48,11 +50,13 @@ class HarnessCoordinator:
             status="RECEIVED",
             objective=request.objective,
             subject_mode=request.subject_mode,
+            trust_boundary_id=request.trust_boundary_id,
             scenario_id=request.scenario_id,
             budget=budget,
             state={
                 "objective": request.objective,
                 "subject_mode": request.subject_mode.value,
+                "trust_boundary_id": request.trust_boundary_id,
                 "scenario_id": request.scenario_id,
                 "history": [],
             },
@@ -85,6 +89,14 @@ class HarnessCoordinator:
             resetter = self._require("resetter")
 
             run.state["permission_snapshot"] = permission_provider.snapshot(request)
+            snapshot = run.state["permission_snapshot"]
+            if snapshot.get("trust_boundary_id"):
+                run.trust_boundary_id = snapshot["trust_boundary_id"]
+                run.source_environment = EnvironmentNode(snapshot["source_environment"])
+                run.target_environment = EnvironmentNode(snapshot["target_environment"])
+                run.state["trust_boundary_id"] = snapshot["trust_boundary_id"]
+                run.state["source_environment"] = snapshot.get("source_environment")
+                run.state["target_environment"] = snapshot.get("target_environment")
             run.state_version += 1
             self._event(
                 run,
@@ -198,6 +210,14 @@ class HarnessCoordinator:
                 if reset.status == "RESET_FAILED":
                     run.status = "BLOCKED"
                     run.termination_reason = "RESET_FAILED"
+                    break
+                if verification.status == "REJECTED":
+                    run.status = "FAILED"
+                    run.termination_reason = "VERIFICATION_REJECTED"
+                    break
+                if verification.status == "INCONCLUSIVE":
+                    run.status = "BLOCKED"
+                    run.termination_reason = "VERIFICATION_INCONCLUSIVE"
                     break
 
                 if fingerprint == last_fingerprint:

@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from ..schemas import SubjectMode
+from ..schemas import EnvironmentNode, PROFILE_KEYS, SubjectMode
 
 
 def utc_now() -> datetime:
@@ -55,13 +55,30 @@ class HarnessBudgetState(HarnessBudgetConfig):
 class HarnessRunRequest(BaseModel):
     objective: str = Field(min_length=1, max_length=4000)
     subject_mode: SubjectMode
+    trust_boundary_id: str | None = None
     scenario_id: str = Field(default="unassigned", min_length=1, max_length=128)
+    permission_profile: dict[str, bool] | None = None
     permission_profile_id: str | None = Field(
         default=None,
         min_length=1,
         max_length=160,
     )
     budget: HarnessBudgetConfig = Field(default_factory=HarnessBudgetConfig)
+
+    @model_validator(mode="after")
+    def validate_permission_profile(self) -> "HarnessRunRequest":
+        if self.permission_profile is None:
+            return self
+        expected = set(PROFILE_KEYS[self.subject_mode])
+        actual = set(self.permission_profile)
+        if actual != expected:
+            missing = ", ".join(sorted(expected - actual)) or "없음"
+            extra = ", ".join(sorted(actual - expected)) or "없음"
+            raise ValueError(
+                "Harness 권한 프로파일은 선택 환경의 세 항목을 모두 포함해야 합니다. "
+                f"누락: {missing}; 잘못된 항목: {extra}"
+            )
+        return self
 
 
 class ActionCandidate(BaseModel):
@@ -137,6 +154,9 @@ class HarnessRunRecord(BaseModel):
     status: Literal["RECEIVED", "RUNNING", "COMPLETED", "BLOCKED", "FAILED"]
     objective: str
     subject_mode: SubjectMode
+    trust_boundary_id: str | None = None
+    source_environment: EnvironmentNode | None = None
+    target_environment: EnvironmentNode | None = None
     scenario_id: str
     state_version: int = 0
     state: dict[str, Any] = Field(default_factory=dict)
