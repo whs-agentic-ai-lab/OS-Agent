@@ -1,5 +1,6 @@
 from .coordinator import HarnessCoordinator
 from .fixtures import FIXTURE_PROFILES, create_fixture_harness_components
+from .os_adapters import create_os_harness_components
 from .models import HarnessRunRecord, HarnessRunRequest, HarnessStatus
 from .ports import HarnessComponents
 from .repository import InMemoryHarnessRunRepository
@@ -13,4 +14,5 @@ __all__ = [
     "InMemoryHarnessRunRepository",
     "FIXTURE_PROFILES",
     "create_fixture_harness_components",
+    "create_os_harness_components",
 ]

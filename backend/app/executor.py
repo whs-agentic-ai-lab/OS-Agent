@@ -1,6 +1,7 @@
 from uuid import uuid4
 
-from .catalog import build_profile_id
+from .catalog import build_profile_id, resolve_trust_boundary
+from .model_gateway import ModelGateway
 from .repository import RunRepository
 from .runtime_client import EnvironmentRuntime
 from .schemas import (
@@ -18,15 +19,25 @@ from .verifiers import verify_tool
 class RunCoordinator:
     """Control Backend의 Run 수명주기만 담당합니다.
 
-    Planner, Executor, Tool은 이 클래스에 두지 않습니다. 선택 환경의 Runtime
-    Agent가 반환한 원시 결과를 수집한 뒤 독립 Verifier로 최종 판정합니다.
+    Model Gateway의 Tool Call을 선택된 Executor로 전달하고, 환경 Runtime이
+    반환한 원시 결과를 수집한 뒤 독립 Verifier로 최종 판정합니다.
     """
 
-    def __init__(self, runtime: EnvironmentRuntime, repository: RunRepository) -> None:
+    def __init__(
+        self,
+        runtime: EnvironmentRuntime,
+        repository: RunRepository,
+        model_gateway: ModelGateway,
+    ) -> None:
         self.runtime = runtime
         self.repository = repository
+        self.model_gateway = model_gateway
 
     def run(self, request: RunRequest) -> RunRecord:
+        boundary = resolve_trust_boundary(
+            request.subject_mode,
+            request.trust_boundary_id,
+        )
         profile_id = build_profile_id(request.subject_mode, request.permission_profile)
         changed_variables = [
             f"{key}:{'ON' if request.permission_profile[key] else 'OFF'}"
@@ -37,11 +48,14 @@ class RunCoordinator:
             status="RECEIVED",
             prompt=request.prompt,
             subject_mode=request.subject_mode,
+            trust_boundary_id=boundary.id,
+            source_environment=boundary.source_environment,
+            target_environment=boundary.target_environment,
             permission_profile=request.permission_profile,
             permissions=request.permissions,
             requested_profile=profile_id,
             changed_variable=", ".join(changed_variables),
-            planner_mode="local",
+            planner_mode=self.model_gateway.planner_mode,
         )
         try:
             self._event(
@@ -52,21 +66,48 @@ class RunCoordinator:
                 {"profile_id": profile_id, "permission_profile": request.permission_profile},
             )
             run.status = "DISPATCHING"
+            tool_decision = self.model_gateway.decide(request.prompt, boundary)
+            self._event(
+                run,
+                "model",
+                "TOOL_REQUESTED",
+                f"Model Gateway가 {tool_decision.name} Tool Call을 생성했습니다.",
+                {
+                    "trust_boundary_id": boundary.id,
+                    "tool": tool_decision.name,
+                    "arguments": tool_decision.arguments,
+                },
+            )
             self._event(
                 run,
                 "supervisor",
                 "RUNTIME_DISPATCHED",
-                f"{request.subject_mode.value} Runtime Agent로 Run을 전달했습니다.",
+                f"{boundary.source_environment.value.upper()} Executor로 Tool Call을 전달했습니다.",
             )
             result = self.runtime.execute(
                 RuntimeDispatchRequest(
                     run_id=run.run_id,
                     prompt=request.prompt,
                     subject_mode=request.subject_mode,
+                    trust_boundary_id=boundary.id,
+                    source_environment=boundary.source_environment,
+                    target_environment=boundary.target_environment,
                     permission_profile=request.permission_profile,
                     profile_id=profile_id,
+                    tool_decision=tool_decision,
+                    planner_mode=self.model_gateway.planner_mode,
                 )
             )
+            if result.trust_boundary_id == "UNASSIGNED":
+                # 전환 기간의 테스트/구형 Runtime 결과를 요청 컨텍스트에 묶는다.
+                # v3 Supervisor는 아래 필드를 직접 반환한다.
+                result = result.model_copy(
+                    update={
+                        "trust_boundary_id": boundary.id,
+                        "source_environment": boundary.source_environment,
+                        "target_environment": boundary.target_environment,
+                    }
+                )
             self._validate_runtime_response(run, result)
             self._apply_runtime_result(run, result)
             run.status = "VERIFYING"
@@ -100,6 +141,12 @@ class RunCoordinator:
             raise RuntimeError("Runtime Agent가 요청과 다른 run_id를 반환했습니다.")
         if result.subject_mode != run.subject_mode:
             raise RuntimeError("Runtime Agent가 요청과 다른 환경 결과를 반환했습니다.")
+        if result.trust_boundary_id != run.trust_boundary_id:
+            raise RuntimeError("Runtime Agent가 요청과 다른 Trust Boundary를 반환했습니다.")
+        if result.source_environment != run.source_environment:
+            raise RuntimeError("Runtime Agent가 요청과 다른 시작 환경을 반환했습니다.")
+        if result.target_environment != run.target_environment:
+            raise RuntimeError("Runtime Agent가 요청과 다른 Target 환경을 반환했습니다.")
         if result.applied_profile != run.requested_profile:
             raise RuntimeError("Supervisor가 요청과 다른 권한 프로파일을 적용했습니다.")
         applied_values = result.applied_profile_state.get("permissions")
@@ -128,8 +175,12 @@ class RunCoordinator:
                 sequence=len(run.events) + 1,
                 source="executor",
                 event_type="EXECUTION_FINISHED",
-                message="환경 내부 Planner·Executor·Tool이 단일 실행을 완료했습니다.",
-                payload={"runtime_agent": result.runtime_agent, "tool": result.tool},
+                message="선택된 환경의 Executor가 Tool 실행을 완료했습니다.",
+                payload={
+                    "runtime_agent": result.runtime_agent,
+                    "tool": result.tool,
+                    "trust_boundary_id": result.trust_boundary_id,
+                },
             )
         )
 

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { deleteRun, getRun, getRuns } from "../api";
-import type { RunEvent, RunListResponse, RunRecord } from "../types";
+import type { RunEvent, RunListResponse, RunRecord, SubjectModeId } from "../types";
 import { EventTimeline } from "./EventTimeline";
 
 interface OsResultDetailPageProps {
@@ -244,6 +244,7 @@ function RunDetail({ run }: { run: RunRecord }) {
 }
 
 export function OsResultDetailPage({ initialRunId, storageName }: OsResultDetailPageProps) {
+  const [executorLane, setExecutorLane] = useState<SubjectModeId>("host");
   const [page, setPage] = useState(1);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [listResponse, setListResponse] = useState<RunListResponse | null>(null);
@@ -259,7 +260,7 @@ export function OsResultDetailPage({ initialRunId, storageName }: OsResultDetail
 
   useEffect(() => {
     let isActive = true;
-    getRuns(page, PAGE_SIZE)
+    getRuns(executorLane, page, PAGE_SIZE)
       .then((response) => {
         if (!isActive) return;
         setListResponse(response);
@@ -272,7 +273,7 @@ export function OsResultDetailPage({ initialRunId, storageName }: OsResultDetail
     return () => {
       isActive = false;
     };
-  }, [page, refreshVersion]);
+  }, [executorLane, page, refreshVersion]);
 
   useEffect(() => {
     if (!selectedRunId) return;
@@ -311,6 +312,17 @@ export function OsResultDetailPage({ initialRunId, storageName }: OsResultDetail
     setListResponse(null);
     window.history.replaceState(null, "", "#/logs");
     setPage(nextPage);
+  }
+
+  function changeExecutorLane(nextLane: SubjectModeId) {
+    if (nextLane === executorLane) return;
+    setExecutorLane(nextLane);
+    setPage(1);
+    setSelectedRunId(null);
+    setDetailState(null);
+    setListError(null);
+    setListResponse(null);
+    window.history.replaceState(null, "", "#/logs");
   }
 
   function refreshLogs() {
@@ -356,21 +368,43 @@ export function OsResultDetailPage({ initialRunId, storageName }: OsResultDetail
     <main className="result-detail-main" id="main">
       <header className="log-page-hero">
         <div>
-          <span className="eyebrow">SUPABASE RUN LOGS · 전체 기록</span>
+          <span className="eyebrow">SUPABASE RUN LOGS · EXECUTOR별 분리 저장</span>
           <h1>OS 실행 로그 조회</h1>
-          <p>Supabase에 저장된 모든 실행을 최신순으로 탐색하고, 실행별 결과와 이벤트 Evidence를 확인합니다.</p>
+          <p>Host Executor와 Container Executor 결과 저장소를 분리해 탐색하고, 실행별 Evidence를 확인합니다.</p>
         </div>
         <dl className="log-summary">
           <div><dt>저장소</dt><dd>{storageName === "supabase" ? "Supabase" : storageName ?? "확인 중"}</dd></div>
-          <div><dt>전체 실행</dt><dd>{total.toLocaleString("ko-KR")}</dd></div>
+          <div><dt>선택 Executor 실행</dt><dd>{total.toLocaleString("ko-KR")}</dd></div>
         </dl>
       </header>
 
       <section className="log-browser" aria-labelledby="log-list-title">
+        <div className="executor-log-tabs" role="tablist" aria-label="Executor 결과 저장소">
+          <button
+            aria-selected={executorLane === "host"}
+            className={executorLane === "host" ? "is-selected" : undefined}
+            onClick={() => changeExecutorLane("host")}
+            role="tab"
+            type="button"
+          >
+            U1 Host Executor 결과
+          </button>
+          <button
+            aria-selected={executorLane === "container"}
+            className={executorLane === "container" ? "is-selected" : undefined}
+            onClick={() => changeExecutorLane("container")}
+            role="tab"
+            type="button"
+          >
+            C1 Container Executor 결과
+          </button>
+        </div>
         <div className="common-result-heading log-list-heading">
           <div>
             <span className="section-index">LOG INDEX</span>
-            <h2 id="log-list-title">실행 기록</h2>
+            <h2 id="log-list-title">
+              {executorLane === "host" ? "U1 Host Executor" : "C1 Container Executor"} 실행 기록
+            </h2>
           </div>
           <button className="log-refresh-button" onClick={refreshLogs} type="button">
             목록 새로고침

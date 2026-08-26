@@ -74,5 +74,17 @@ class HarnessComponents:
         return [
             name
             for name in HarnessComponentName
-            if getattr(self, name.value) is None
+            if not self._ready(getattr(self, name.value))
         ]
+
+    @staticmethod
+    def _ready(component: object | None) -> bool:
+        if component is None:
+            return False
+        readiness = getattr(component, "is_ready", None)
+        if readiness is None:
+            return True
+        try:
+            return bool(readiness())
+        except Exception:
+            return False

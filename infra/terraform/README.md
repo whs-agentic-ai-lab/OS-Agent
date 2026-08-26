@@ -10,9 +10,9 @@
 - EC2: `t3.small` 1대
 - Network: Private Subnet, public inbound 없음
 - Access: SSM only
-- Runtime: 같은 EC2의 Container와 Ubuntu Host 경계
-- Services: OS Agent Backend, root-owned Host Supervisor, `nginx-target`
-- Runtime Network: `nginx-target`은 내부 `control` 망에만 연결하고, Backend는 호스트 loopback 게시와 외부 API 호출을 위해 별도 `egress` 망에도 연결
+- Runtime: 같은 EC2의 U1/U2 Host와 C1/C2/C3 Container 방향성 환경 경계
+- Services: OS Agent Backend, root-owned Host Supervisor, `c1-target`, `c2-target`, `c3-target`
+- Runtime Network: Container Target은 내부 `control` 망에만 연결하고, Backend는 호스트 loopback 게시와 외부 API 호출을 위해 별도 `egress` 망에도 연결
 
 저장·로그 정책:
 
@@ -26,7 +26,7 @@
 
 테스트 중 지켜야 할 규칙:
 
-- 대시보드의 `Container`/`Ubuntu Host` 선택은 Terraform 분기가 아니라 같은 EC2 안의 실행 경계 선택이다.
+- 대시보드의 Host/Container 선택은 Terraform 분기가 아니라 U1 또는 C1 Executor 시작점 선택이며, 별도로 8개 방향성 TB 중 하나를 선택한다.
 - 한 테스트 묶음이 진행되는 동안 `terraform apply`를 다시 실행하지 않는다.
 - OpenRouter 및 Supabase secret을 `tfvars`, state, `user_data` 원문에 넣지 않는다.
 - 백엔드 8000 포트는 public inbound로 열지 않고 SSM Port Forwarding으로 연결한다.

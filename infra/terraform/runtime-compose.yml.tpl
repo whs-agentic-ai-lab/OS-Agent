@@ -18,9 +18,31 @@ services:
       - control
       - egress
 
-  nginx-target:
+  c1-target:
     image: nginx:1.27-alpine
-    container_name: nginx-target
+    container_name: c1-target
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    networks:
+      - control
+
+  c2-target:
+    image: nginx:1.27-alpine
+    container_name: c2-target
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    networks:
+      - control
+
+  c3-target:
+    image: nginx:1.27-alpine
+    container_name: c3-target
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -34,6 +56,6 @@ networks:
     name: os-agent-runtime-control
     internal: true
   # Backend는 SSM으로 게시된 호스트 포트와 OpenRouter/Supabase outbound가 필요하다.
-  # 실험 대상 nginx는 control 내부망에만 남겨 외부 연결을 허용하지 않는다.
+  # C1/C2/C3 Target은 control 내부망에만 남겨 외부 연결을 허용하지 않는다.
   egress:
     driver: bridge

@@ -1,4 +1,4 @@
-import type { DeploymentStatus, HarnessRunRecord, HarnessRunRequest, HarnessStatus, HealthResponse, OptionsResponse, RunDeleteResponse, RunListResponse, RunRecord, RunRequest, TunnelStatus } from "./types";
+import type { DeploymentStatus, HarnessRunRecord, HarnessRunRequest, HarnessStatus, HealthResponse, OptionsResponse, RunDeleteResponse, RunListResponse, RunRecord, RunRequest, SubjectModeId, TunnelStatus } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
@@ -21,8 +21,8 @@ export function getHealth(remote = false): Promise<HealthResponse> {
   return request<HealthResponse>(agentPath("/api/health", remote));
 }
 
-export function getHarnessStatus(): Promise<HarnessStatus> {
-  return request<HarnessStatus>("/api/harness/status");
+export function getHarnessStatus(remote = false): Promise<HarnessStatus> {
+  return request<HarnessStatus>(agentPath("/api/harness/status", remote));
 }
 
 export function getFixtureHarnessStatus(): Promise<HarnessStatus> {
@@ -33,6 +33,17 @@ export function createFixtureHarnessRun(
   payload: HarnessRunRequest,
 ): Promise<HarnessRunRecord> {
   return request<HarnessRunRecord>("/api/harness/fixture-runs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export function createHarnessRun(
+  payload: HarnessRunRequest,
+  remote = false,
+): Promise<HarnessRunRecord> {
+  return request<HarnessRunRecord>(agentPath("/api/harness/runs", remote), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -51,8 +62,9 @@ export function getRun(runId: string, remote = false): Promise<RunRecord> {
   return request<RunRecord>(agentPath(`/api/runs/${encodeURIComponent(runId)}`, remote));
 }
 
-export function getRuns(page = 1, pageSize = 20): Promise<RunListResponse> {
+export function getRuns(subjectMode: SubjectModeId, page = 1, pageSize = 20): Promise<RunListResponse> {
   const query = new URLSearchParams({
+    subject_mode: subjectMode,
     page: String(page),
     page_size: String(pageSize),
   });

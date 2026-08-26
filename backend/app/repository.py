@@ -3,7 +3,16 @@ from typing import Protocol
 
 from supabase import Client, create_client
 
-from .schemas import RunRecord
+from .schemas import RunRecord, SubjectMode
+
+
+RUN_TABLES = {
+    SubjectMode.host: ("host_executor_runs", "host_executor_run_events"),
+    SubjectMode.container: (
+        "container_executor_runs",
+        "container_executor_run_events",
+    ),
+}
 
 
 class RunRepository(Protocol):
@@ -13,7 +22,12 @@ class RunRepository(Protocol):
 
     def get(self, run_id: str) -> RunRecord | None: ...
 
-    def list_runs(self, page: int, page_size: int) -> tuple[list[RunRecord], int]: ...
+    def list_runs(
+        self,
+        subject_mode: SubjectMode,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[RunRecord], int]: ...
 
     def delete(self, run_id: str) -> bool: ...
 
@@ -24,22 +38,33 @@ class InMemoryRunRepository:
     storage_name = "memory"
 
     def __init__(self) -> None:
-        self._items: dict[str, RunRecord] = {}
+        self._items: dict[SubjectMode, dict[str, RunRecord]] = {
+            SubjectMode.host: {},
+            SubjectMode.container: {},
+        }
         self._lock = Lock()
 
     def save(self, run: RunRecord) -> None:
         with self._lock:
-            self._items[run.run_id] = run.model_copy(deep=True)
+            self._items[run.subject_mode][run.run_id] = run.model_copy(deep=True)
 
     def get(self, run_id: str) -> RunRecord | None:
         with self._lock:
-            item = self._items.get(run_id)
-            return item.model_copy(deep=True) if item else None
+            for lane in self._items.values():
+                item = lane.get(run_id)
+                if item is not None:
+                    return item.model_copy(deep=True)
+            return None
 
-    def list_runs(self, page: int, page_size: int) -> tuple[list[RunRecord], int]:
+    def list_runs(
+        self,
+        subject_mode: SubjectMode,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[RunRecord], int]:
         with self._lock:
             ordered = sorted(
-                self._items.values(),
+                self._items[subject_mode].values(),
                 key=lambda item: item.created_at,
                 reverse=True,
             )
@@ -52,11 +77,11 @@ class InMemoryRunRepository:
 
     def delete(self, run_id: str) -> bool:
         with self._lock:
-            return self._items.pop(run_id, None) is not None
+            return any(lane.pop(run_id, None) is not None for lane in self._items.values())
 
 
 class SupabaseRunRepository:
-    """서버 전용 Secret Key로 runs와 run_events를 저장합니다."""
+    """서버 전용 Secret Key로 Executor별 Run/Event 테이블을 분리 저장합니다."""
 
     storage_name = "supabase"
 
@@ -69,8 +94,9 @@ class SupabaseRunRepository:
         self._client = client or create_client(url, secret_key)
 
     def save(self, run: RunRecord) -> None:
+        run_table, event_table = RUN_TABLES[run.subject_mode]
         run_row = run.model_dump(mode="json", exclude={"events"})
-        self._client.table("runs").upsert(
+        self._client.table(run_table).upsert(
             run_row,
             on_conflict="run_id",
         ).execute()
@@ -83,37 +109,43 @@ class SupabaseRunRepository:
                 }
                 for event in run.events
             ]
-            self._client.table("run_events").upsert(
+            self._client.table(event_table).upsert(
                 event_rows,
                 on_conflict="run_id,sequence",
             ).execute()
 
     def get(self, run_id: str) -> RunRecord | None:
-        run_response = (
-            self._client.table("runs")
-            .select("*")
-            .eq("run_id", run_id)
-            .limit(1)
-            .execute()
-        )
-        if not run_response.data:
-            return None
+        for run_table, event_table in RUN_TABLES.values():
+            run_response = (
+                self._client.table(run_table)
+                .select("*")
+                .eq("run_id", run_id)
+                .limit(1)
+                .execute()
+            )
+            if run_response.data:
+                event_response = (
+                    self._client.table(event_table)
+                    .select("sequence,source,event_type,message,payload,created_at")
+                    .eq("run_id", run_id)
+                    .order("sequence")
+                    .execute()
+                )
+                payload = dict(run_response.data[0])
+                payload["events"] = event_response.data
+                return RunRecord.model_validate(payload)
+        return None
 
-        event_response = (
-            self._client.table("run_events")
-            .select("sequence,source,event_type,message,payload,created_at")
-            .eq("run_id", run_id)
-            .order("sequence")
-            .execute()
-        )
-        payload = dict(run_response.data[0])
-        payload["events"] = event_response.data
-        return RunRecord.model_validate(payload)
-
-    def list_runs(self, page: int, page_size: int) -> tuple[list[RunRecord], int]:
+    def list_runs(
+        self,
+        subject_mode: SubjectMode,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[RunRecord], int]:
         start = (page - 1) * page_size
+        run_table, _ = RUN_TABLES[subject_mode]
         response = (
-            self._client.table("runs")
+            self._client.table(run_table)
             .select("*", count="exact")
             .order("created_at", desc=True)
             .range(start, start + page_size - 1)
@@ -124,14 +156,17 @@ class SupabaseRunRepository:
         return items, total
 
     def delete(self, run_id: str) -> bool:
-        response = (
-            self._client.table("runs")
-            .delete()
-            .eq("run_id", run_id)
-            .select("run_id")
-            .execute()
-        )
-        return bool(response.data)
+        for run_table, _ in RUN_TABLES.values():
+            response = (
+                self._client.table(run_table)
+                .delete()
+                .eq("run_id", run_id)
+                .select("run_id")
+                .execute()
+            )
+            if response.data:
+                return True
+        return False
 
 
 def create_run_repository(

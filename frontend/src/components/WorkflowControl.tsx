@@ -87,12 +87,7 @@ function deploymentNodes(deployment: DeploymentStatus | null, actionError: strin
   }
 
   if (deployment.operation === "destroy") {
-    if (deployment.status === "running") {
-      return [empty, { status: "running", error: null }, empty];
-    }
-    if (deployment.status === "failed") {
-      return [empty, { status: "failed", error: deployment.error ?? actionError ?? "Terraform 삭제 중 오류가 발생했습니다." }, empty];
-    }
+    // destroy는 apply 노드가 아니라 별도의 teardown 노드에서 표시한다.
     return [empty, empty, empty];
   }
 
@@ -158,6 +153,22 @@ export function WorkflowControl({
 
   const nodes = useMemo(() => {
     const [image, terraform, runtime] = deploymentNodes(deployment, deploymentActionError);
+    const teardownNode: Pick<WorkflowNode, "status" | "error"> =
+      deployment?.operation !== "destroy"
+        ? { status: "pending", error: null }
+        : deployment.status === "running"
+          ? { status: "running", error: null }
+          : deployment.status === "succeeded"
+            ? { status: "succeeded", error: null }
+            : deployment.status === "failed"
+              ? {
+                  status: "failed",
+                  error:
+                    deployment.error
+                    ?? deploymentActionError
+                    ?? "Terraform 삭제 중 오류가 발생했습니다.",
+                }
+              : { status: "pending", error: null };
     const tunnelNode: Pick<WorkflowNode, "status" | "error"> = tunnelActionError
       ? { status: "failed", error: tunnelActionError }
       : tunnel?.status === "connected"
@@ -221,11 +232,10 @@ export function WorkflowControl({
       {
         id: "teardown",
         step: 7,
-        title: "테스트 종료",
+        title: deployment?.operation === "destroy" ? "환경 전체 삭제" : "테스트 종료",
         summary: "결과를 확인하고 필요할 때 terraform destroy 수행",
-        status: "pending",
-        error: null,
-        automatic: false,
+        ...teardownNode,
+        automatic: deployment?.operation === "destroy",
       },
     ];
 
