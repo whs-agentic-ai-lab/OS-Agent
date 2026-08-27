@@ -1,0 +1,32 @@
+[Unit]
+Description=OS Agent root-owned action path Supervisor
+Requires=docker.service
+After=docker.service network-online.target
+Before=os-agent-experiment.service
+
+[Service]
+Type=simple
+User=root
+Group=os-agent-supervisor
+UMask=0007
+EnvironmentFile=/etc/os-agent/environment
+RuntimeDirectory=os-agent
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/python3 /opt/os-agent/bin/host-supervisor.py --serve
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/run/os-agent /srv/os-agent/targets /var/log/os-agent /var/lib/os-agent
+
+[Install]
+WantedBy=multi-user.target

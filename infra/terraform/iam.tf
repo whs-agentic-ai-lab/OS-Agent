@@ -1,9 +1,7 @@
-# EC2용 IAM Role: SSM 관리 권한만 부여한다.
-# Agent가 사용할 AWS 권한은 여기 포함하지 않는다.
-
 data "aws_iam_policy_document" "ec2_assume_role" {
   statement {
     actions = ["sts:AssumeRole"]
+
     principals {
       type        = "Service"
       identifiers = ["ec2.amazonaws.com"]
@@ -12,29 +10,21 @@ data "aws_iam_policy_document" "ec2_assume_role" {
 }
 
 resource "aws_iam_role" "trial_ec2" {
-  name               = "${var.project_name}-ec2-ssm-role"
+  name               = "${local.resource_prefix}-ec2-role"
   assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
 }
 
-# SSM 관리(Session Manager, Run Command)에 필요한 AWS 관리형 정책만 부여
 resource "aws_iam_role_policy_attachment" "ssm_core" {
   role       = aws_iam_role.trial_ec2.name
   policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# 선택 사항: EC2 상태(CPU/메모리 등)를 CloudWatch로 보내야 할 때만 켠다 (기본은 꺼짐)
-resource "aws_iam_role_policy_attachment" "cloudwatch_agent" {
-  count      = var.attach_cloudwatch_agent_policy ? 1 : 0
-  role       = aws_iam_role.trial_ec2.name
-  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/CloudWatchAgentServerPolicy"
-}
-
 resource "aws_iam_instance_profile" "trial_ec2" {
-  name = "${var.project_name}-ec2-instance-profile"
+  name = "${local.resource_prefix}-ec2-instance-profile"
   role = aws_iam_role.trial_ec2.name
 }
 
-data "aws_iam_policy_document" "backend_ecr_pull" {
+data "aws_iam_policy_document" "ecr_pull" {
   statement {
     actions   = ["ecr:GetAuthorizationToken"]
     resources = ["*"]
@@ -46,14 +36,41 @@ data "aws_iam_policy_document" "backend_ecr_pull" {
       "ecr:GetDownloadUrlForLayer",
       "ecr:BatchGetImage",
     ]
-    resources = [aws_ecr_repository.agent_backend.arn]
+    resources = [for repository in aws_ecr_repository.images : repository.arn]
   }
 }
 
-resource "aws_iam_role_policy" "backend_ecr_pull" {
-  name   = "${var.project_name}-backend-ecr-pull"
+resource "aws_iam_role_policy" "ecr_pull" {
+  name   = "${local.resource_prefix}-ecr-pull"
   role   = aws_iam_role.trial_ec2.id
-  policy = data.aws_iam_policy_document.backend_ecr_pull.json
+  policy = data.aws_iam_policy_document.ecr_pull.json
 }
 
-# 참고: Agent가 쓸 AWS 권한은 여기 없음. 필요해지면 별도로 검토해서 추가해야 한다.
+data "aws_iam_policy_document" "collector_token" {
+  count = var.enable_remote_evidence_sink ? 1 : 0
+
+  statement {
+    actions = ["ssm:GetParameter"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.collector_token_parameter_name}",
+    ]
+  }
+
+  dynamic "statement" {
+    for_each = var.collector_token_kms_key_arn == "" ? [] : [var.collector_token_kms_key_arn]
+    iterator = kms_key
+
+    content {
+      actions   = ["kms:Decrypt"]
+      resources = [kms_key.value]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "collector_token" {
+  count = var.enable_remote_evidence_sink ? 1 : 0
+
+  name   = "${local.resource_prefix}-collector-token-read"
+  role   = aws_iam_role.trial_ec2.id
+  policy = data.aws_iam_policy_document.collector_token[0].json
+}

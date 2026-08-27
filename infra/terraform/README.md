@@ -1,48 +1,175 @@
-# Fixed Terraform environment
+# 0826 OS experiment Terraform
 
-이 디렉터리는 최소 운영 테스트에서 사용하는 **고정 AWS 인프라 사본**의 위치다.
+이 디렉터리는 AWS Sandbox의 고정 OS 실험환경만 조성한다.
 
-팀 OS 저장소의 commit `a0152804ddc64d67f220b17125f7987abf24cdec`를 기준으로 사본을 고정했다. 원본 정보는 `SOURCE.lock`, 팀 문서는 `UPSTREAM_README.md`에서 확인한다.
+## Terraform이 만드는 환경
 
-고정 환경은 `fixed.auto.tfvars`에 정의되어 있고 대시보드에서 변경할 수 없다.
+- VPC, Private Subnet, NAT, SSM VPC Endpoints
+- Public inbound가 없는 Ubuntu EC2 한 대
+- Linux Host User1 `user1`과 User2 `user2`
+- Container1, Container2, Container3
+- root-owned Host Supervisor
+- auditd, persistent journald, Docker json-file
+- Docker Events/로그 relay
+- Before/After state capture script
+- Vector collector와 로컬 disk buffer
+
+FastAPI, Model Gateway, OpenRouter, Supabase schema는 이 Terraform 범위 밖이다.
+
+고정 배포 조건은 다음과 같다.
 
 - Region/AZ: `us-east-1` / `us-east-1a`
 - EC2: `t3.small` 1대
 - Network: Private Subnet, public inbound 없음
 - Access: SSM only
 - Runtime: 같은 EC2의 U1/U2 Host와 C1/C2/C3 Container 방향성 환경 경계
-- Services: OS Agent Backend, root-owned Host Supervisor, `c1-target`, `c2-target`, `c3-target`
-- Runtime Network: Container Target은 내부 `control` 망에만 연결하고, Backend는 호스트 loopback 게시와 외부 API 호출을 위해 별도 `egress` 망에도 연결
 
-저장·로그 정책:
+## 고정 topology
 
-- Backend Docker image는 ECR에 저장하고 EC2 IAM Role로 pull한다.
-- Host Supervisor는 public/TCP port 없이 `/run/os-agent/host-supervisor.sock`에서만 요청을 받는다.
-- 백엔드 UID와 Host 실험 사용자 UID를 분리하며, 실험 사용자는 Supervisor socket에 접근할 수 없다.
-- S3 리소스는 생성하지 않는다.
-- VPC Flow Logs는 CloudWatch Logs에 저장한다.
-- `collect_state.sh` Evidence는 Supabase Collector 연동 전까지 EC2 로컬 staging 경로에만 저장한다.
-- Terraform state는 최소 테스트 동안 로컬 파일을 사용하며 Git에 커밋하지 않는다.
+`topology.yaml`은 다음만 허용한다.
 
-테스트 중 지켜야 할 규칙:
+- Source executor: U1, C1
+- Target: U1, U2, C1, C2, C3
+- Action paths: U1C1, U1C2, U1U2, U1C3, C1U1, C1C2, C1U2, C1C3
 
-- 대시보드의 Host/Container 선택은 Terraform 분기가 아니라 U1 또는 C1 Executor 시작점 선택이며, 별도로 8개 방향성 TB 중 하나를 선택한다.
+Linux 계정명은 `user1`, `user2`다. `os-agent`는 서비스와 디렉터리 prefix로만 사용한다.
+
+실험 중에는 다음을 지킨다.
+
 - 한 테스트 묶음이 진행되는 동안 `terraform apply`를 다시 실행하지 않는다.
 - OpenRouter 및 Supabase secret을 `tfvars`, state, `user_data` 원문에 넣지 않는다.
-- 백엔드 8000 포트는 public inbound로 열지 않고 SSM Port Forwarding으로 연결한다.
-- 최초 `terraform init` 후 생성되는 `terraform.lock.hcl`을 고정한다.
+- 최초 `terraform init` 후 생성되는 `.terraform.lock.hcl`을 고정한다.
 
-## 대시보드 자동 배포 순서
+## 이미지 계약
 
-로컬 백엔드의 배포 컨트롤러만 이 디렉터리를 실행할 수 있다. 대시보드는 임의 Terraform 경로, target 또는 변수를 전달하지 않는다.
+Terraform은 이미지를 build하지 않는다. ECR repository만 만들고 immutable digest를 받는다.
 
-1. `terraform init -input=false`
-2. ECR repository만 우선 apply
-3. `backend/` Docker image를 ECR에 push
-4. 고정 `backend_image_uri`를 넘겨 전체 apply
-5. `terraform output -json`을 대시보드에 표시
-6. SSM 관리 노드가 Online이 되면 로컬 `8001`에서 EC2 Backend `8000`으로 터널 연결
+- `runtime`: `/app/RUNTIME_CONTRACT` 값이 `action-path-runtime-v1`이어야 하며
+  `/app/host_runtime/host_supervisor.py`와 `/app/runtime_agent/runtime.py`를 포함해야 한다.
+- `container1`: Container1 Target과 C1 executor를 함께 시작해야 한다.
+  `/app/RUNTIME_CONTRACT` 값은 `container1-executor-target-v1`이어야 한다.
+- `target`: Container2/Container3 target service를 기본 entrypoint로 시작하고 C1의
+  내부-network 요청을 처리해야 한다. `/app/RUNTIME_CONTRACT` 값은
+  `target-service-v1`이어야 한다.
 
-대시보드의 `AWS 환경 삭제`는 동일한 로컬 state로 `terraform destroy`를 실행하고, 필요하면 남은 고정 CloudWatch Log Group도 정리한다. EC2만 정지하면 NAT Gateway, VPC Endpoint와 EBS 비용은 남을 수 있으므로 장기간 사용하지 않을 때는 전체 환경을 삭제한다.
+두 container image는 `/app/healthcheck` 실행 파일을 제공해야 한다. Container1은
+C1 executor/target과 Supervisor socket 연결까지, target image는 target service 준비까지
+검사하며 Compose는 세 container가 모두 healthy가 될 때까지 기다린다. C2와 C3는 서로
+다른 internal network에 있어 C1을 통하지 않고 통신하지 못한다. 최종 8-path allowlist는
+Supervisor와 각 runtime이 `topology.json`을 기준으로 다시 강제해야 한다.
 
-실제 AWS 배포 전에 Terraform, AWS CLI v2, Docker와 `whs-team` AWS profile이 필요하다. 세부 실행 방법은 프로젝트 루트의 `실행방법.md`를 참고한다.
+현재 애플리케이션 이미지가 이 계약을 구현하지 않으면 bootstrap은 명시적으로 실패한다.
+
+## Evidence
+
+Vector는 다음 source를 수집한다.
+
+- systemd journal
+- `/var/log/audit/audit.log`
+- `/var/log/os-agent/docker-events.ndjson`
+- `/var/log/os-agent/docker-logs.ndjson`
+- `/var/log/os-agent/executor/*.ndjson`
+- `/var/log/os-agent/state-captures.ndjson`
+
+기본값은 로컬 sink다.
+
+```text
+/var/lib/os-agent/evidence/collected/events.ndjson
+```
+
+FastAPI Evidence API가 준비된 후에만 `enable_remote_evidence_sink=true`로 전환한다.
+Collector token 값은 기존 SSM SecureString에서 boot 시 읽으며 Terraform 변수/state에 넣지 않는다.
+
+## 재현성 입력
+
+다음 값은 매 실험 전에 고정해야 한다.
+
+- Ubuntu AMI ID
+- runtime/container image digest
+- Vector 0.57.0 공식 archive SHA-256
+- instance type와 EBS 크기
+- topology revision
+
+Docker/apt repository 패키지는 이 구성에서 새로 설치되므로 완전한 byte-for-byte 재현성이
+필요하면 Docker와 Vector까지 넣은 별도 검증 AMI를 bake해야 한다. 실제 부팅에 설치된 핵심
+패키지 버전은 `/var/lib/os-agent/bootstrap-package-versions.txt`에 증거로 남는다.
+
+`terraform.tfvars.example`을 참고하되 실제 `terraform.tfvars`는 Git에 커밋하지 않는다.
+
+## 적용
+
+이 구성은 기존 state를 in-place 변경하기 위한 것이 아니다. 기존 state에는 다른 주소와
+리소스가 있으므로 고유한 `environment_id`와 **비어 있는 새 state**로 배포한다. 기존 state
+파일은 삭제하거나 migrate하지 말고 별도 보관한다. 이 모듈의 local backend는 기존 기본
+state와 분리된 `terraform-0826.tfstate`만 사용한다. 실제 AWS resource prefix는
+`<project_name>-<environment_id>`이며 조합은 40자 이하여야 한다. `confirm_new_state=true`는
+이 확인을 마친 경우에만 설정한다.
+
+첫 배포는 ECR과 digest 이미지 사이에 의도적인 2단계가 있다.
+
+```powershell
+# 0) 먼저 초기화하고 현재 디렉터리의 state가 비어 있는지 확인한다.
+terraform init -reconfigure -input=false
+if (Test-Path -LiteralPath './terraform-0826.tfstate') {
+  $existingResources = @(terraform state list)
+  if ($LASTEXITCODE -ne 0) { throw "state 조회에 실패했습니다" }
+  if ($existingResources.Count -gt 0) { throw "기존 state를 사용하면 안 됩니다: $existingResources" }
+}
+
+# 1) 빈 새 state에서 immutable repository만 만든다.
+terraform apply -target='aws_ecr_repository.images'
+
+# 2) 새 runtime/container1/target 계약 이미지를 각 ECR에 push한다.
+# 3) 세 manifest digest를 terraform.tfvars에 고정한 뒤 전체 plan/apply한다.
+terraform plan -out=0826.plan
+terraform show 0826.plan
+terraform apply 0826.plan
+```
+
+전체 plan은 `aws_ecr_image.pinned`으로 세 digest가 실제 repository에 존재하는지 먼저
+검증한다. 첫 단계에서 EC2를 함께 만들지 않는다. 첫 전체 적용 전 plan summary가 기존
+리소스의 change/destroy 없이 새 0826 리소스 create만 포함하는지 확인한다.
+
+```powershell
+terraform fmt -check -recursive
+terraform validate
+```
+
+현재 대시보드 배포 컨트롤러는 이전 resource/output 계약을 사용하므로 이 Terraform을
+대시보드 배포 버튼으로 적용하면 안 된다.
+
+## 부팅 후 검증
+
+SSM으로 접속한 뒤:
+
+```bash
+sudo cloud-init status --wait
+sudo test -f /var/lib/os-agent/bootstrap-complete
+sudo /opt/os-agent/scripts/verify_environment.sh
+sudo systemctl status vector os-agent-host-supervisor os-agent-experiment
+sudo auditctl -l
+sudo journalctl --disk-usage
+```
+
+Before/After capture는 Supervisor가 다음 형식으로 호출한다.
+
+```bash
+sudo /opt/os-agent/scripts/capture_state.sh \
+  <run_id> <action_id> <path_id> <before|after> <U1|U2|C1|C2|C3>
+```
+
+Terraform은 이 스크립트를 설치하지만 action lifecycle에서 호출하는 것은 Supervisor
+애플리케이션의 책임이다.
+
+Supervisor/runtime은 모든 tool 요청에 동일한 `run_id`, `action_id`, `path_id`를 싣고,
+실제 명령, stdout, stderr, 종료 코드를 NDJSON event로 남겨야 한다. 원격 sink를 켜면
+FastAPI가 이 event를 검증해 Supabase Evidence Store에 idempotent하게 적재해야 한다.
+NDJSON writer는 rotation 후 새 파일을 따르도록 event마다 append-open해야 한다.
+
+SSM SecureString이 기본 `aws/ssm` key가 아니라 customer-managed KMS key로 암호화되어
+있다면 `collector_token_kms_key_arn`도 설정해야 한다. Terraform의 EC2 생성 성공은
+cloud-init 성공을 의미하지 않는다. 위 `cloud-init`, `bootstrap-complete`, 환경 검증 세
+명령을 모두 통과한 시점만 실제 실험 시작 gate로 취급한다.
+
+`terraform destroy` 전에 세 ECR repository의 이미지를 명시적으로 삭제해야 한다.
+repository는 실수로 증거성 실행물을 지우지 않도록 `force_delete=false`다.

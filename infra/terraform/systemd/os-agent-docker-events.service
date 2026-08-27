@@ -1,0 +1,22 @@
+[Unit]
+Description=OS Agent Docker event evidence relay
+Requires=docker.service
+After=docker.service
+Before=os-agent-experiment.service
+
+[Service]
+Type=simple
+User=root
+Group=vector
+UMask=0027
+ExecStart=/opt/os-agent/scripts/relay_docker_events.sh
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/os-agent /var/lib/os-agent
+
+[Install]
+WantedBy=multi-user.target
