@@ -15,12 +15,28 @@ export interface PermissionTest {
   description: string;
   off_profile: string;
   on_profile: string;
+  off_description: string;
+  on_description: string;
+  catalog_ids: string[];
+  axis: string;
+  default_enabled: boolean;
+}
+
+export interface PermissionCatalogSummary {
+  source_version: string;
+  total_entries: number;
+  independent_permission_count: number | null;
+  policy: string;
 }
 
 export interface ToolOption {
   id: string;
   label: string;
   description: string;
+  family: string;
+  actions: string[];
+  implemented: boolean;
+  implemented_actions: string[];
 }
 
 export interface TrustBoundaryOption {
@@ -38,12 +54,13 @@ export interface OptionsResponse {
   permission_tests: Record<SubjectModeId, PermissionTest[]>;
   tools: ToolOption[];
   trust_boundaries: TrustBoundaryOption[];
+  permission_catalog_summary: PermissionCatalogSummary;
   planner_mode: "local" | "openrouter";
 }
 
 export interface HealthResponse {
   status: string;
-  run_api_version?: "profile-runtime-v3";
+  run_api_version?: "permission-control-runtime-v5";
   harness_api_version?: "os-harness-v1";
   planner: string;
   storage: string;

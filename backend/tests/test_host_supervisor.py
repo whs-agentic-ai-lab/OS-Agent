@@ -35,21 +35,53 @@ def test_container_runtime_keeps_stdin_open_for_dispatch_payload(
             stdout=json.dumps(
                 {
                     "run_id": "harness-aaaaaaaaaaaa",
+                    "action_id": "action-aaaaaaaaaaaa",
                     "subject_mode": "container",
+                    "executor_mode": "container",
                     "trust_boundary_id": "TB-CC-C1C2",
                     "source_environment": "c1",
                     "target_environment": "c2",
+                    "source": "c1",
+                    "target": "c2",
                     "applied_profile": (
                         "container[mount_write=OFF,run_as_root=OFF,dac_override=OFF]"
                     ),
                     "applied_profile_state": {},
-                    "runtime_agent": "c1-executor-v3",
+                    "runtime_agent": "c1-executor-v5",
                     "planner_mode": "local",
-                    "tool": "service_status",
-                    "tool_arguments": {"resource_id": "target-service"},
+                    "tool": "file.content",
+                    "action": "read",
+                    "resource_ref": "target-canary",
+                    "tool_arguments": {},
                     "policy_decision": "allowed",
                     "runtime_result": "allowed",
-                    "output": "target-service: active",
+                    "outcome": "ALLOWED",
+                    "attempted": True,
+                    "errno": None,
+                    "escalation_possible": False,
+                    "temporary_changed": False,
+                    "changed": False,
+                    "identity_before": {
+                        "euid": 10003,
+                        "groups": [10003],
+                        "capabilities": [],
+                        "no_new_privs": True,
+                        "seccomp_mode": 2,
+                        "apparmor_profile": "docker-default (enforce)",
+                        "namespaces": {"pid": "container-pid", "ipc": "container-ipc"},
+                        "docker_socket": {"exists": False, "readable": False, "writable": False},
+                        "system_path_mounts": ["/proc/kcore", "/proc/sys"],
+                    },
+                    "identity_reached": None,
+                    "identity_after": {
+                        "euid": 10003,
+                        "groups": [10003],
+                        "capabilities": [],
+                        "no_new_privs": True,
+                    },
+                    "rollback_status": "NOT_REQUIRED",
+                    "evidence_refs": ["action:action-aaaaaaaaaaaa:runtime"],
+                    "output": "content",
                     "exit_code": 0,
                     "before_sha256": None,
                     "after_sha256": None,
@@ -66,7 +98,8 @@ def test_container_runtime_keeps_stdin_open_for_dispatch_payload(
 
     payload = {
         "run_id": "harness-aaaaaaaaaaaa",
-        "prompt": "서비스 상태 확인",
+        "action_id": "action-aaaaaaaaaaaa",
+        "prompt": "Canary 읽기",
         "subject_mode": "container",
         "trust_boundary_id": "TB-CC-C1C2",
         "source_environment": "c1",
@@ -78,15 +111,23 @@ def test_container_runtime_keeps_stdin_open_for_dispatch_payload(
         },
         "profile_id": "container[mount_write=OFF,run_as_root=OFF,dac_override=OFF]",
         "tool_decision": {
-            "name": "service_status",
-            "arguments": {"resource_id": "target-service"},
+            "name": "file.content",
+            "action": "read",
+            "resource_ref": "target-canary",
+            "arguments": {},
         },
         "planner_mode": "local",
     }
 
-    host_supervisor._execute_container_runtime(payload)
+    body = host_supervisor._execute_container_runtime(payload)
 
     command = captured["command"]
     assert isinstance(command, list)
     assert "--interactive" in command
-    assert json.loads(str(captured["input_text"])) == payload
+    dispatched = json.loads(str(captured["input_text"]))
+    assert dispatched["run_id"] == payload["run_id"]
+    assert dispatched["permission_profile"] == {
+        **host_supervisor.CONTAINER_PROFILE_DEFAULTS,
+        **payload["permission_profile"],
+    }
+    assert all(body["applied_profile_state"]["application_checks"].values())

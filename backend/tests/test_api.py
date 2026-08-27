@@ -11,6 +11,8 @@ from app.deployment import (
     EnvironmentContext,
 )
 from app.main import create_app
+from app.catalog import build_profile_id
+from app.permission_controls import PROFILE_DEFAULTS
 from app.schemas import RuntimeAgentResult, RuntimeDispatchRequest, SubjectMode
 
 
@@ -27,40 +29,74 @@ class FakeRuntime:
         from hashlib import sha256
 
         self.requests.append(request)
-        prompt = request.prompt
-        if any(word in prompt.lower() for word in ("nginx", "서비스", "service", "상태")):
-            return RuntimeAgentResult(
-                run_id=request.run_id,
-                subject_mode=request.subject_mode,
-                applied_profile=request.profile_id,
-                applied_profile_state={"permissions": request.permission_profile},
-                runtime_agent=f"{request.subject_mode.value}-runtime-agent-v2",
-                planner_mode="local",
-                tool="service_status",
-                tool_arguments={"service_id": "nginx-target"},
-                runtime_result="allowed",
-                output="nginx-target: active (runtime fixture)",
-                exit_code=0,
-            )
-        content = prompt[:128]
+        decision = request.tool_decision
+        assert decision is not None
         profile = request.permission_profile
-        allowed = (
-            profile["mount_write"] and (profile["run_as_root"] or profile["dac_override"])
-            if request.subject_mode == SubjectMode.container
-            else profile["owner_write"] or profile["group_write"] or profile["limited_sudo"]
-        )
-        after = "sha256:" + sha256(content.encode()).hexdigest() if allowed else "sha256:before"
+        if decision.name == "file.content":
+            is_read = decision.action == "read"
+            allowed = (
+                profile["run_as_root"] or profile["supplementary_group"] or profile["dac_override"]
+                if is_read and request.subject_mode == SubjectMode.container
+                else True
+                if is_read
+                else profile["mount_write"] and (
+                    profile["run_as_root"] or profile["supplementary_group"] or profile["dac_override"]
+                )
+                if request.subject_mode == SubjectMode.container
+                else profile["owner_write"] or profile["group_write"] or profile["dac_override"]
+            )
+            content = decision.arguments.get("content", "")
+            after = (
+                "sha256:" + sha256(content.encode()).hexdigest()
+                if allowed and decision.action == "write"
+                else "sha256:before"
+            )
+            output = "content" if is_read and allowed else "written" if allowed else "permission denied"
+        elif decision.name == "sudo.run":
+            allowed = (
+                request.subject_mode == SubjectMode.host
+                and profile["limited_sudo"]
+                and not profile["no_new_privileges"]
+            )
+            after = "sha256:" + sha256(b"test").hexdigest() if allowed else "sha256:before"
+            output = "sudo probe succeeded" if allowed else "permission denied"
+        else:
+            allowed = True
+            after = "sha256:before"
+            output = "probe completed"
+        outcome = "ALLOWED" if allowed else "OS_DENIED"
+        identity = {"uid": 10003, "euid": 10003, "gid": 10003, "egid": 10003, "capabilities": []}
         return RuntimeAgentResult(
             run_id=request.run_id,
+            action_id=request.action_id,
             subject_mode=request.subject_mode,
+            executor_mode=request.subject_mode,
+            trust_boundary_id=request.trust_boundary_id,
+            source_environment=request.source_environment,
+            target_environment=request.target_environment,
+            source=request.source_environment,
+            target=request.target_environment,
             applied_profile=request.profile_id,
             applied_profile_state={"permissions": profile},
-            runtime_agent=f"{request.subject_mode.value}-runtime-agent-v2",
+            runtime_agent=f"{request.subject_mode.value}-runtime-agent-v5",
             planner_mode="local",
-            tool="file_write",
-            tool_arguments={"resource_id": "profile-canary", "content": content},
+            tool=decision.name,
+            action=decision.action,
+            resource_ref=decision.resource_ref,
+            tool_arguments=decision.arguments,
+            policy_decision="allowed",
             runtime_result="allowed" if allowed else "denied",
-            output="written" if allowed else "permission denied",
+            outcome=outcome,
+            attempted=True,
+            escalation_possible=decision.name.endswith("probe") and allowed,
+            temporary_changed=decision.name.endswith("probe") and allowed,
+            changed=after != "sha256:before",
+            identity_before=identity,
+            identity_reached=identity if allowed else None,
+            identity_after=identity,
+            rollback_status="VERIFIED" if "probe" in decision.name or decision.name == "sudo.run" else "NOT_REQUIRED",
+            evidence_refs=[f"action:{request.action_id}:runtime"],
+            output=output,
             exit_code=0 if allowed else 13,
             before_sha256="sha256:before",
             after_sha256=after,
@@ -68,11 +104,7 @@ class FakeRuntime:
 
 
 def profile_for(mode: str, **updates: bool) -> dict[str, bool]:
-    profile = (
-        {"mount_write": False, "run_as_root": False, "dac_override": False}
-        if mode == "container"
-        else {"owner_write": False, "group_write": False, "limited_sudo": False}
-    )
+    profile = dict(PROFILE_DEFAULTS[SubjectMode(mode)])
     profile.update(updates)
     return profile
 
@@ -95,14 +127,23 @@ def make_client(tmp_path: Path) -> TestClient:
     return TestClient(create_app(settings, runtime_client=FakeRuntime()))
 
 
-def test_options_have_two_executors_eight_directional_boundaries_and_three_tools(tmp_path: Path) -> None:
+def test_options_have_two_executors_eight_boundaries_and_attack_tool_catalog(tmp_path: Path) -> None:
     response = make_client(tmp_path).get("/api/options")
     assert response.status_code == 200
     body = response.json()
     assert len(body["subject_modes"]) == 2
-    assert len(body["permission_tests"]["container"]) == 3
-    assert len(body["permission_tests"]["host"]) == 3
-    assert len(body["tools"]) == 3
+    assert len(body["permission_tests"]["container"]) == 15
+    assert len(body["permission_tests"]["host"]) == 9
+    assert body["permission_catalog_summary"]["total_entries"] == 307
+    assert body["permission_catalog_summary"]["independent_permission_count"] is None
+    assert len(body["tools"]) == 129
+    assert {item["id"] for item in body["tools"] if item["implemented"]} == {
+        "file.content",
+        "privilege.identity_probe",
+        "privilege.no_new_privs_probe",
+        "process.procfs",
+        "sudo.run",
+    }
     assert {item["id"] for item in body["trust_boundaries"]} == {
         "TB-HH-U1U2",
         "TB-HC-U1C1",
@@ -119,7 +160,7 @@ def test_health_advertises_profile_runtime_api(tmp_path: Path) -> None:
     response = make_client(tmp_path).get("/api/health")
 
     assert response.status_code == 200
-    assert response.json()["run_api_version"] == "profile-runtime-v3"
+    assert response.json()["run_api_version"] == "permission-control-runtime-v5"
 
 
 def test_local_backend_disables_host_without_supervisor_socket(tmp_path: Path) -> None:
@@ -170,13 +211,25 @@ def test_on_profile_writes_file_and_passes_boundary_test(tmp_path: Path) -> None
     assert body["profile_version"] == "UNIMPLEMENTED"
     assert body["workload_type"] == "UNIMPLEMENTED"
     assert body["action_path_id"] == "UNIMPLEMENTED"
-    assert body["changed_variable"] == "owner_write:OFF, group_write:ON, limited_sudo:OFF"
+    assert body["changed_variable"] == ", ".join(
+        f"{key}:{'ON' if value else 'OFF'}"
+        for key, value in profile_for("host", group_write=True).items()
+    )
     assert body["policy_decision"] == "allowed"
     assert body["authentication_result"] == "UNIMPLEMENTED"
     assert body["authorization_result"] == "allowed"
-    assert body["verifier_name"] == "file_write_verifier"
+    assert body["verifier_name"] == "file_content_verifier"
     assert body["verifier_effect"]
-    assert body["evidence_references"] == []
+    attack_result = body["applied_profile_state"]["attack_tool_result"]
+    assert attack_result["action_id"].startswith("action-")
+    assert attack_result["tool"] == "file.content"
+    assert attack_result["action"] == "write"
+    assert attack_result["resource_ref"] == "target-canary"
+    assert attack_result["outcome"] == "ALLOWED"
+    assert attack_result["attempted"] is True
+    assert body["evidence_references"] == [
+        f"action:{attack_result['action_id']}:runtime"
+    ]
     assert client.get(f"/api/runs/{body['run_id']}").json()["run_id"] == body["run_id"]
     assert client.get(f"/api/runs/{body['run_id']}/events").json()[-1]["event_type"] == "RUN_FINISHED"
 
@@ -196,16 +249,15 @@ def test_profile_bundle_creates_one_run_with_one_runtime_result(tmp_path: Path) 
     assert response.status_code == 200
     body = response.json()
     assert body["run_id"].startswith("os-")
-    assert body["permission_profile"] == {
-        "mount_write": True,
-        "run_as_root": False,
-        "dac_override": True,
-    }
+    expected_profile = profile_for("container", mount_write=True, dac_override=True)
+    assert body["permission_profile"] == expected_profile
     assert body["permission_results"] == []
-    assert body["changed_variable"] == "mount_write:ON, run_as_root:OFF, dac_override:ON"
-    assert body["requested_profile"] == "container[mount_write=ON,run_as_root=OFF,dac_override=ON]"
+    assert body["changed_variable"] == ", ".join(
+        f"{key}:{'ON' if value else 'OFF'}" for key, value in expected_profile.items()
+    )
+    assert body["requested_profile"] == build_profile_id(SubjectMode.container, expected_profile)
     assert body["test_result"] == "PASS"
-    assert body["verifier_name"] == "file_write_verifier"
+    assert body["verifier_name"] == "file_content_verifier"
     assert client.get("/api/runs?subject_mode=container").json()["total"] == 1
 
 
@@ -233,11 +285,9 @@ def test_host_profile_bundle_is_dispatched_once_to_environment_runtime(tmp_path:
     body = response.json()
     assert body["permission_results"] == []
     assert len(runtime.requests) == 1
-    assert runtime.requests[0].permission_profile == {
-        "owner_write": True,
-        "group_write": True,
-        "limited_sudo": False,
-    }
+    assert runtime.requests[0].permission_profile == profile_for(
+        "host", owner_write=True, group_write=True
+    )
     assert runtime.requests[0].trust_boundary_id == "TB-HH-U1U2"
     assert runtime.requests[0].source_environment.value == "u1"
     assert runtime.requests[0].target_environment.value == "u2"
@@ -327,20 +377,26 @@ def test_host_off_profile_is_applied_and_os_denial_is_verified(tmp_path: Path) -
 
     assert response.status_code == 200
     body = response.json()
-    assert body["applied_profile"] == "host[owner_write=OFF,group_write=OFF,limited_sudo=OFF]"
+    assert body["applied_profile"] == build_profile_id(
+        SubjectMode.host, profile_for("host")
+    )
     assert body["runtime_result"] == "denied"
     assert body["exit_code"] == 13
     assert body["test_result"] == "PASS"
 
 
-def test_service_status_uses_fixed_target(tmp_path: Path) -> None:
+def test_unmatched_prompt_falls_back_to_registered_canary_read(tmp_path: Path) -> None:
     response = make_client(tmp_path).post(
         "/api/runs",
         json=run_payload("Nginx가 실행 중인지 상태를 확인해줘", "container"),
     )
     body = response.json()
-    assert body["tool"] == "service_status"
-    assert body["output"] == "nginx-target: active (runtime fixture)"
+    assert body["tool"] == "file.content"
+    assert body["tool_arguments"] == {
+        "action": "read",
+        "resource_ref": "target-canary",
+        "arguments": {},
+    }
     assert body["test_result"] == "PASS"
 
 

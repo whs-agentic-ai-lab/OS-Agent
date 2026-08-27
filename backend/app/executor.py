@@ -5,7 +5,6 @@ from .model_gateway import ModelGateway
 from .repository import RunRepository
 from .runtime_client import EnvironmentRuntime
 from .schemas import (
-    PROFILE_KEYS,
     RunEvent,
     RunRecord,
     RunRequest,
@@ -13,6 +12,7 @@ from .schemas import (
     RuntimeDispatchRequest,
     utc_now,
 )
+from .permission_controls import PROFILE_KEYS
 from .verifiers import verify_tool
 
 
@@ -87,6 +87,7 @@ class RunCoordinator:
             result = self.runtime.execute(
                 RuntimeDispatchRequest(
                     run_id=run.run_id,
+                    action_id=f"action-{uuid4().hex[:12]}",
                     prompt=request.prompt,
                     subject_mode=request.subject_mode,
                     trust_boundary_id=boundary.id,
@@ -156,11 +157,21 @@ class RunCoordinator:
     @staticmethod
     def _apply_runtime_result(run: RunRecord, result: RuntimeAgentResult) -> None:
         run.applied_profile = result.applied_profile
-        run.applied_profile_state = result.applied_profile_state
+        run.applied_profile_state = {
+            **result.applied_profile_state,
+            "attack_tool_result": result.model_dump(
+                mode="json",
+                exclude={"applied_profile_state", "events"},
+            ),
+        }
         run.runtime_agent = result.runtime_agent
         run.planner_mode = result.planner_mode
         run.tool = result.tool
-        run.tool_arguments = result.tool_arguments
+        run.tool_arguments = {
+            "action": result.action,
+            "resource_ref": result.resource_ref,
+            "arguments": result.tool_arguments,
+        }
         run.policy_decision = result.policy_decision
         run.authorization_result = result.runtime_result
         run.runtime_result = result.runtime_result
@@ -168,6 +179,7 @@ class RunCoordinator:
         run.exit_code = result.exit_code
         run.before_sha256 = result.before_sha256
         run.after_sha256 = result.after_sha256
+        run.evidence_references = list(result.evidence_refs)
         for event in result.events:
             run.events.append(event.model_copy(update={"sequence": len(run.events) + 1}))
         run.events.append(
@@ -177,8 +189,12 @@ class RunCoordinator:
                 event_type="EXECUTION_FINISHED",
                 message="선택된 환경의 Executor가 Tool 실행을 완료했습니다.",
                 payload={
+                    "action_id": result.action_id,
                     "runtime_agent": result.runtime_agent,
                     "tool": result.tool,
+                    "action": result.action,
+                    "resource_ref": result.resource_ref,
+                    "outcome": result.outcome,
                     "trust_boundary_id": result.trust_boundary_id,
                 },
             )

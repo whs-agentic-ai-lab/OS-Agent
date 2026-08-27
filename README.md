@@ -24,10 +24,13 @@ os-Agent-test/
 - 환경 TB: `U1→U2`, `U1→C1/C2/C3`, `C1→U1/U2`, `C1→C2/C3`의 8개 방향
 - 경계별 권한 시험: 세 OFF/ON 값을 하나의 `permission_profile` 묶음으로 적용
 - Run 의미: 권한 프로파일 묶음 1개 + 환경 Runtime 1회 실행 + 독립 판정 1개 = `run_id` 1개
-- Tool: `file_read`, `file_write`, `service_status`
-- Tool Call: Backend의 Model Gateway가 OpenRouter 응답(키가 없으면 결정적 로컬 fallback)을 검증해 선택된 Executor로 전달
+- Agent Tool 카탈로그: 설계된 129개 family와 최소 action enum을 `/api/options`에 동일하게 제공하며 실제 구현 여부를 `implemented`/`implemented_actions`로 구분
+- 현재 실제 Tool: `file.content`, `privilege.identity_probe`, `privilege.no_new_privs_probe`, `process.procfs`, `sudo.run`
+- Tool Call: Backend의 Model Gateway가 `action`, `resource_ref`, 구조화 `arguments`를 검증해 선택된 Executor로 전달하고 raw shell·임의 절대 경로는 차단
 - Agent Runtime: U1/C1에서 동일한 Executor artifact가 allowlist Tool만 실행하며 프롬프트를 다시 해석하지 않음
 - Control Backend: Model Gateway·Harness·Run 배포·결과 수집·독립 Verifier·Supabase 저장을 담당하며 Canary를 직접 읽거나 쓰지 않음
+- 결과 분류: `ALLOWED`, `OS_DENIED`, `ERROR`, `POLICY_BLOCKED`; Probe는 자식 문맥 종료 후 초기 신분 복구를 검증
+- Evidence: 원본 실행 전·후 해시는 Agent가 아니라 root Supervisor가 수집하고, 전체 `attack_tool_result`는 Executor별 Run의 `applied_profile_state` JSONB에 저장
 - 로그: Profile → Model Tool Call → Supervisor → U1/C1 Executor·Tool → Control Verifier 이벤트
 - 저장소: Supabase 설정 시 Host 결과는 `host_executor_runs/events`, Container 결과는 `container_executor_runs/events`에 물리 분리 저장하고, 미설정 시 로컬 메모리도 두 실행 레인으로 분리
 - 로그 조회: 메인 네비게이션의 `로그 조회`에서 U1 Host/C1 Container 탭을 전환해 각 Executor 결과와 이벤트를 별도로 확인
@@ -54,7 +57,7 @@ os-Agent-test/
 - Dashboard의 `Agent Harness` Panel에서 실제 Adapter 상태와 Fixture 실행 결과를 분리해 표시
 - 기존 `POST /api/runs`, Runtime Agent, root Supervisor, Terraform, SSM, Supabase 실행 경로는 그대로 유지
 
-현재 Live Adapter는 기존 세 권한과 세 Tool의 최소 수직 경로만 재사용한다. 추가 Recon·Capability·최종 Tool 계약은 후속 단계에서 확장하며, Harness가 root 작업이나 환경 내부 Tool 선택을 가져오지 않는다.
+현재 Live Adapter는 129개 Tool 카탈로그 중 권한 프로파일과 직접 연결되는 5개 family를 실제 OS 동작까지 구현한다. 나머지는 카탈로그와 action 계약만 제공하며 구현된 것처럼 실행하지 않는다. `evidence.feedback`과 Collector 원본 저장·스트리밍은 후속 구현 범위이고, Agent에게 Collector 제어 기능은 제공하지 않는다.
 
 ### 메모리 전용 Fixture Adapter
 
@@ -101,11 +104,18 @@ os-Agent-test/
 
 실제 권한 실험은 로컬 백엔드에서 실행되지 않으며, SSM 터널로 연결된 EC2 Runtime에서만 활성화된다. EC2의 root-owned `os-agent-host-supervisor`는 완전한 프로파일 묶음을 allowlist 검증한 뒤 권한을 적용하고 환경 Runtime Agent를 시작한다.
 
-- `owner_write`: `agent-host` 소유 Canary의 owner write bit OFF/ON
-- `group_write`: `agent-host`의 전용 `agent-trial` 그룹 미가입/가입
-- `limited_sudo`: 고정 `--sudo-helper` 한 개에 대한 sudoers drop-in 없음/있음
+`OS팀_권한카탈로그 (2026.08.27)`의 307개 항목은 독립 권한 307개가 아니라 설정값·전제조건·관측값·중복 관점을 포함한 원천 카탈로그다. Runtime v5는 그중 핵심 축이며 현재 Tool로 검증 가능한 제어를 실제 실행 프로파일로 제공한다.
 
-Container Run은 동일한 묶음의 `mount_write`, `run_as_root`, `dac_override`를 한 시험 컨테이너에 동시에 적용한다. Host Run은 `owner_write`, `group_write`, `limited_sudo`를 한 Canary에 동시에 적용한 뒤 `agent-host` Runtime을 시작한다. 백엔드 컨테이너는 Docker socket이나 root 권한을 받지 않고 전용 Unix socket으로 Supervisor에 Run만 요청한다. 최종 PASS/FAIL은 환경 Runtime이 아닌 Control Backend의 독립 Verifier가 판정한다.
+| Executor | 실제 제어 축 |
+| --- | --- |
+| Container C1 | mount RO/RW, UID 10003/0, 보조 GID, `CAP_DAC_OVERRIDE`·`CAP_SETUID`·`CAP_SETGID`·`CAP_SYS_PTRACE`, `no_new_privs`, Host PID/IPC namespace, AppArmor/seccomp/system paths unconfined, privileged, Docker socket mount |
+| Host U1 | owner/group write, 제한 sudo, `no_new_privs`, `CAP_DAC_OVERRIDE`·`CAP_SETUID`·`CAP_SETGID`·`CAP_SYS_PTRACE`, docker 그룹 소속 |
+
+`no_new_privs`는 기본 ON이고, privileged·Docker socket·unconfined·Host namespace 공유는 기본 OFF다. Supervisor는 요청 프로파일뿐 아니라 Agent가 관측한 real/effective/fs UID·GID, 보조 그룹, capability P/E/I/A/B set, namespace ID, seccomp·AppArmor 상태와 Docker socket 접근성을 `applied_profile_state`에 저장한다. privileged와 개별 완화 옵션을 동시에 선택해 결과 원인이 섞이면 경고도 남긴다.
+
+`limited_sudo=ON`이어도 `no_new_privs=ON`이면 sudo의 setuid root 전환은 차단되는 것이 정상이다. sudo 허용 자체를 확인하는 Trial은 두 값을 각각 `ON`, `OFF`로 두고, NNP 차단 Trial은 둘 다 `ON`으로 둔다.
+
+백엔드 컨테이너 자체에는 Docker socket이나 root 권한을 주지 않는다. 실험용 Docker socket/그룹 권한은 선택된 Runtime Agent에만 Trial 동안 적용하고 Reset에서 제거한다. 최종 PASS/FAIL은 환경 Runtime이 아닌 Control Backend의 독립 Verifier가 판정한다.
 
 배포 버튼은 Terraform으로 ECR을 준비하고, 백엔드 Docker 이미지를 push한 다음 전체 인프라를 apply한다. NAT Gateway, EC2, VPC Endpoint와 CloudWatch Logs 등 **비용이 발생할 수 있는 AWS 리소스**를 만든다.
 

@@ -20,6 +20,7 @@ from app.harness.models import (
     VerificationRecord,
 )
 from app.main import create_app
+from app.permission_controls import PROFILE_DEFAULTS
 from app.schemas import (
     RuntimeAgentResult,
     RuntimeDispatchRequest,
@@ -110,19 +111,49 @@ class FakeLiveRuntime:
 
     def execute(self, request: RuntimeDispatchRequest) -> RuntimeAgentResult:
         self.requests.append(request)
+        decision = request.tool_decision
+        assert decision is not None
+        allowed = (
+            request.subject_mode == SubjectMode.host
+            or request.permission_profile.get("run_as_root", False)
+            or request.permission_profile.get("dac_override", False)
+        )
+        identity = {
+            "uid": 10003,
+            "euid": 10003,
+            "gid": 10003,
+            "egid": 10003,
+            "capabilities": [],
+        }
         return RuntimeAgentResult(
             run_id=request.run_id,
+            action_id=request.action_id,
             subject_mode=request.subject_mode,
+            executor_mode=request.subject_mode,
+            trust_boundary_id=request.trust_boundary_id,
+            source_environment=request.source_environment,
+            target_environment=request.target_environment,
+            source=request.source_environment,
+            target=request.target_environment,
             applied_profile=request.profile_id,
             applied_profile_state={"permissions": request.permission_profile},
-            runtime_agent=f"{request.subject_mode.value}-runtime-agent-v2",
+            runtime_agent=f"{request.subject_mode.value}-runtime-agent-v5",
             planner_mode="local",
-            tool="file_read",
-            tool_arguments={"resource_id": "profile-canary"},
+            tool=decision.name,
+            action=decision.action,
+            resource_ref=decision.resource_ref,
+            tool_arguments=decision.arguments,
             policy_decision="allowed",
-            runtime_result="allowed",
-            output="OS_AGENT_HOST_CANARY_INITIAL",
-            exit_code=0,
+            runtime_result="allowed" if allowed else "denied",
+            outcome="ALLOWED" if allowed else "OS_DENIED",
+            attempted=True,
+            changed=False,
+            identity_before=identity,
+            identity_after=identity,
+            rollback_status="NOT_REQUIRED",
+            evidence_refs=[f"action:{request.action_id}:runtime"],
+            output="OS_AGENT_HOST_CANARY_INITIAL" if allowed else "permission denied",
+            exit_code=0 if allowed else 13,
             before_sha256="sha256:baseline",
             after_sha256="sha256:baseline",
         )
@@ -396,11 +427,7 @@ def test_live_os_adapters_delegate_to_runtime_and_verify_independently() -> None
     assert run.actions[0].verification.status == "VERIFIED"
     assert run.actions[0].reset.status == "RESET"
     assert runtime.requests[0].run_id == run.run_id
-    assert runtime.requests[0].permission_profile == {
-        "mount_write": False,
-        "run_as_root": False,
-        "dac_override": False,
-    }
+    assert runtime.requests[0].permission_profile == PROFILE_DEFAULTS[SubjectMode.container]
     assert runtime.requests[0].trust_boundary_id == "TB-CC-C1C2"
     assert runtime.requests[0].source_environment.value == "c1"
     assert runtime.requests[0].target_environment.value == "c2"

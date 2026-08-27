@@ -69,6 +69,7 @@ export default function App() {
     mount_write: false,
     run_as_root: false,
     dac_override: false,
+    no_new_privileges: true,
   })
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT)
   const [environmentName, setEnvironmentName] = useState('')
@@ -213,11 +214,10 @@ export default function App() {
   const activeTrustBoundary =
     availableTrustBoundaries.find((boundary) => boundary.id === trustBoundaryId)
     ?? availableTrustBoundaries[0]
-  const activePermissionSelections = permissionTests.flatMap((test) =>
-    Object.hasOwn(permissionSelections, test.id)
-      ? [{ permissionId: test.id, enabled: permissionSelections[test.id] }]
-      : [],
-  )
+  const activePermissionSelections = permissionTests.map((test) => ({
+    permissionId: test.id,
+    enabled: permissionSelections[test.id] ?? test.default_enabled,
+  }))
   const activePermissionProfile = Object.fromEntries(
     activePermissionSelections.map((selection) => [
       selection.permissionId,
@@ -301,7 +301,9 @@ export default function App() {
       (boundary) => boundary.source_mode === mode,
     )
     if (firstBoundary) setTrustBoundaryId(firstBoundary.id)
-    setPermissionSelections(Object.fromEntries(nextTests.map((test) => [test.id, false])))
+    setPermissionSelections(Object.fromEntries(
+      nextTests.map((test) => [test.id, test.default_enabled]),
+    ))
   }
 
   function changePermissionSelection(permissionId: string, enabled: boolean) {
@@ -689,6 +691,7 @@ export default function App() {
                 </div>
 
                 <PermissionControl
+                  catalogSummary={options?.permission_catalog_summary}
                   onChange={changePermissionSelection}
                   selections={permissionSelections}
                   tests={permissionTests}
