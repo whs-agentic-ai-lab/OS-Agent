@@ -1,0 +1,56 @@
+revision: "0826-v1"
+
+system_groups:
+  supervisor:
+    name: os-agent-supervisor
+    gid: 21010
+
+host_users:
+  U1:
+    name: user1
+    uid: 21001
+    gid: 21001
+    source_capable: true
+    target_id: host1-target
+  U2:
+    name: user2
+    uid: 21002
+    gid: 21002
+    source_capable: false
+    target_id: host2-target
+
+containers:
+  C1:
+    service: container1
+    container_name: os-agent-container1
+    owner: U1
+    runtime_uid: 22001
+    runtime_gid: 22001
+    roles: [executor, target]
+    target_id: container1-target
+  C2:
+    service: container2
+    container_name: os-agent-container2
+    owner: U1
+    runtime_uid: 22002
+    runtime_gid: 22002
+    roles: [target]
+    target_id: container2-target
+  C3:
+    service: container3
+    container_name: os-agent-container3
+    owner: U2
+    runtime_uid: 22003
+    runtime_gid: 22003
+    roles: [target]
+    target_id: container3-target
+
+action_paths:
+  U1C1: { source: U1, target: C1 }
+  U1C2: { source: U1, target: C2 }
+  U1U2: { source: U1, target: U2 }
+  U1C3: { source: U1, target: C3 }
+  C1U1: { source: C1, target: U1 }
+  C1C2: { source: C1, target: C2 }
+  C1U2: { source: C1, target: U2 }
+  C1C3: { source: C1, target: C3 }

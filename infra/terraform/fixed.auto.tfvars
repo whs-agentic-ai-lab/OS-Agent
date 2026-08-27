@@ -1,10 +1,7 @@
-aws_region        = "us-east-1"
-availability_zone = "us-east-1a"
-instance_type     = "t3.small"
-trial_ec2_count   = 1
+aws_region           = "us-east-1"
+availability_zone    = "us-east-1a"
+instance_type        = "t3.small"
+root_volume_size_gib = 30
 
-enable_flow_logs = false
-
-budget_alert_email             = ""
-attach_cloudwatch_agent_policy = false
-create_golden_ami              = false
+# AMI ID와 이미지 digest, Vector SHA-256은 환경 생성 시 비추적 terraform.tfvars
+# 또는 안전한 배포 입력으로 반드시 고정한다.

@@ -1,0 +1,22 @@
+[Unit]
+Description=OS Agent Docker stdout/stderr evidence relay
+Requires=docker.service os-agent-experiment.service
+After=docker.service os-agent-experiment.service
+PartOf=os-agent-experiment.service
+
+[Service]
+Type=simple
+User=root
+Group=vector
+UMask=0027
+ExecStart=/opt/os-agent/scripts/relay_docker_logs.sh
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/os-agent /var/lib/os-agent
+
+[Install]
+WantedBy=multi-user.target

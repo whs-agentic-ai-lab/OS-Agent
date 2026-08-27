@@ -1,14 +1,25 @@
-# 이 파일을 복사해서 terraform.tfvars로 만들고 값을 채우세요.
-# terraform.tfvars는 .gitignore에 들어있어서 git에 올라가지 않습니다.
+# 이 파일을 terraform.tfvars로 복사한 뒤 현재 실험에서 검증한 값만 채우세요.
+# terraform.tfvars는 Git에 커밋하지 않습니다.
 
-aws_region         = "us-east-1"
-availability_zone  = "us-east-1a"
-instance_type      = "t3.small"
+aws_profile    = ""
+project_name   = "os-agent"
+environment_id = "trial-0826"
+confirm_new_state = true
 
-# 팀 공용 AWS 계정에 등록해둔 CLI 프로필 이름. 비워두면 기본 프로필을 씀.
-# 설정 전에 터미널에서: aws configure --profile <프로필 이름>  (팀 공용 계정 Access Key 입력)
-aws_profile        = ""
+# Canonical Ubuntu 24.04 amd64 AMI를 한 번 확인한 뒤 정확한 ID로 고정합니다.
+base_ami_id = "ami-xxxxxxxxxxxxxxxxx"
 
-budget_alert_email             = "your-email@example.com"
-attach_cloudwatch_agent_policy = false
-create_golden_ami              = false
+# 모두 ECR image manifest digest입니다. tag가 아닙니다.
+runtime_image_digest    = "sha256:REPLACE_WITH_64_HEX"
+container1_image_digest = "sha256:REPLACE_WITH_64_HEX"
+target_image_digest     = "sha256:REPLACE_WITH_64_HEX"
+
+# 공식 Vector 0.57.0 x86_64 GNU archive SHA-256입니다.
+vector_archive_sha256 = "REPLACE_WITH_64_HEX"
+
+# FastAPI Evidence API가 구현되기 전에는 false로 둡니다.
+enable_remote_evidence_sink = false
+evidence_api_url             = ""
+collector_token_parameter_name = ""
+# customer-managed KMS key를 쓰는 SecureString일 때만 채웁니다.
+collector_token_kms_key_arn = ""

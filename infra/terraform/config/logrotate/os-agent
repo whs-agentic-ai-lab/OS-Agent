@@ -1,0 +1,28 @@
+/var/log/os-agent/docker-events.ndjson
+/var/log/os-agent/docker-logs.ndjson
+/var/log/os-agent/state-captures.ndjson
+/var/log/os-agent/executor/*.ndjson {
+    su root vector
+    size 50M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 root vector
+}
+
+/var/lib/os-agent/evidence/collected/events.ndjson {
+    su vector vector
+    size 100M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 vector vector
+    sharedscripts
+    postrotate
+        /bin/systemctl kill -s HUP vector.service >/dev/null 2>&1 || true
+    endscript
+}
