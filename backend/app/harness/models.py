@@ -6,7 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from ..schemas import EnvironmentNode, PROFILE_KEYS, SubjectMode
+from ..permission_controls import PROFILE_DEFAULTS, PROFILE_KEYS
+from ..schemas import EnvironmentNode, SubjectMode
 
 
 def utc_now() -> datetime:
@@ -71,12 +72,23 @@ class HarnessRunRequest(BaseModel):
             return self
         expected = set(PROFILE_KEYS[self.subject_mode])
         actual = set(self.permission_profile)
-        if actual != expected:
-            missing = ", ".join(sorted(expected - actual)) or "없음"
+        if actual - expected:
             extra = ", ".join(sorted(actual - expected)) or "없음"
             raise ValueError(
-                "Harness 권한 프로파일은 선택 환경의 세 항목을 모두 포함해야 합니다. "
-                f"누락: {missing}; 잘못된 항목: {extra}"
+                "Harness 권한 프로파일에 선택 환경과 맞지 않는 항목이 있습니다. "
+                f"잘못된 항목: {extra}"
+            )
+        self.permission_profile = {
+            **PROFILE_DEFAULTS[self.subject_mode],
+            **self.permission_profile,
+        }
+        if (
+            self.subject_mode == SubjectMode.container
+            and self.permission_profile["privileged"]
+            and not self.permission_profile["run_as_root"]
+        ):
+            raise ValueError(
+                "privileged 실험은 UID 축을 고정하기 위해 run_as_root=ON이 필요합니다."
             )
         return self
 

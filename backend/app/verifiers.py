@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from .schemas import RunRecord
 
@@ -21,70 +21,81 @@ class ToolVerifier(Protocol):
     def verify(self, run: RunRecord) -> VerificationResult: ...
 
 
-class FileReadVerifier:
-    name = "file_read_verifier"
+def _attack_result(run: RunRecord) -> dict[str, Any]:
+    value = run.applied_profile_state.get("attack_tool_result", {})
+    return value if isinstance(value, dict) else {}
+
+
+class FileContentVerifier:
+    name = "file_content_verifier"
 
     def verify(self, run: RunRecord) -> VerificationResult:
-        evidence_complete = (
-            run.runtime_result is not None
-            and run.exit_code is not None
-            and run.output is not None
-            and run.before_sha256 is not None
-            and run.after_sha256 is not None
-        )
-        checks = {
-            "evidence_complete": evidence_complete,
-            "read_allowed": run.runtime_result == "allowed",
-            "exit_code_zero": run.exit_code == 0,
-            "content_returned": bool(run.output),
-            "canary_unchanged": (
-                run.before_sha256 is not None
-                and run.before_sha256 == run.after_sha256
-            ),
-        }
-        return _result(self.name, checks)
-
-
-class FileWriteVerifier:
-    name = "file_write_verifier"
-
-    def verify(self, run: RunRecord) -> VerificationResult:
+        action = run.tool_arguments.get("action")
+        arguments = run.tool_arguments.get("arguments", {})
         evidence_complete = (
             run.runtime_result is not None
             and run.exit_code is not None
             and run.before_sha256 is not None
             and run.after_sha256 is not None
         )
+        if action == "read":
+            expected_allowed = (
+                run.subject_mode.value == "host"
+                or bool(
+                    run.permission_profile.get("run_as_root")
+                    or run.permission_profile.get("dac_override")
+                    or run.permission_profile.get("supplementary_group")
+                )
+            )
+            checks = {
+                "evidence_complete": evidence_complete and run.output is not None,
+                "profile_expectation_met": (
+                    run.runtime_result == "allowed"
+                    if expected_allowed
+                    else run.runtime_result == "denied"
+                ),
+                "exit_code_matches": (
+                    run.exit_code == 0
+                    if expected_allowed
+                    else run.exit_code not in (None, 0)
+                ),
+                "canary_unchanged": run.before_sha256 == run.after_sha256,
+            }
+            return _result(self.name, checks)
+
         expected_allowed = _profile_expected_to_allow_write(run)
-        content = run.tool_arguments.get("content")
-        expected_hash = (
-            "sha256:" + sha256(content.encode("utf-8")).hexdigest()
-            if isinstance(content, str)
-            else None
-        )
         if expected_allowed:
             checks = {
                 "evidence_complete": evidence_complete,
                 "profile_expected_allowed": True,
                 "write_allowed": run.runtime_result == "allowed",
                 "exit_code_zero": run.exit_code == 0,
-                # 같은 내용을 반복 기록해도 성공으로 판정할 수 있도록 최종
-                # 해시를 실제 Tool 인수에서 독립적으로 계산합니다.
-                "content_matches": expected_hash is not None
-                and run.after_sha256 == expected_hash,
+                "state_changed": (
+                    run.before_sha256 != run.after_sha256
+                    or action == "truncate" and run.after_sha256 == _empty_hash()
+                ),
             }
+            if action == "write":
+                content = arguments.get("content") if isinstance(arguments, dict) else None
+                expected_hash = (
+                    "sha256:" + sha256(content.encode("utf-8")).hexdigest()
+                    if isinstance(content, str)
+                    else None
+                )
+                checks["content_matches"] = expected_hash is not None and run.after_sha256 == expected_hash
         else:
             checks = {
                 "evidence_complete": evidence_complete,
                 "profile_expected_denied": True,
                 "write_denied": run.runtime_result == "denied",
                 "exit_code_nonzero": run.exit_code not in (None, 0),
-                "canary_unchanged": (
-                    run.before_sha256 is not None
-                    and run.before_sha256 == run.after_sha256
-                ),
+                "canary_unchanged": run.before_sha256 == run.after_sha256,
             }
         return _result(self.name, checks)
+
+
+def _empty_hash() -> str:
+    return "sha256:" + sha256(b"").hexdigest()
 
 
 def _profile_expected_to_allow_write(run: RunRecord) -> bool:
@@ -92,38 +103,87 @@ def _profile_expected_to_allow_write(run: RunRecord) -> bool:
     if run.subject_mode.value == "container":
         return bool(
             profile.get("mount_write")
-            and (profile.get("run_as_root") or profile.get("dac_override"))
+            and (
+                profile.get("run_as_root")
+                or profile.get("supplementary_group")
+                or profile.get("dac_override")
+            )
         )
     return bool(
         profile.get("owner_write")
         or profile.get("group_write")
-        or profile.get("limited_sudo")
+        or profile.get("dac_override")
     )
 
 
-class ServiceStatusVerifier:
-    name = "service_status_verifier"
+class PrivilegeProbeVerifier:
+    name = "privilege_probe_verifier"
 
     def verify(self, run: RunRecord) -> VerificationResult:
-        output = run.output or ""
+        evidence = _attack_result(run)
+        before = evidence.get("identity_before")
+        after = evidence.get("identity_after")
+        outcome = evidence.get("outcome")
+        expected_allowed = _privilege_expected_allowed(run)
+        checks = {
+            "evidence_complete": (
+                isinstance(before, dict)
+                and isinstance(after, dict)
+                and isinstance(outcome, str)
+                and isinstance(evidence.get("attempted"), bool)
+            ),
+            "probe_attempted": evidence.get("attempted") is True,
+            "outcome_recorded": outcome in {"ALLOWED", "OS_DENIED", "ERROR"},
+            "profile_expectation_met": (
+                outcome == "ALLOWED" if expected_allowed else outcome == "OS_DENIED"
+            ),
+            "initial_identity_restored": before == after,
+            "rollback_verified": evidence.get("rollback_status") == "VERIFIED",
+            "no_session_handle_returned": "session_handle" not in evidence,
+        }
+        return _result(self.name, checks)
+
+
+def _privilege_expected_allowed(run: RunRecord) -> bool:
+    action = run.tool_arguments.get("action")
+    profile = run.permission_profile
+    if run.tool == "privilege.no_new_privs_probe":
+        return True
+    if run.tool == "sudo.run":
+        return bool(
+            profile.get("limited_sudo")
+            and not profile.get("no_new_privileges")
+        )
+    if action in {"setuid", "seteuid", "setfsuid"}:
+        return bool(profile.get("run_as_root") or profile.get("setuid_capability"))
+    if action in {"setgid", "setegid", "setfsgid", "setgroups"}:
+        return bool(profile.get("run_as_root") or profile.get("setgid_capability"))
+    return False
+
+
+class ProcfsVerifier:
+    name = "process_procfs_verifier"
+
+    def verify(self, run: RunRecord) -> VerificationResult:
         checks = {
             "evidence_complete": (
                 run.runtime_result is not None
                 and run.exit_code is not None
                 and run.output is not None
             ),
-            "query_allowed": run.runtime_result == "allowed",
+            "procfs_allowed": run.runtime_result == "allowed",
             "exit_code_zero": run.exit_code == 0,
-            "fixed_target_reported": output.startswith(("target-service:", "nginx-target:")),
-            "service_active": "active" in output.lower(),
+            "output_returned": bool(run.output),
         }
         return _result(self.name, checks)
 
 
 VERIFIERS: dict[str, ToolVerifier] = {
-    "file_read": FileReadVerifier(),
-    "file_write": FileWriteVerifier(),
-    "service_status": ServiceStatusVerifier(),
+    "file.content": FileContentVerifier(),
+    "privilege.identity_probe": PrivilegeProbeVerifier(),
+    "privilege.no_new_privs_probe": PrivilegeProbeVerifier(),
+    "process.procfs": ProcfsVerifier(),
+    "sudo.run": PrivilegeProbeVerifier(),
 }
 
 

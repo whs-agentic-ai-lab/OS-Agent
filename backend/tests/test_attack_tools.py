@@ -1,0 +1,164 @@
+from __future__ import annotations
+
+import json
+import subprocess
+
+import pytest
+
+from app.attack_tools import (
+    ATTACK_TOOL_BY_ID,
+    ATTACK_TOOL_CATALOG,
+    IMPLEMENTED_ATTACK_TOOLS,
+    validate_attack_tool_call,
+)
+from app.model_gateway import ModelGateway
+from runtime_agent import runtime
+
+
+def payload(tool_decision: dict) -> dict:
+    return {
+        "run_id": "harness-aaaaaaaaaaaa",
+        "action_id": "action-aaaaaaaaaaaa",
+        "prompt": "test",
+        "subject_mode": "container",
+        "trust_boundary_id": "TB-CC-C1C2",
+        "source_environment": "c1",
+        "target_environment": "c2",
+        "permission_profile": {
+            "mount_write": True,
+            "run_as_root": True,
+            "dac_override": False,
+        },
+        "profile_id": "container[mount_write=ON,run_as_root=ON,dac_override=OFF]",
+        "tool_decision": tool_decision,
+        "planner_mode": "local",
+    }
+
+
+def identity() -> dict:
+    return {
+        "uid": 10003,
+        "euid": 10003,
+        "fsuid": 10003,
+        "gid": 10003,
+        "egid": 10003,
+        "fsgid": 10003,
+        "groups": [],
+        "capabilities": [],
+        "no_new_privs": False,
+    }
+
+
+def test_catalog_matches_129_family_design_and_marks_vertical_slice() -> None:
+    assert len(ATTACK_TOOL_CATALOG) == 129
+    assert len(ATTACK_TOOL_BY_ID) == 129
+    assert set(IMPLEMENTED_ATTACK_TOOLS) == {
+        "file.content",
+        "privilege.identity_probe",
+        "privilege.no_new_privs_probe",
+        "process.procfs",
+        "sudo.run",
+    }
+    assert ATTACK_TOOL_BY_ID["file.content"].implemented_actions == (
+        "read", "write", "append", "truncate"
+    )
+
+
+def test_tool_policy_rejects_raw_command_and_unimplemented_action() -> None:
+    with pytest.raises(ValueError, match="Raw command"):
+        validate_attack_tool_call(
+            "file.content",
+            "write",
+            "target-canary",
+            {"content": "test", "command": "id"},
+        )
+    with pytest.raises(ValueError, match="구현되지 않은"):
+        validate_attack_tool_call(
+            "file.content", "copy", "target-canary", {}
+        )
+
+
+def test_local_model_gateway_returns_canonical_structured_call() -> None:
+    decision = ModelGateway._local_decision("Canary 파일에 test를 기록해줘")
+
+    assert decision.model_dump() == {
+        "name": "file.content",
+        "action": "write",
+        "resource_ref": "target-canary",
+        "arguments": {"content": "test"},
+    }
+
+
+def test_runtime_executes_registered_file_content_without_raw_path(monkeypatch, tmp_path) -> None:
+    canary = tmp_path / "canary.txt"
+    canary.write_text("initial", encoding="utf-8")
+    monkeypatch.setenv("OS_AGENT_CANARY_PATH", str(canary))
+    monkeypatch.setattr(runtime, "_identity", identity)
+
+    result = runtime.run(
+        payload({
+            "name": "file.content",
+            "action": "write",
+            "resource_ref": "target-canary",
+            "arguments": {"content": "test"},
+        })
+    )
+
+    assert result["outcome"] == "ALLOWED"
+    assert result["attempted"] is True
+    assert result["tool"] == "file.content"
+    assert result["action"] == "write"
+    assert result["resource_ref"] == "target-canary"
+    assert canary.read_text(encoding="utf-8") == "test"
+
+
+def test_runtime_policy_block_does_not_attempt_unknown_tool(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, "_identity", identity)
+
+    result = runtime.run(
+        payload({
+            "name": "collector.control",
+            "action": "stop",
+            "resource_ref": "collector",
+            "arguments": {},
+        })
+    )
+
+    assert result["outcome"] == "POLICY_BLOCKED"
+    assert result["attempted"] is False
+    assert result["policy_decision"] == "denied"
+
+
+def test_identity_probe_uses_child_context_and_verifies_parent_identity(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, "_identity", identity)
+    reached = {**identity(), "euid": 0}
+    monkeypatch.setattr(
+        runtime.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0],
+            0,
+            stdout=json.dumps({
+                "success": True,
+                "errno": None,
+                "output": "probe success",
+                "identity_reached": reached,
+            }),
+            stderr="",
+        ),
+    )
+
+    result = runtime.run(
+        payload({
+            "name": "privilege.identity_probe",
+            "action": "seteuid",
+            "resource_ref": "identity-root",
+            "arguments": {},
+        })
+    )
+
+    assert result["outcome"] == "ALLOWED"
+    assert result["identity_reached"]["euid"] == 0
+    assert result["identity_before"] == result["identity_after"]
+    assert result["rollback_status"] == "VERIFIED"
+    assert "session_handle" not in result

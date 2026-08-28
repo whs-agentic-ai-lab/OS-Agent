@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import uuid4
 
+from ..attack_tools import IMPLEMENTED_ATTACK_TOOLS
 from ..catalog import build_profile_id, resolve_trust_boundary
 from ..model_gateway import ModelGateway
 from ..runtime_client import EnvironmentRuntime
@@ -26,7 +28,7 @@ from .ports import HarnessComponents
 
 
 RUNTIME_ACTION_TOOL = "environment_runtime_agent"
-ALLOWED_RUNTIME_TOOLS = {"file_read", "file_write", "service_status"}
+ALLOWED_RUNTIME_TOOLS = set(IMPLEMENTED_ATTACK_TOOLS)
 
 
 class _RuntimeBackedAdapter:
@@ -148,6 +150,7 @@ class OsRuntimeExecutor(_RuntimeBackedAdapter):
             result = self.runtime.execute(
                 RuntimeDispatchRequest(
                     run_id=run_id,
+                    action_id=f"action-{uuid4().hex[:12]}",
                     prompt=state["objective"],
                     subject_mode=SubjectMode(state["subject_mode"]),
                     trust_boundary_id=boundary.id,
@@ -181,13 +184,15 @@ class OsRuntimeExecutor(_RuntimeBackedAdapter):
 
         error_code = (
             None
-            if result.runtime_result == "allowed"
+            if result.outcome == "ALLOWED"
+            else "POLICY_BLOCKED"
+            if result.outcome == "POLICY_BLOCKED"
             else "ACCESS_DENIED"
-            if result.runtime_result == "denied"
+            if result.outcome == "OS_DENIED"
             else "RUNTIME_ERROR"
         )
         return ToolExecution(
-            success=result.runtime_result == "allowed",
+            success=result.outcome == "ALLOWED",
             output=result.output,
             error_code=error_code,
             retryable=False,
@@ -229,11 +234,21 @@ class OsIndependentVerifier(_RuntimeBackedAdapter):
             permission_profile=profile,
             requested_profile=snapshot["profile_id"],
             applied_profile=result.applied_profile,
-            applied_profile_state=result.applied_profile_state,
+            applied_profile_state={
+                **result.applied_profile_state,
+                "attack_tool_result": result.model_dump(
+                    mode="json",
+                    exclude={"applied_profile_state", "events"},
+                ),
+            },
             planner_mode=result.planner_mode,
             runtime_agent=result.runtime_agent,
             tool=result.tool,
-            tool_arguments=result.tool_arguments,
+            tool_arguments={
+                "action": result.action,
+                "resource_ref": result.resource_ref,
+                "arguments": result.tool_arguments,
+            },
             policy_decision=result.policy_decision,
             authorization_result=result.runtime_result,
             runtime_result=result.runtime_result,
@@ -270,6 +285,7 @@ class OsIndependentVerifier(_RuntimeBackedAdapter):
         return VerificationRecord(
             status=status,
             evidence_refs=[
+                *result.evidence_refs,
                 f"runtime:{run_id}:{result.tool}",
                 f"verifier:{tool_verification.verifier}",
             ],

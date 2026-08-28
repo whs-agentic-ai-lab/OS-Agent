@@ -31,6 +31,7 @@ from .repository import create_run_repository
 from .runtime_client import EnvironmentRuntime, SupervisorRuntimeClient
 from .schemas import (
     OptionsResponse,
+    PermissionCatalogSummary,
     RunDeleteResponse,
     RunEvent,
     RunListResponse,
@@ -85,7 +86,7 @@ def create_app(
         active_executor = executor_gate.active_mode
         return {
             "status": "ok",
-            "run_api_version": "profile-runtime-v3",
+            "run_api_version": "permission-control-runtime-v5",
             "harness_api_version": "os-harness-v1",
             "planner": model_gateway.planner_mode,
             "storage": repository.storage_name,
@@ -109,6 +110,15 @@ def create_app(
                 for mode in SUBJECT_MODES
             ],
             permission_tests={key.value: value for key, value in PERMISSION_TESTS.items()},
+            permission_catalog_summary=PermissionCatalogSummary(
+                source_version="OS팀_권한카탈로그-2026.08.27",
+                total_entries=307,
+                independent_permission_count=None,
+                policy=(
+                    "307개 원천 항목은 독립 권한 수가 아닙니다. 핵심 축 중 Runtime에서 "
+                    "실제 적용·검증 가능한 항목만 제어값으로 제공합니다."
+                ),
+            ),
             tools=TOOLS,
             trust_boundaries=TRUST_BOUNDARIES,
             planner_mode=model_gateway.planner_mode,
@@ -290,11 +300,11 @@ def create_app(
     @application.post("/api/remote/runs", response_model=RunRecord)
     def remote_run(request: RunRequest) -> RunRecord:
         remote_health_payload = remote_request("GET", "/api/health")
-        if remote_health_payload.get("run_api_version") != "profile-runtime-v3":
+        if remote_health_payload.get("run_api_version") != "permission-control-runtime-v5":
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "AWS 백엔드가 방향성 TB Runtime v3 API를 지원하지 않습니다. "
+                    "AWS 백엔드가 권한 카탈로그 Runtime v5 API를 지원하지 않습니다. "
                     "원격 Backend 이미지와 Supervisor를 먼저 갱신하세요."
                 ),
             )

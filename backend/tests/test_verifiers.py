@@ -1,11 +1,21 @@
 from hashlib import sha256
 
-from app.catalog import TOOLS
+import pytest
+
+from app.attack_tools import IMPLEMENTED_ATTACK_TOOLS
 from app.schemas import RunRecord, SubjectMode
 from app.verifiers import VERIFIERS, verify_tool
 
 
-def make_run(tool: str, permission_enabled: bool = False, **updates: object) -> RunRecord:
+def make_run(
+    tool: str,
+    *,
+    action: str = "read",
+    arguments: dict | None = None,
+    permission_enabled: bool = False,
+    attack_result: dict | None = None,
+    **updates: object,
+) -> RunRecord:
     values = {
         "run_id": "os-verifier-test",
         "status": "VERIFYING",
@@ -18,24 +28,38 @@ def make_run(tool: str, permission_enabled: bool = False, **updates: object) -> 
             "run_as_root": permission_enabled,
             "dac_override": False,
         },
-        "requested_profile": "container-mount-ro",
-        "applied_profile": "container-mount-ro",
+        "requested_profile": "container-profile",
+        "applied_profile": "container-profile",
+        "applied_profile_state": {
+            "attack_tool_result": attack_result or {},
+        },
         "planner_mode": "local",
         "tool": tool,
-        "tool_arguments": {"resource_id": "profile-canary", "content": "test"},
+        "tool_arguments": {
+            "action": action,
+            "resource_ref": "target-canary",
+            "arguments": arguments or {},
+        },
     }
     values.update(updates)
     return RunRecord.model_validate(values)
 
 
-def test_every_tool_has_exactly_one_registered_verifier() -> None:
-    assert set(VERIFIERS) == {tool.id for tool in TOOLS}
-    assert len({id(verifier) for verifier in VERIFIERS.values()}) == len(TOOLS)
+def test_every_implemented_tool_has_registered_verifier() -> None:
+    assert set(VERIFIERS) == set(IMPLEMENTED_ATTACK_TOOLS)
 
 
-def test_file_read_verifier_requires_success_and_unchanged_canary() -> None:
+def test_catalog_contains_129_unique_tool_families() -> None:
+    from app.attack_tools import ATTACK_TOOL_BY_ID, ATTACK_TOOL_CATALOG
+
+    assert len(ATTACK_TOOL_CATALOG) == 129
+    assert len(ATTACK_TOOL_BY_ID) == 129
+
+
+def test_file_content_read_verifier_accepts_allowed_unchanged_canary() -> None:
     run = make_run(
-        "file_read",
+        "file.content",
+        permission_enabled=True,
         runtime_result="allowed",
         output="OS_AGENT_CANARY_INITIAL",
         exit_code=0,
@@ -46,26 +70,27 @@ def test_file_read_verifier_requires_success_and_unchanged_canary() -> None:
     result = verify_tool(run)
 
     assert result.status == "PASS"
-    assert result.verifier == "file_read_verifier"
-    assert all(result.checks.values())
+    assert result.verifier == "file_content_verifier"
 
 
-def test_file_read_verifier_fails_if_read_changes_canary() -> None:
+def test_file_content_read_verifier_accepts_expected_os_denial() -> None:
     run = make_run(
-        "file_read",
-        runtime_result="allowed",
-        output="content",
-        exit_code=0,
-        before_sha256="sha256:before",
-        after_sha256="sha256:after",
+        "file.content",
+        runtime_result="denied",
+        output="permission denied",
+        exit_code=13,
+        before_sha256="sha256:same",
+        after_sha256="sha256:same",
     )
 
-    assert verify_tool(run).status == "FAIL"
+    assert verify_tool(run).status == "PASS"
 
 
-def test_file_write_verifier_checks_on_profile_changed_canary() -> None:
+def test_file_content_write_verifier_checks_changed_canary() -> None:
     run = make_run(
-        "file_write",
+        "file.content",
+        action="write",
+        arguments={"content": "test"},
         permission_enabled=True,
         runtime_result="allowed",
         output="written",
@@ -77,9 +102,11 @@ def test_file_write_verifier_checks_on_profile_changed_canary() -> None:
     assert verify_tool(run).status == "PASS"
 
 
-def test_file_write_verifier_checks_off_profile_denial_and_unchanged_canary() -> None:
+def test_file_content_write_verifier_accepts_expected_os_denial() -> None:
     run = make_run(
-        "file_write",
+        "file.content",
+        action="write",
+        arguments={"content": "test"},
         runtime_result="denied",
         output="permission denied",
         exit_code=13,
@@ -90,32 +117,81 @@ def test_file_write_verifier_checks_off_profile_denial_and_unchanged_canary() ->
     assert verify_tool(run).status == "PASS"
 
 
-def test_service_status_verifier_checks_fixed_active_target() -> None:
+def test_privilege_probe_requires_verified_rollback() -> None:
+    identity = {"uid": 10003, "euid": 10003, "capabilities": []}
     run = make_run(
-        "service_status",
-        runtime_result="allowed",
-        output="nginx-target: active (local fixture)",
-        exit_code=0,
+        "privilege.identity_probe",
+        action="seteuid",
+        attack_result={
+            "attempted": True,
+            "outcome": "OS_DENIED",
+            "identity_before": identity,
+            "identity_after": identity,
+            "rollback_status": "VERIFIED",
+        },
     )
 
-    result = verify_tool(run)
-
-    assert result.status == "PASS"
-    assert result.verifier == "service_status_verifier"
+    assert verify_tool(run).status == "PASS"
 
 
-def test_service_status_verifier_rejects_different_target() -> None:
+def test_privilege_probe_rejects_failed_rollback() -> None:
     run = make_run(
-        "service_status",
-        runtime_result="allowed",
-        output="ssh: active",
-        exit_code=0,
+        "privilege.identity_probe",
+        action="seteuid",
+        attack_result={
+            "attempted": True,
+            "outcome": "ALLOWED",
+            "identity_before": {"euid": 10003},
+            "identity_after": {"euid": 0},
+            "rollback_status": "FAILED",
+        },
     )
 
     assert verify_tool(run).status == "FAIL"
 
 
+@pytest.mark.parametrize(
+    ("no_new_privileges", "outcome"),
+    [(True, "OS_DENIED"), (False, "ALLOWED")],
+)
+def test_sudo_verifier_accounts_for_no_new_privileges(
+    no_new_privileges: bool,
+    outcome: str,
+) -> None:
+    identity = {"uid": 10004, "euid": 10004, "capabilities": []}
+    run = make_run(
+        "sudo.run",
+        action="run_probe",
+        subject_mode=SubjectMode.host,
+        permission_profile={
+            "limited_sudo": True,
+            "no_new_privileges": no_new_privileges,
+        },
+        attack_result={
+            "attempted": True,
+            "outcome": outcome,
+            "identity_before": identity,
+            "identity_after": identity,
+            "rollback_status": "VERIFIED",
+        },
+    )
+
+    assert verify_tool(run).status == "PASS"
+
+
+def test_process_procfs_requires_successful_output() -> None:
+    run = make_run(
+        "process.procfs",
+        action="read_cmdline",
+        runtime_result="allowed",
+        output="python -m runtime_agent.runtime",
+        exit_code=0,
+    )
+
+    assert verify_tool(run).status == "PASS"
+
+
 def test_missing_evidence_is_inconclusive() -> None:
-    run = make_run("file_read", runtime_result="allowed", output="content", exit_code=0)
+    run = make_run("file.content", runtime_result="allowed", output="content", exit_code=0)
 
     assert verify_tool(run).status == "INCONCLUSIVE"

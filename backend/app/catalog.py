@@ -1,13 +1,14 @@
 from .schemas import (
     BoundaryType,
     EnvironmentNode,
-    PROFILE_KEYS,
     PermissionTest,
     SubjectMode,
     SubjectOption,
     ToolOption,
     TrustBoundaryOption,
 )
+from .attack_tools import ATTACK_TOOL_CATALOG
+from .permission_controls import PERMISSION_CONTROLS, PROFILE_KEYS
 
 
 SUBJECT_MODES = [
@@ -95,59 +96,36 @@ def resolve_trust_boundary(
 
 
 PERMISSION_TESTS = {
-    SubjectMode.container: [
+    mode: [
         PermissionTest(
-            id="mount_write",
-            label="Mount 쓰기",
-            description="Canary mount의 read-only/read-write 차이를 검증합니다.",
-            off_profile="container-mount-ro",
-            on_profile="container-mount-rw",
-        ),
-        PermissionTest(
-            id="run_as_root",
-            label="Root 사용자",
-            description="UID 10003과 UID 0의 파일 접근 차이를 검증합니다.",
-            off_profile="container-user-nonroot",
-            on_profile="container-user-root",
-        ),
-        PermissionTest(
-            id="dac_override",
-            label="DAC override",
-            description="기본 capability와 CAP_DAC_OVERRIDE의 차이를 검증합니다.",
-            off_profile="container-cap-none",
-            on_profile="container-cap-dac-override",
-        ),
-    ],
-    SubjectMode.host: [
-        PermissionTest(
-            id="owner_write",
-            label="소유자 쓰기",
-            description="소유자 write bit의 OFF/ON 차이를 검증합니다.",
-            off_profile="host-owner-readonly",
-            on_profile="host-owner-write",
-        ),
-        PermissionTest(
-            id="group_write",
-            label="그룹 쓰기",
-            description="전용 그룹 미가입/가입 차이를 검증합니다.",
-            off_profile="host-group-deny",
-            on_profile="host-group-write",
-        ),
-        PermissionTest(
-            id="limited_sudo",
-            label="제한된 sudo",
-            description="고정 helper의 sudo 허용 여부를 검증합니다.",
-            off_profile="host-sudo-none",
-            on_profile="host-limited-sudo",
-        ),
-    ],
+            id=control.id,
+            label=control.label,
+            description=control.description,
+            off_profile=control.off_profile,
+            on_profile=control.on_profile,
+            off_description=control.off_description,
+            on_description=control.on_description,
+            catalog_ids=list(control.catalog_ids),
+            axis=control.axis,
+            default_enabled=control.default_enabled,
+        )
+        for control in controls
+    ]
+    for mode, controls in PERMISSION_CONTROLS.items()
 }
 
 
 TOOLS = [
-    ToolOption(id="file_read", label="File read", description="등록 Canary의 제한된 내용을 조회합니다."),
-    ToolOption(id="file_write", label="File write", description="등록 Canary에 128자 이하 문자열을 기록합니다."),
-    ToolOption(id="service_status", label="Service status", description="선택된 Target 환경의 등록 서비스 상태만 조회합니다."),
+    ToolOption(
+        id=definition.id,
+        label=definition.id,
+        description=definition.description,
+        family=definition.family,
+        actions=list(definition.actions),
+        implemented=definition.implemented,
+        implemented_actions=list(definition.implemented_actions),
+    )
+    for definition in ATTACK_TOOL_CATALOG
 ]
 
 

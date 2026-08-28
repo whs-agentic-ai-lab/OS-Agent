@@ -34,6 +34,11 @@ class PermissionTest(BaseModel):
     description: str
     off_profile: str
     on_profile: str
+    off_description: str = ""
+    on_description: str = ""
+    catalog_ids: list[str] = Field(default_factory=list)
+    axis: str = "UNCLASSIFIED"
+    default_enabled: bool = False
 
 
 class SubjectOption(BaseModel):
@@ -47,6 +52,10 @@ class ToolOption(BaseModel):
     id: str
     label: str
     description: str
+    family: str = "legacy"
+    actions: list[str] = Field(default_factory=list)
+    implemented: bool = False
+    implemented_actions: list[str] = Field(default_factory=list)
 
 
 class TrustBoundaryOption(BaseModel):
@@ -59,23 +68,25 @@ class TrustBoundaryOption(BaseModel):
     description: str
 
 
+class PermissionCatalogSummary(BaseModel):
+    source_version: str
+    total_entries: int
+    independent_permission_count: int | None = None
+    policy: str
+
+
 class OptionsResponse(BaseModel):
     subject_modes: list[SubjectOption]
     permission_tests: dict[str, list[PermissionTest]]
     tools: list[ToolOption]
     trust_boundaries: list[TrustBoundaryOption]
+    permission_catalog_summary: PermissionCatalogSummary
     planner_mode: Literal["local", "openrouter"] = "local"
 
 
 class PermissionSelection(BaseModel):
     permission_id: str
     enabled: bool
-
-
-PROFILE_KEYS: dict[SubjectMode, tuple[str, str, str]] = {
-    SubjectMode.container: ("mount_write", "run_as_root", "dac_override"),
-    SubjectMode.host: ("owner_write", "group_write", "limited_sudo"),
-}
 
 
 class RunRequest(BaseModel):
@@ -92,6 +103,8 @@ class RunRequest(BaseModel):
 
     @model_validator(mode="after")
     def normalize_permissions(self) -> "RunRequest":
+        from .permission_controls import PROFILE_DEFAULTS, PROFILE_KEYS
+
         if not self.permission_profile and self.permissions:
             self.permission_profile = {
                 item.permission_id: item.enabled for item in self.permissions
@@ -114,12 +127,23 @@ class RunRequest(BaseModel):
             }
         expected_keys = set(PROFILE_KEYS[self.subject_mode])
         actual_keys = set(self.permission_profile)
-        if actual_keys != expected_keys:
-            missing = ", ".join(sorted(expected_keys - actual_keys)) or "없음"
+        if actual_keys - expected_keys:
             extra = ", ".join(sorted(actual_keys - expected_keys)) or "없음"
             raise ValueError(
-                "권한 프로파일 묶음은 선택 환경의 세 항목을 모두 포함해야 합니다. "
-                f"누락: {missing}; 잘못된 항목: {extra}"
+                "권한 프로파일에 선택 환경과 맞지 않는 항목이 있습니다. "
+                f"잘못된 항목: {extra}"
+            )
+        self.permission_profile = {
+            **PROFILE_DEFAULTS[self.subject_mode],
+            **self.permission_profile,
+        }
+        if (
+            self.subject_mode == SubjectMode.container
+            and self.permission_profile["privileged"]
+            and not self.permission_profile["run_as_root"]
+        ):
+            raise ValueError(
+                "privileged 실험은 UID 축을 고정하기 위해 run_as_root=ON이 필요합니다."
             )
         self.permissions = [
             PermissionSelection(permission_id=key, enabled=self.permission_profile[key])
@@ -148,8 +172,10 @@ class RunEvent(BaseModel):
 
 
 class ToolDecision(BaseModel):
-    name: Literal["file_read", "file_write", "service_status"]
-    arguments: dict[str, Any]
+    name: str
+    action: str
+    resource_ref: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
 
 
 class PermissionRunResult(BaseModel):
@@ -170,6 +196,7 @@ class PermissionRunResult(BaseModel):
 
 class RuntimeDispatchRequest(BaseModel):
     run_id: str
+    action_id: str
     prompt: str
     subject_mode: SubjectMode
     trust_boundary_id: str
@@ -204,10 +231,27 @@ class RuntimeAgentResult(BaseModel):
     applied_profile_state: dict[str, Any]
     runtime_agent: str
     planner_mode: Literal["local", "openrouter"]
-    tool: Literal["file_read", "file_write", "service_status"]
+    action_id: str
+    executor_mode: SubjectMode
+    source: EnvironmentNode
+    target: EnvironmentNode
+    tool: str
+    action: str
+    resource_ref: str
     tool_arguments: dict[str, Any] = Field(default_factory=dict)
     policy_decision: Literal["allowed", "denied"] = "allowed"
     runtime_result: Literal["allowed", "denied", "error"]
+    outcome: Literal["ALLOWED", "OS_DENIED", "ERROR", "POLICY_BLOCKED"]
+    attempted: bool
+    errno: int | None = None
+    escalation_possible: bool = False
+    temporary_changed: bool = False
+    changed: bool = False
+    identity_before: dict[str, Any] = Field(default_factory=dict)
+    identity_reached: dict[str, Any] | None = None
+    identity_after: dict[str, Any] = Field(default_factory=dict)
+    rollback_status: Literal["NOT_REQUIRED", "VERIFIED", "FAILED"] = "NOT_REQUIRED"
+    evidence_refs: list[str] = Field(default_factory=list)
     output: str
     exit_code: int
     before_sha256: str | None = None

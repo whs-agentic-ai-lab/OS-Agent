@@ -133,7 +133,7 @@ export function HarnessPanel({
       || isLiveStatusLoading
       || !liveStatus?.ready
       || !trustBoundaryId
-      || Object.keys(permissionProfile).length !== 3
+      || Object.keys(permissionProfile).length === 0
     ) return;
     setIsRunning(true);
     setRun(null);
@@ -231,7 +231,7 @@ export function HarnessPanel({
                 || !liveStatus?.ready
                 || !trustBoundaryId
                 || !objective.trim()
-                || Object.keys(permissionProfile).length !== 3
+                || Object.keys(permissionProfile).length === 0
               }
               onClick={submitLiveRun}
               type="button"
