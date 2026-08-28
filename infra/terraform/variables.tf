@@ -32,8 +32,8 @@ variable "environment_id" {
   default     = "trial-0826"
 
   validation {
-    condition     = can(regex("^[a-z0-9][a-z0-9-]{2,18}$", var.environment_id))
-    error_message = "environment_id는 3~19자의 영문 소문자, 숫자, 하이픈이어야 합니다."
+    condition     = can(regex("^[a-z0-9][a-z0-9-]{2,62}[a-z0-9]$", var.environment_id))
+    error_message = "environment_id는 4~64자의 영문 소문자, 숫자, 하이픈이어야 합니다."
   }
 }
 

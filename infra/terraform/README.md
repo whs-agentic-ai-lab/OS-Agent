@@ -103,12 +103,14 @@ Docker/apt repository 패키지는 이 구성에서 새로 설치되므로 완�
 파일은 삭제하거나 migrate하지 말고 별도 보관한다. 이 모듈의 local backend는 기존 기본
 state와 분리된 `terraform-0826.tfstate`만 사용한다. 실제 AWS resource prefix는
 `<project_name>-<environment_id>`이며 조합은 40자 이하여야 한다. `confirm_new_state=true`는
-이 확인을 마친 경우에만 설정한다.
+이 확인을 마친 경우에만 설정한다. 대시보드 컨트롤러는 모든 stateful 명령에 환경별
+`-state` 경로를 전달하며, backend block은 기존 state를 자동 migrate하지 않도록 기본
+local 경로를 유지한다.
 
 첫 배포는 ECR과 digest 이미지 사이에 의도적인 2단계가 있다.
 
 ```powershell
-# 0) 먼저 초기화하고 현재 디렉터리의 state가 비어 있는지 확인한다.
+# 0) 기본 local backend를 migrate 없이 초기화한다.
 terraform init -reconfigure -input=false
 if (Test-Path -LiteralPath './terraform-0826.tfstate') {
   $existingResources = @(terraform state list)

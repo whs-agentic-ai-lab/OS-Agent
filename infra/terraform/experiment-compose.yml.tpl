@@ -1,6 +1,37 @@
 name: os-agent-experiment
 
 services:
+  runtime:
+    image: ${runtime_image_uri}
+    container_name: os-agent-runtime
+    init: true
+    restart: unless-stopped
+    user: "10003:10003"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    group_add:
+      - "${supervisor_gid}"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    volumes:
+      - /run/os-agent:/run/os-agent:rw
+    environment:
+      HOST_SUPERVISOR_SOCKET: /run/os-agent/host-supervisor.sock
+      OS_AGENT_TOPOLOGY_REVISION: ${topology_revision}
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+
   container1:
     image: ${container1_image_uri}
     container_name: os-agent-container1

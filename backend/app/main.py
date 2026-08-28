@@ -24,7 +24,6 @@ from .harness import (
     HarnessRunRequest,
     HarnessStatus,
     InMemoryHarnessRunRepository,
-    create_fixture_harness_components,
     create_os_harness_components,
 )
 from .repository import create_run_repository
@@ -32,6 +31,7 @@ from .runtime_client import EnvironmentRuntime, SupervisorRuntimeClient
 from .schemas import (
     OptionsResponse,
     PermissionCatalogSummary,
+    PlannerModelOption,
     RunDeleteResponse,
     RunEvent,
     RunListResponse,
@@ -63,11 +63,6 @@ def create_app(
         harness_components or create_os_harness_components(active_runtime, model_gateway),
         harness_repository,
     )
-    fixture_harness_repository = InMemoryHarnessRunRepository()
-    fixture_harness_coordinator = HarnessCoordinator(
-        create_fixture_harness_components(),
-        fixture_harness_repository,
-    )
     deployment_manager = DeploymentManager(active_settings)
     tunnel_manager = SsmTunnelManager(active_settings)
 
@@ -86,7 +81,7 @@ def create_app(
         active_executor = executor_gate.active_mode
         return {
             "status": "ok",
-            "run_api_version": "permission-control-runtime-v5",
+            "run_api_version": "permission-control-runtime-v6",
             "harness_api_version": "os-harness-v1",
             "planner": model_gateway.planner_mode,
             "storage": repository.storage_name,
@@ -122,6 +117,23 @@ def create_app(
             tools=TOOLS,
             trust_boundaries=TRUST_BOUNDARIES,
             planner_mode=model_gateway.planner_mode,
+            planner_models=[
+                PlannerModelOption(
+                    id="deepseek/deepseek-v4-flash-0731",
+                    label="DeepSeek V4 Flash",
+                    description="비용 효율이 높은 기본 Tool Call 모델",
+                ),
+                PlannerModelOption(
+                    id="z-ai/glm-5.3-flash",
+                    label="GLM-5.3-Flash",
+                    description="긴 코딩·에이전트 작업 균형형 모델",
+                ),
+                PlannerModelOption(
+                    id="openai/gpt-5-mini",
+                    label="GPT-5 Mini",
+                    description="중요 Tool Call의 지시 준수 우선 모델",
+                ),
+            ],
         )
 
     @application.get("/api/harness/status", response_model=HarnessStatus)
@@ -141,32 +153,6 @@ def create_app(
         run = harness_repository.get(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Harness 실행 기록을 찾을 수 없습니다.")
-        return run
-
-    @application.get("/api/harness/fixtures/status", response_model=HarnessStatus)
-    def fixture_harness_status() -> HarnessStatus:
-        return fixture_harness_coordinator.get_status()
-
-    @application.post(
-        "/api/harness/fixture-runs",
-        response_model=HarnessRunRecord,
-    )
-    def create_fixture_harness_run(
-        request: HarnessRunRequest,
-    ) -> HarnessRunRecord:
-        return fixture_harness_coordinator.run(request)
-
-    @application.get(
-        "/api/harness/fixture-runs/{run_id}",
-        response_model=HarnessRunRecord,
-    )
-    def get_fixture_harness_run(run_id: str) -> HarnessRunRecord:
-        run = fixture_harness_repository.get(run_id)
-        if run is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Fixture Harness 실행 기록을 찾을 수 없습니다.",
-            )
         return run
 
     @application.get("/api/deployments/current", response_model=DeploymentStatus)
@@ -300,7 +286,7 @@ def create_app(
     @application.post("/api/remote/runs", response_model=RunRecord)
     def remote_run(request: RunRequest) -> RunRecord:
         remote_health_payload = remote_request("GET", "/api/health")
-        if remote_health_payload.get("run_api_version") != "permission-control-runtime-v5":
+        if remote_health_payload.get("run_api_version") != "permission-control-runtime-v6":
             raise HTTPException(
                 status_code=409,
                 detail=(

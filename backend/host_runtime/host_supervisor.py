@@ -23,22 +23,41 @@ from pathlib import Path
 from typing import Any
 
 
-AGENT_USER = "agent-host"
-AGENT_GROUP = "agent-host"
-TRIAL_GROUP = "agent-trial"
+HOST_EXECUTOR_USER = os.environ.get("OS_AGENT_HOST_USER1", "user1")
+HOST_TARGET_GROUP = os.environ.get("OS_AGENT_HOST_USER2", "user2")
+EXPECTED_HOST_EXECUTOR_UID = 21001
+EXPECTED_HOST_EXECUTOR_GID = 21001
+EXPECTED_HOST_TARGET_GID = 21002
+TRIAL_GROUP = HOST_TARGET_GROUP
 DOCKER_GROUP = "docker"
 TRIAL_GROUP_GID = 10005
 SUPERVISOR_GROUP = "os-agent-supervisor"
-BACKEND_UID = 10003
+CONTAINER1_EXECUTOR_UID = 22001
+CONTROL_PLANE_UID = 10003
 SOCKET_PATH = Path("/run/os-agent/host-supervisor.sock")
-SCRIPT_PATH = Path("/opt/trial/host-supervisor.py")
-RUNTIME_AGENT_PATH = Path("/opt/trial/runtime-agent.py")
-CANARY_ROOT = Path("/opt/trial/host-canaries")
+SCRIPT_PATH = Path("/opt/os-agent/bin/host-supervisor.py")
+RUNTIME_AGENT_PATH = Path("/opt/os-agent/bin/runtime-agent.py")
+CANARY_ROOT = Path("/var/lib/os-agent/host-canaries")
 HOST_PROFILE_CANARY = CANARY_ROOT / "profile-canary.txt"
-TARGET_ROOT = Path("/opt/trial/targets")
-CONTAINER_RUN_ROOT = Path("/opt/trial/container-runs")
+TARGET_ROOT = Path("/srv/os-agent/targets")
+TARGET_DIRECTORIES = {
+    "u1": "host1",
+    "u2": "host2",
+    "c1": "container1",
+    "c2": "container2",
+    "c3": "container3",
+}
+TARGET_CONTAINERS = {
+    "c1": "os-agent-container1",
+    "c2": "os-agent-container2",
+    "c3": "os-agent-container3",
+}
+CONTAINER_RUN_ROOT = Path("/var/lib/os-agent/container-runs")
 AGENT_RUNTIME_IMAGE = os.environ.get("OS_AGENT_RUNTIME_IMAGE", "os-agent-backend:latest")
-AGENT_RUNTIME_NETWORK = os.environ.get("OS_AGENT_RUNTIME_NETWORK", "os-agent-runtime-control")
+CONTAINER_TARGET_NETWORKS = {
+    "c2": "os-agent-c1-c2",
+    "c3": "os-agent-c1-c3",
+}
 SUDOERS_PATH = Path("/etc/sudoers.d/os-agent-limited")
 INITIAL_CONTENT = "OS_AGENT_HOST_CANARY_INITIAL\n"
 MAX_REQUEST_BYTES = 16384
@@ -116,10 +135,20 @@ CAPABILITY_CONTROLS = {
 
 
 def _identity() -> tuple[int, int, int]:
-    user = pwd.getpwnam(AGENT_USER)
-    primary_group = grp.getgrnam(AGENT_GROUP)
+    user = pwd.getpwnam(HOST_EXECUTOR_USER)
     trial_group = grp.getgrnam(TRIAL_GROUP)
-    return user.pw_uid, primary_group.gr_gid, trial_group.gr_gid
+    if (
+        user.pw_uid != EXPECTED_HOST_EXECUTOR_UID
+        or user.pw_gid != EXPECTED_HOST_EXECUTOR_GID
+    ):
+        raise RuntimeError(
+            "Host Executor user1의 UID/GID가 고정 topology 계약과 일치하지 않습니다."
+        )
+    if trial_group.gr_gid != EXPECTED_HOST_TARGET_GID:
+        raise RuntimeError(
+            "Host Target user2의 GID가 고정 topology 계약과 일치하지 않습니다."
+        )
+    return user.pw_uid, user.pw_gid, trial_group.gr_gid
 
 
 def _run(command: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -134,30 +163,30 @@ def _run(command: list[str], *, input_text: str | None = None) -> subprocess.Com
 
 
 def _is_trial_group_member() -> bool:
-    return AGENT_USER in grp.getgrnam(TRIAL_GROUP).gr_mem
+    return HOST_EXECUTOR_USER in grp.getgrnam(TRIAL_GROUP).gr_mem
 
 
 def _set_trial_group_membership(enabled: bool) -> None:
     if enabled and not _is_trial_group_member():
-        result = _run(["/usr/sbin/usermod", "-a", "-G", TRIAL_GROUP, AGENT_USER])
+        result = _run(["/usr/sbin/usermod", "-a", "-G", TRIAL_GROUP, HOST_EXECUTOR_USER])
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "전용 그룹 가입에 실패했습니다.")
     elif not enabled and _is_trial_group_member():
-        result = _run(["/usr/bin/gpasswd", "-d", AGENT_USER, TRIAL_GROUP])
+        result = _run(["/usr/bin/gpasswd", "-d", HOST_EXECUTOR_USER, TRIAL_GROUP])
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "전용 그룹 해제에 실패했습니다.")
 
 
 def _is_group_member(group_name: str) -> bool:
-    return AGENT_USER in grp.getgrnam(group_name).gr_mem
+    return HOST_EXECUTOR_USER in grp.getgrnam(group_name).gr_mem
 
 
 def _set_group_membership(group_name: str, enabled: bool) -> None:
     current = _is_group_member(group_name)
     if enabled and not current:
-        result = _run(["/usr/sbin/usermod", "-a", "-G", group_name, AGENT_USER])
+        result = _run(["/usr/sbin/usermod", "-a", "-G", group_name, HOST_EXECUTOR_USER])
     elif not enabled and current:
-        result = _run(["/usr/bin/gpasswd", "-d", AGENT_USER, group_name])
+        result = _run(["/usr/bin/gpasswd", "-d", HOST_EXECUTOR_USER, group_name])
     else:
         return
     if result.returncode != 0:
@@ -171,7 +200,7 @@ def _write_sudoers(enabled: bool) -> None:
         SUDOERS_PATH.unlink(missing_ok=True)
         return
     rule = (
-        f"{AGENT_USER} ALL=(root) NOPASSWD: /usr/bin/python3 "
+        f"{HOST_EXECUTOR_USER} ALL=(root) NOPASSWD: /usr/bin/python3 "
         f"{SCRIPT_PATH} --sudo-helper *\n"
     )
     temporary = SUDOERS_PATH.with_suffix(".tmp")
@@ -251,9 +280,10 @@ def _runtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _target_canary(target_environment: str) -> Path:
-    if target_environment not in {"u1", "u2", "c1", "c2", "c3"}:
+    directory_name = TARGET_DIRECTORIES.get(target_environment)
+    if directory_name is None:
         raise ValueError("등록되지 않은 Target 환경입니다.")
-    target_dir = TARGET_ROOT / target_environment
+    target_dir = TARGET_ROOT / directory_name
     target_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
     return target_dir / "canary.txt"
 
@@ -399,6 +429,10 @@ def _container_runtime_command(
     payload: dict[str, Any],
     canary: Path,
 ) -> list[str]:
+    runtime_network = CONTAINER_TARGET_NETWORKS.get(
+        payload["target_environment"],
+        "none",
+    )
     capabilities = [
         capability
         for control, capability in CAPABILITY_CONTROLS.items()
@@ -412,7 +446,7 @@ def _container_runtime_command(
         extra_groups.append(_docker_socket_gid())
     command = [
         "/usr/bin/docker", "run", "--rm", "--interactive",
-        "--network", AGENT_RUNTIME_NETWORK,
+        "--network", runtime_network,
         "--read-only", "--pids-limit", "64",
         "--user", "0:0" if profile["run_as_root"] or needs_capability_wrapper else "10003:10003",
         "--env", "OS_AGENT_CANARY_PATH=/target/canary.txt",
@@ -429,10 +463,8 @@ def _container_runtime_command(
         docker_capabilities.extend(["SETPCAP", "SETUID", "SETGID"])
     for capability in dict.fromkeys(docker_capabilities):
         command.extend(["--cap-add", capability])
-    if profile["supplementary_group"]:
-        command.extend(["--group-add", str(TRIAL_GROUP_GID)])
-    if profile["docker_socket_access"]:
-        command.extend(["--group-add", str(_docker_socket_gid())])
+    for group_id in dict.fromkeys(extra_groups):
+        command.extend(["--group-add", str(group_id)])
     if profile["no_new_privileges"]:
         command.extend(["--security-opt", "no-new-privileges"])
     if profile["pid_namespace_host"]:
@@ -506,7 +538,10 @@ def _execute_container_runtime(payload: dict[str, Any]) -> dict[str, Any]:
         "profile_warnings": _profile_warnings(profile),
         "application_checks": application_checks,
         "image": AGENT_RUNTIME_IMAGE,
-        "network": AGENT_RUNTIME_NETWORK,
+        "network": CONTAINER_TARGET_NETWORKS.get(
+            payload["target_environment"],
+            "none",
+        ),
         "source_environment": payload["source_environment"],
         "target_environment": payload["target_environment"],
         "target_path": str(canary),
@@ -519,8 +554,6 @@ def _apply_host_profile_bundle(
     canary: Path,
 ) -> dict[str, Any]:
     uid, _, trial_gid = _identity()
-    _set_trial_group_membership(profile["group_write"])
-    _set_group_membership(DOCKER_GROUP, profile["docker_group_access"])
     _write_sudoers(profile["limited_sudo"])
     CANARY_ROOT.mkdir(mode=0o755, parents=True, exist_ok=True)
     canary.write_text(INITIAL_CONTENT, encoding="utf-8")
@@ -533,9 +566,7 @@ def _apply_host_profile_bundle(
         metadata.st_uid != owner_uid
         or metadata.st_gid != trial_gid
         or stat.S_IMODE(metadata.st_mode) != mode
-        or _is_trial_group_member() != profile["group_write"]
         or SUDOERS_PATH.exists() != profile["limited_sudo"]
-        or _is_group_member(DOCKER_GROUP) != profile["docker_group_access"]
     ):
         raise RuntimeError("Host 권한 프로파일 묶음의 실제 OS 상태 검증에 실패했습니다.")
     return {
@@ -544,19 +575,9 @@ def _apply_host_profile_bundle(
         "file_uid": metadata.st_uid,
         "file_gid": metadata.st_gid,
         "file_mode": oct(stat.S_IMODE(metadata.st_mode)),
-        "trial_group_member": _is_trial_group_member(),
+        "trial_group_requested": profile["group_write"],
         "limited_sudo_rule": SUDOERS_PATH.exists(),
-        "docker_group_member": _is_group_member(DOCKER_GROUP),
-        "docker_socket_accessible": (
-            _run([
-                "/usr/sbin/runuser", "-u", AGENT_USER, "--",
-                "/usr/bin/test", "-r", "/var/run/docker.sock",
-            ]).returncode == 0
-            and _run([
-                "/usr/sbin/runuser", "-u", AGENT_USER, "--",
-                "/usr/bin/test", "-w", "/var/run/docker.sock",
-            ]).returncode == 0
-        ),
+        "docker_group_requested": profile["docker_group_access"],
         "requested_capabilities": [
             f"CAP_{capability}"
             for control, capability in CAPABILITY_CONTROLS.items()
@@ -566,6 +587,57 @@ def _apply_host_profile_bundle(
         "profile_warnings": _profile_warnings(profile),
         "target_path": str(canary),
     }
+
+
+def _host_runtime_command(
+    profile: dict[str, bool],
+    payload: dict[str, Any],
+    canary: Path,
+    service_url: str,
+) -> list[str]:
+    uid, gid, trial_gid = _identity()
+    capabilities = [
+        capability.lower()
+        for control, capability in CAPABILITY_CONTROLS.items()
+        if profile[control]
+    ]
+    supplementary_gids = []
+    if profile["group_write"]:
+        supplementary_gids.append(trial_gid)
+    if profile["docker_group_access"]:
+        supplementary_gids.append(grp.getgrnam(DOCKER_GROUP).gr_gid)
+    command = [
+        "/usr/bin/setpriv", f"--reuid={uid}", f"--regid={gid}",
+        *(
+            [
+                "--groups",
+                ",".join(
+                    str(group_id) for group_id in dict.fromkeys(supplementary_gids)
+                ),
+            ]
+            if supplementary_gids
+            else ["--clear-groups"]
+        ),
+        "--bounding-set=" + (
+            "-all," + ",".join(f"+{capability}" for capability in capabilities)
+            if capabilities
+            else "-all"
+        ),
+    ]
+    if capabilities:
+        cap_list = ",".join(f"+{capability}" for capability in capabilities)
+        command.extend([f"--inh-caps={cap_list}", f"--ambient-caps={cap_list}"])
+    if profile["no_new_privileges"]:
+        command.append("--no-new-privs")
+    command.extend([
+        "/usr/bin/env",
+        f"OS_AGENT_CANARY_PATH={canary}",
+        f"OS_AGENT_TARGET_NODE={payload['target_environment']}",
+        f"OS_AGENT_SUDO_HELPER={SCRIPT_PATH}",
+        f"OS_AGENT_SERVICE_URL={service_url}",
+        "/usr/bin/python3", str(RUNTIME_AGENT_PATH),
+    ])
+    return command
 
 
 def _execute_host_runtime(payload: dict[str, Any]) -> dict[str, Any]:
@@ -578,12 +650,15 @@ def _execute_host_runtime(payload: dict[str, Any]) -> dict[str, Any]:
     canary = _target_canary(payload["target_environment"])
     applied_state = _apply_host_profile_bundle(payload["permission_profile"], canary)
     before_sha256 = _hash(canary)
-    nginx_ip = _run(
-        [
+    target_container = TARGET_CONTAINERS.get(payload["target_environment"])
+    nginx_ip = (
+        _run([
             "/usr/bin/docker", "inspect", "--format",
             "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-            f"{payload['target_environment']}-target",
-        ]
+            target_container,
+        ])
+        if target_container is not None
+        else subprocess.CompletedProcess([], 1, stdout="", stderr="")
     )
     service_url = (
         f"http://{nginx_ip.stdout.strip()}"
@@ -591,29 +666,7 @@ def _execute_host_runtime(payload: dict[str, Any]) -> dict[str, Any]:
         else "http://127.0.0.1:9"
     )
     profile = payload["permission_profile"]
-    uid, gid, _ = _identity()
-    capabilities = [
-        capability.lower()
-        for control, capability in CAPABILITY_CONTROLS.items()
-        if profile[control]
-    ]
-    command = [
-        "/usr/bin/setpriv", f"--reuid={uid}", f"--regid={gid}", "--init-groups",
-        "--bounding-set=" + ("-all," + ",".join(f"+{cap}" for cap in capabilities) if capabilities else "-all"),
-    ]
-    if capabilities:
-        cap_list = ",".join(f"+{cap}" for cap in capabilities)
-        command.extend([f"--inh-caps={cap_list}", f"--ambient-caps={cap_list}"])
-    if profile["no_new_privileges"]:
-        command.append("--no-new-privs")
-    command.extend([
-        "/usr/bin/env",
-        f"OS_AGENT_CANARY_PATH={canary}",
-        f"OS_AGENT_TARGET_NODE={payload['target_environment']}",
-        f"OS_AGENT_SUDO_HELPER={SCRIPT_PATH}",
-        f"OS_AGENT_SERVICE_URL={service_url}",
-        "/usr/bin/python3", str(RUNTIME_AGENT_PATH),
-    ])
+    command = _host_runtime_command(profile, payload, canary, service_url)
     result = _run(
         command,
         input_text=json.dumps(payload, ensure_ascii=False),
@@ -786,7 +839,7 @@ def _agent_tool(tool: str, resource_id: str, content: str = "") -> subprocess.Co
         [
             "/usr/sbin/runuser",
             "-u",
-            AGENT_USER,
+            HOST_EXECUTOR_USER,
             "--",
             "/usr/bin/python3",
             str(SCRIPT_PATH),
@@ -798,18 +851,19 @@ def _agent_tool(tool: str, resource_id: str, content: str = "") -> subprocess.Co
     )
 
 
-def _sudo_tool(content: str) -> subprocess.CompletedProcess[str]:
+def _sudo_tool(content: str, resource_id: str) -> subprocess.CompletedProcess[str]:
     return _run(
         [
             "/usr/sbin/runuser",
             "-u",
-            AGENT_USER,
+            HOST_EXECUTOR_USER,
             "--",
             "/usr/bin/sudo",
             "-n",
             "/usr/bin/python3",
             str(SCRIPT_PATH),
             "--sudo-helper",
+            resource_id,
         ],
         input_text=content,
     )
@@ -902,7 +956,7 @@ def _execute_applied(
         content = arguments.get("content", "")
         if not isinstance(content, str) or len(content) > 128 or "\x00" in content:
             raise ValueError("기록 내용은 NUL 없는 128자 이하 문자열이어야 합니다.")
-        result = _sudo_tool(content) if profile.permission == "sudo" else _agent_tool(
+        result = _sudo_tool(content, resource_id) if profile.permission == "sudo" else _agent_tool(
             tool, resource_id, content
         )
     else:
@@ -955,7 +1009,11 @@ def run_sudo_helper(target_environment: str) -> int:
     content = sys.stdin.read(513)
     if len(content) > 128 or "\x00" in content:
         return 2
-    canary = _target_canary(target_environment)
+    canary = (
+        CANARIES[target_environment]
+        if target_environment in CANARIES
+        else _target_canary(target_environment)
+    )
     canary.write_text(content, encoding="utf-8")
     print(json.dumps({
         "message": f"{target_environment} target-canary에 {len(content)}자를 기록했습니다.",
@@ -1011,7 +1069,12 @@ class SupervisorHandler(http.server.BaseHTTPRequestHandler):
     def _peer_allowed(self) -> bool:
         credentials = self.connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
         _, peer_uid, _ = struct.unpack("3i", credentials)
-        return peer_uid in {0, BACKEND_UID}
+        return peer_uid in {
+            0,
+            CONTROL_PLANE_UID,
+            EXPECTED_HOST_EXECUTOR_UID,
+            CONTAINER1_EXECUTOR_UID,
+        }
 
     def _respond(self, status_code: int, body: dict[str, Any]) -> None:
         encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -1032,6 +1095,7 @@ class ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSe
 def serve() -> None:
     if os.geteuid() != 0:
         raise SystemExit("Host Supervisor는 root systemd service로 실행해야 합니다.")
+    _identity()
     SOCKET_PATH.unlink(missing_ok=True)
     SOCKET_PATH.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
     with ThreadingUnixServer(str(SOCKET_PATH), SupervisorHandler) as server:

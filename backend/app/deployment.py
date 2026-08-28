@@ -59,6 +59,8 @@ class EnvironmentContext(BaseModel):
     created_by: str
     owner_arn: str
     account_id: str
+    base_ami_id: str | None = None
+    image_digests: dict[str, str] = Field(default_factory=dict)
 
 
 class AwsInstanceSummary(BaseModel):
@@ -102,6 +104,18 @@ class DeploymentManager:
 
     FLOW_LOG_GROUP_ADDRESS = "aws_cloudwatch_log_group.vpc_flow_logs[0]"
     ENVIRONMENT_ID_PATTERN = re.compile(r"os-agent-test(?:-[a-z0-9]+)*")
+    UBUNTU_AMI_PARAMETER = (
+        "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/"
+        "hvm/ebs-gp3/ami-id"
+    )
+    VECTOR_ARCHIVE_SHA256 = (
+        "4d156e6859e235b366f5b77121ae59d5440c93acab215c45f30f3fc839d20f65"
+    )
+    IMAGE_DOCKERFILES = {
+        "runtime": Path("Dockerfile"),
+        "container1": Path("container_images/container1/Dockerfile"),
+        "target": Path("container_images/target/Dockerfile"),
+    }
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -399,7 +413,7 @@ class DeploymentManager:
         try:
             terraform = self._required_executable("terraform")
             self._command(
-                [terraform, "init", "-input=false"],
+                [terraform, "init", "-reconfigure", "-input=false"],
                 self.settings.terraform_dir,
             )
             self._succeed("고정 Terraform 작업 디렉터리 초기화가 완료되었습니다.")
@@ -413,11 +427,52 @@ class DeploymentManager:
             terraform_dir = self.settings.terraform_dir
             state_path = self._state_path(environment_id, create=False)
             environment = self._load_environment_context(environment_id)
-            placeholder_image = (
-                f"000000000000.dkr.ecr.{self.settings.aws_region}.amazonaws.com/"
-                f"{environment_id}-backend:destroy"
+            self._command(
+                [terraform, "init", "-reconfigure", "-input=false"], terraform_dir
             )
-            self._command([terraform, "init", "-input=false"], terraform_dir)
+            if not state_path.is_file():
+                self._delete_orphaned_flow_log_group(aws, environment_id)
+                self._succeed(f"{environment_id} 환경에는 삭제할 Terraform 리소스가 없습니다.")
+                return
+            state_resources = self._capture(
+                [terraform, "state", "list", f"-state={state_path}"],
+                terraform_dir,
+                log_output=False,
+            ).splitlines()
+            if not state_resources:
+                self._delete_orphaned_flow_log_group(aws, environment_id)
+                self._succeed(f"{environment_id} 환경에는 삭제할 Terraform 리소스가 없습니다.")
+                return
+            missing_images = set(self.IMAGE_DOCKERFILES) - set(environment.image_digests)
+            if missing_images:
+                if "aws_instance.trial" in state_resources:
+                    raise RuntimeError(
+                        "EC2가 있는 환경의 image digest metadata가 없어 안전하게 삭제할 수 없습니다."
+                    )
+                targets = []
+                if any(item.startswith("aws_ecr_repository.images") for item in state_resources):
+                    targets.append("-target=aws_ecr_repository.images")
+                if self.FLOW_LOG_GROUP_ADDRESS in state_resources:
+                    targets.append(f"-target={self.FLOW_LOG_GROUP_ADDRESS}")
+                if targets:
+                    self._command(
+                        [
+                            terraform,
+                            "destroy",
+                            f"-state={state_path}",
+                            "-auto-approve",
+                            "-input=false",
+                            *targets,
+                            *self._terraform_variable_args(environment),
+                            *self._terraform_runtime_args(
+                                environment, require_images=False
+                            ),
+                        ],
+                        terraform_dir,
+                    )
+                self._delete_orphaned_flow_log_group(aws, environment_id)
+                self._succeed(f"{environment_id} 부분 배포 환경 삭제가 완료되었습니다.")
+                return
             self._command(
                 [
                     terraform,
@@ -425,8 +480,8 @@ class DeploymentManager:
                     f"-state={state_path}",
                     "-auto-approve",
                     "-input=false",
-                    f"-var=backend_image_uri={placeholder_image}",
                     *self._terraform_variable_args(environment),
+                    *self._terraform_runtime_args(environment),
                 ],
                 terraform_dir,
             )
@@ -442,10 +497,13 @@ class DeploymentManager:
             docker = self._required_executable("docker")
             terraform_dir = self.settings.terraform_dir
             state_path = self._state_path(environment.environment_id, create=True)
-            variable_args = self._terraform_variable_args(environment)
+            environment.base_ami_id = self._resolve_base_ami_id(aws)
             self._save_environment_context(environment)
+            variable_args = self._terraform_variable_args(environment)
 
-            self._command([terraform, "init", "-input=false"], terraform_dir)
+            self._command(
+                [terraform, "init", "-reconfigure", "-input=false"], terraform_dir
+            )
             self._reconcile_flow_log_group(
                 terraform,
                 aws,
@@ -460,25 +518,26 @@ class DeploymentManager:
                     f"-state={state_path}",
                     "-auto-approve",
                     "-input=false",
-                    "-target=aws_ecr_repository.agent_backend",
+                    "-target=aws_ecr_repository.images",
                     *variable_args,
+                    *self._terraform_runtime_args(environment, require_images=False),
                 ],
                 terraform_dir,
             )
-            repository_url = self._capture(
+            repository_urls = json.loads(self._capture(
                 [
                     terraform,
                     "output",
                     f"-state={state_path}",
-                    "-raw",
-                    "backend_ecr_repository_url",
+                    "-json",
+                    "ecr_repository_urls",
                 ],
                 terraform_dir,
-            ).strip()
-            registry = repository_url.split("/", 1)[0]
+            ))
+            if set(repository_urls) != set(self.IMAGE_DOCKERFILES):
+                raise RuntimeError("Terraform ECR 출력이 runtime/container1/target 계약과 다릅니다.")
+            registry = str(repository_urls["runtime"]).split("/", 1)[0]
             tag = datetime.now(timezone.utc).strftime("dashboard-%Y%m%d%H%M%S")
-            local_image = f"{environment.environment_id}-backend:{tag}"
-            remote_image = f"{repository_url}:{tag}"
 
             password = self._capture(
                 [
@@ -499,12 +558,38 @@ class DeploymentManager:
                 input_text=password,
                 log_output=False,
             )
-            self._command(
-                [docker, "build", "--tag", local_image, "."],
-                self.settings.backend_context,
-            )
-            self._command([docker, "tag", local_image, remote_image], self.settings.backend_context)
-            self._command([docker, "push", remote_image], self.settings.backend_context)
+            image_digests: dict[str, str] = {}
+            for component, dockerfile in self.IMAGE_DOCKERFILES.items():
+                repository_url = str(repository_urls[component])
+                local_image = f"{environment.environment_id}-{component}:{tag}"
+                remote_image = f"{repository_url}:{tag}"
+                self._command(
+                    [
+                        docker,
+                        "build",
+                        "--platform",
+                        "linux/amd64",
+                        "--file",
+                        str(self.settings.backend_context / dockerfile),
+                        "--tag",
+                        local_image,
+                        ".",
+                    ],
+                    self.settings.backend_context,
+                )
+                self._command(
+                    [docker, "tag", local_image, remote_image],
+                    self.settings.backend_context,
+                )
+                self._command(
+                    [docker, "push", remote_image], self.settings.backend_context
+                )
+                image_digests[component] = self._resolve_ecr_digest(
+                    aws, repository_url, tag
+                )
+
+            environment.image_digests = image_digests
+            self._save_environment_context(environment)
             self._command(
                 [
                     terraform,
@@ -512,8 +597,8 @@ class DeploymentManager:
                     f"-state={state_path}",
                     "-auto-approve",
                     "-input=false",
-                    f"-var=backend_image_uri={remote_image}",
                     *variable_args,
+                    *self._terraform_runtime_args(environment),
                 ],
                 terraform_dir,
             )
@@ -742,14 +827,92 @@ class DeploymentManager:
             account_id="unknown",
         )
 
-    @staticmethod
-    def _terraform_variable_args(environment: EnvironmentContext) -> list[str]:
+    def _terraform_variable_args(self, environment: EnvironmentContext) -> list[str]:
         return [
-            f"-var=project_name={environment.environment_id}",
+            "-var=project_name=os-agent",
             f"-var=environment_id={environment.environment_id}",
             f"-var=created_by={environment.created_by}",
             f"-var=owner_arn={environment.owner_arn}",
+            f"-var=aws_profile={self.settings.aws_profile}",
+            "-var=confirm_new_state=true",
         ]
+
+    def _terraform_runtime_args(
+        self,
+        environment: EnvironmentContext,
+        *,
+        require_images: bool = True,
+    ) -> list[str]:
+        if not environment.base_ami_id:
+            if require_images:
+                raise RuntimeError("환경 metadata에 고정 Ubuntu AMI ID가 없습니다.")
+            base_ami_id = ""
+        else:
+            base_ami_id = environment.base_ami_id
+        missing = set(self.IMAGE_DOCKERFILES) - set(environment.image_digests)
+        if require_images and missing:
+            raise RuntimeError(
+                "환경 metadata에 이미지 digest가 없습니다: " + ", ".join(sorted(missing))
+            )
+        return [
+            f"-var=base_ami_id={base_ami_id}",
+            f"-var=vector_archive_sha256={self.VECTOR_ARCHIVE_SHA256}",
+            *[
+                f"-var={component}_image_digest={environment.image_digests.get(component, '')}"
+                for component in self.IMAGE_DOCKERFILES
+            ],
+        ]
+
+    def _resolve_base_ami_id(self, aws: str) -> str:
+        ami_id = self._capture(
+            [
+                aws,
+                "ssm",
+                "get-parameter",
+                "--name",
+                self.UBUNTU_AMI_PARAMETER,
+                "--query",
+                "Parameter.Value",
+                "--output",
+                "text",
+                "--region",
+                self.settings.aws_region,
+                "--profile",
+                self.settings.aws_profile,
+            ],
+            self.settings.backend_context,
+            log_output=False,
+        ).strip()
+        if re.fullmatch(r"ami-[0-9a-f]+", ami_id) is None:
+            raise RuntimeError("AWS 공식 Ubuntu 24.04 AMI ID 조회 결과가 올바르지 않습니다.")
+        return ami_id
+
+    def _resolve_ecr_digest(self, aws: str, repository_url: str, tag: str) -> str:
+        repository_name = repository_url.split("/", 1)[-1]
+        digest = self._capture(
+            [
+                aws,
+                "ecr",
+                "describe-images",
+                "--repository-name",
+                repository_name,
+                "--image-ids",
+                f"imageTag={tag}",
+                "--query",
+                "imageDetails[0].imageDigest",
+                "--output",
+                "text",
+                "--region",
+                self.settings.aws_region,
+                "--profile",
+                self.settings.aws_profile,
+            ],
+            self.settings.backend_context,
+            log_output=False,
+        ).strip()
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+            raise RuntimeError(f"{repository_name} ECR digest 조회 결과가 올바르지 않습니다.")
+        return digest
 
     @classmethod
     def _validate_environment_id(cls, environment_id: str) -> None:
@@ -783,7 +946,12 @@ class DeploymentManager:
 
     def _environment(self) -> dict[str, str]:
         env = os.environ.copy()
+        terraform_data_dir = (
+            self.settings.runtime_dir / "terraform-data" / "dashboard-controller"
+        )
+        terraform_data_dir.mkdir(parents=True, exist_ok=True)
         env["TF_IN_AUTOMATION"] = "1"
+        env["TF_DATA_DIR"] = str(terraform_data_dir.resolve())
         env["AWS_PROFILE"] = self.settings.aws_profile
         env["AWS_REGION"] = self.settings.aws_region
         return env

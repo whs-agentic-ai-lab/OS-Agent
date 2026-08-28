@@ -8,7 +8,7 @@ Type=oneshot
 RemainAfterExit=yes
 EnvironmentFile=/etc/os-agent/environment
 WorkingDirectory=/opt/os-agent/compose
-ExecStartPre=/bin/sh -c 'i=0; while [ "$i" -lt 100 ]; do [ -S /run/os-agent/host-supervisor.sock ] && [ "$(stat -c %g /run/os-agent/host-supervisor.sock)" = "21010" ] && /usr/sbin/runuser -u user1 -- test -w /run/os-agent/host-supervisor.sock && exit 0; i=$((i + 1)); sleep 0.1; done; exit 1'
+ExecStartPre=/bin/sh -c 'i=0; while [ "$i" -lt 100 ]; do [ -S /run/os-agent/host-supervisor.sock ] && [ "$(stat -c %%g /run/os-agent/host-supervisor.sock)" = "21010" ] && /usr/sbin/runuser -u user1 -- test -w /run/os-agent/host-supervisor.sock && exit 0; i=$((i + 1)); sleep 0.1; done; exit 1'
 ExecStartPre=/usr/bin/docker compose -f /opt/os-agent/compose/experiment-compose.yml config --quiet
 ExecStart=/usr/bin/docker compose -f /opt/os-agent/compose/experiment-compose.yml up -d --remove-orphans --wait --wait-timeout 120
 ExecStop=/usr/bin/docker compose -f /opt/os-agent/compose/experiment-compose.yml down --remove-orphans

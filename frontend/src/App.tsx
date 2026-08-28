@@ -20,7 +20,7 @@ import {
 import { DeploymentPanel } from './components/DeploymentPanel'
 import { EnvironmentSelector } from './components/EnvironmentSelector'
 import { EventTimeline } from './components/EventTimeline'
-import { HarnessPanel } from './components/HarnessPanel'
+import { ModelSelector } from './components/ModelSelector'
 import { OsResultDetailPage } from './components/OsResultDetailPage'
 import { PermissionControl } from './components/PermissionControl'
 import { RunResult } from './components/RunResult'
@@ -29,6 +29,7 @@ import type {
   DeploymentStatus,
   HealthResponse,
   OptionsResponse,
+  PlannerModelId,
   RunRecord,
   SubjectModeId,
   TunnelStatus,
@@ -72,6 +73,9 @@ export default function App() {
     no_new_privileges: true,
   })
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT)
+  const [plannerModel, setPlannerModel] = useState<PlannerModelId>(
+    'deepseek/deepseek-v4-flash-0731',
+  )
   const [environmentName, setEnvironmentName] = useState('')
   const [run, setRun] = useState<RunRecord | null>(null)
   const [routeHash, setRouteHash] = useState(() => window.location.hash)
@@ -200,13 +204,7 @@ export default function App() {
     deployment?.instances[0]?.instance_id ??
     null
 
-  const selectedModeAvailable = options?.subject_modes.find(
-    (mode) => mode.id === subjectMode,
-  )?.enabled
-  const activeSubjectMode =
-    selectedModeAvailable === false
-      ? (options?.subject_modes.find((mode) => mode.enabled)?.id ?? 'container')
-      : subjectMode
+  const activeSubjectMode = subjectMode
   const permissionTests = options?.permission_tests[activeSubjectMode] ?? []
   const availableTrustBoundaries = options?.trust_boundaries.filter(
     (boundary) => boundary.source_mode === activeSubjectMode,
@@ -218,12 +216,6 @@ export default function App() {
     permissionId: test.id,
     enabled: permissionSelections[test.id] ?? test.default_enabled,
   }))
-  const activePermissionProfile = Object.fromEntries(
-    activePermissionSelections.map((selection) => [
-      selection.permissionId,
-      selection.enabled,
-    ]),
-  )
   const backendConnected = Boolean(health) || Boolean(options)
   const connectionServices: ServiceConnection[] = [
     {
@@ -278,7 +270,7 @@ export default function App() {
       ? [
           {
             id: 'host-supervisor',
-            label: 'Host Supervisor',
+            label: '에이전트',
             state:
               health?.host_supervisor === 'connected'
                 ? ('connected' as const)
@@ -287,8 +279,8 @@ export default function App() {
               health?.host_supervisor === 'connected' ? '연결됨' : '오류',
             detail:
               health?.host_supervisor === 'connected'
-                ? '고정 Host 프로필과 Unix socket 실행기가 준비됐습니다.'
-                : 'EC2 Host Supervisor 소켓을 사용할 수 없습니다.',
+                ? 'AWS 에이전트와 실제 OS 실행기가 준비됐습니다.'
+                : 'AWS 에이전트 실행기에 연결할 수 없습니다.',
           },
         ]
       : []),
@@ -330,6 +322,7 @@ export default function App() {
               selection.enabled,
             ]),
           ),
+          planner_model: plannerModel,
         },
         agentRemote,
       )
@@ -551,8 +544,8 @@ export default function App() {
           </div>
           <div className="hero-aside">
             <p>
-              하나의 고정 EC2에서 Container와 Ubuntu Host 경계를 선택하고, 세
-              권한을 하나의 프로파일로 적용한 단일 Run을 검증합니다.
+              하나의 고정 EC2에서 실제 Container와 Ubuntu Host 경계를 선택하고,
+              권한 프로파일을 적용한 Agent 실행을 검증합니다.
             </p>
             <dl>
               <div>
@@ -561,11 +554,11 @@ export default function App() {
               </div>
               <div>
                 <dt>Boundaries</dt>
-                <dd>8</dd>
+                <dd>{options?.trust_boundaries.length ?? '—'}</dd>
               </div>
               <div>
                 <dt>Tools</dt>
-                <dd>3</dd>
+                <dd>{options?.tools.filter((tool) => tool.implemented).length ?? '—'}</dd>
               </div>
             </dl>
           </div>
@@ -621,22 +614,15 @@ export default function App() {
           tunnel={tunnel}
         />
 
-        <HarnessPanel
-          permissionProfile={activePermissionProfile}
-          remote={agentRemote}
-          subjectMode={activeSubjectMode}
-          trustBoundaryId={activeTrustBoundary?.id ?? ''}
-        />
-
         <div className="workspace-grid">
           <section className="control-panel" aria-labelledby="control-title">
             <div className="section-heading">
               <div>
                 <span className="section-index">02</span>
-                <h2 id="control-title">실험 구성</h2>
+                <h2 id="control-title">실제 OS Agent 실험</h2>
               </div>
               <span className="planner-mode">
-                {options?.planner_mode ?? '—'} planner
+                {agentRemote ? 'EC2 via SSM' : 'SSM 연결 필요'}
               </span>
             </div>
 
@@ -646,10 +632,40 @@ export default function App() {
               </p>
             ) : options ? (
               <form onSubmit={submitRun}>
+                <div className="runtime-path" aria-label="실제 Agent 실행 경로">
+                  <div className={agentRemote ? 'is-ready' : 'is-waiting'}>
+                    <span>01</span>
+                    <strong>SSM</strong>
+                    <small>{agentRemote ? '연결됨' : '연결 필요'}</small>
+                  </div>
+                  <div className={health?.host_supervisor === 'connected' ? 'is-ready' : 'is-waiting'}>
+                    <span>02</span>
+                    <strong>Supervisor</strong>
+                    <small>{health?.host_supervisor === 'connected' ? '준비됨' : '대기'}</small>
+                  </div>
+                  <div className={agentRemote && health?.host_supervisor === 'connected' ? 'is-ready' : 'is-waiting'}>
+                    <span>03</span>
+                    <strong>{activeSubjectMode === 'container' ? 'C1' : 'U1'} Executor</strong>
+                    <small>실제 OS 실행</small>
+                  </div>
+                  <div className={agentRemote && health?.host_supervisor === 'connected' ? 'is-ready' : 'is-waiting'}>
+                    <span>04</span>
+                    <strong>Verifier</strong>
+                    <small>Evidence 판정</small>
+                  </div>
+                </div>
+
                 <EnvironmentSelector
                   modes={options.subject_modes}
                   onChange={changeSubjectMode}
                   selected={activeSubjectMode}
+                />
+
+                <ModelSelector
+                  disabled={options.planner_mode !== 'openrouter'}
+                  models={options.planner_models}
+                  onChange={setPlannerModel}
+                  selected={plannerModel}
                 />
 
                 <div className="field-group">
@@ -707,6 +723,8 @@ export default function App() {
                   className="run-button"
                   disabled={
                     isRunning
+                    || !agentRemote
+                    || health?.host_supervisor !== 'connected'
                     || Boolean(health?.active_executor)
                     || activePermissionSelections.length === 0
                   }
@@ -714,10 +732,14 @@ export default function App() {
                 >
                   <span>
                     {isRunning
-                      ? '통합 프로파일 실행 중'
+                      ? '실제 권한 실험 실행 중'
                       : health?.active_executor
                         ? `${health.active_executor} Executor 실행 중`
-                        : '통합 실험 실행'}
+                        : !agentRemote
+                          ? 'SSM 연결 후 실행할 수 있습니다'
+                          : health?.host_supervisor !== 'connected'
+                            ? 'Runtime 준비 상태를 확인하세요'
+                            : '실제 권한 실험 실행'}
                   </span>
                   <span aria-hidden="true">↗</span>
                 </button>
@@ -742,7 +764,7 @@ export default function App() {
           <strong>OS Agent Minimum Test</strong>
           <p>로컬 대시보드 · 고정 AWS 인프라 · 백엔드 통제 실행</p>
         </div>
-        <span>v0.1 · Local verification scaffold</span>
+        <span>Runtime v6 · EC2 via SSM</span>
       </footer>
     </div>
   )

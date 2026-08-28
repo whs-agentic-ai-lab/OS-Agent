@@ -6,7 +6,7 @@
 
 ```text
 os-Agent-test/
-├─ frontend/           # 로컬/Vercel React·Vite 대시보드
+├─ frontend/           # 로컬 React·Vite 대시보드
 ├─ backend/            # Control Backend, 환경 Runtime Agent, root Supervisor 소스
 ├─ infra/
 │  └─ terraform/       # 고정 인프라와 root-owned Supervisor 설치
@@ -41,34 +41,17 @@ os-Agent-test/
 - SSM 연결: 관리 노드가 Online이 될 때까지 대기한 뒤 `127.0.0.1:8001 → EC2:8000` 자동 연결
 - 워크플로우 제어: 7단계 방향성 그래프, 자동 상태 동기화, 수동 체크포인트, 노드별 실제 오류 로그와 상태 복원
 
-## Agent Harness Core
+## 실제 OS Agent 실험
 
-기존 단일 권한 Run과 실행 경계를 변경하지 않고, 현재 OS 권한·Tool·Verifier를 조정하는 `os-harness-v1` Core와 Live Adapter를 별도 API로 제공한다.
+대시보드의 실험 진입점은 `POST /api/runs` 하나다. SSM 연결 상태, root Supervisor, 선택한 U1/C1 Executor, 독립 Verifier를 같은 화면에서 확인하고 실행한다.
 
-- `GET /api/harness/status`: Permission Provider, Tool Catalog, Planner, Executor, Verifier, Resetter 연결 상태 조회
-- `POST /api/harness/runs`: Harness Run 생성과 상태·Budget·종료 수명주기 실행
-- `GET /api/harness/runs/{run_id}`: In-memory Harness 실행 기록 조회
-- `GET /api/harness/fixtures/status`: 메모리 전용 Fixture 자가진단 준비 상태 조회
-- `POST /api/harness/fixture-runs`: Dashboard에서 안전한 Fixture 수명주기 실행
-- 실제 OS Adapter는 기존 Supervisor/Environment Runtime 경로에 연결되며, Supervisor socket이 없으면 `BLOCKED / MISSING_REQUIRED_COMPONENTS`로 종료
-- Live Harness는 현재 화면의 TB와 완전한 권한 Profile을 적용하고, Backend Model Gateway의 Tool Call을 U1/C1 Executor에 위임한 뒤 Control Backend에서 검증하고 Supervisor로 Reset
-- SSM 연결 시 `/api/remote/harness/*`를 통해 EC2 Backend의 동일 Harness를 실행하며, 로컬 Backend가 원격 Tool을 대신 실행하지 않음
-- `create_fixture_harness_components()`를 테스트에서 주입하면 State → Frontier → Planner → Execute → Verify → Reset 전체 흐름 실행
-- Dashboard의 `Agent Harness` Panel에서 실제 Adapter 상태와 Fixture 실행 결과를 분리해 표시
-- 기존 `POST /api/runs`, Runtime Agent, root Supervisor, Terraform, SSM, Supabase 실행 경로는 그대로 유지
+- 실제 권한 Profile과 환경 TB를 선택한 뒤 EC2 Runtime에서만 실행
+- Backend Model Gateway의 Tool Call을 선택된 U1/C1 Executor에 전달
+- Control Backend가 Evidence를 판정하고 Supervisor가 Trial 상태를 Reset
+- Run 결과와 이벤트를 동일 화면에 표시하고 Supabase 설정 시 Executor별 테이블에 저장
+- 메모리 Fixture와 Dashboard 전용 Fixture API는 운영 화면과 Production API에서 제거
 
-현재 Live Adapter는 129개 Tool 카탈로그 중 권한 프로파일과 직접 연결되는 5개 family를 실제 OS 동작까지 구현한다. 나머지는 카탈로그와 action 계약만 제공하며 구현된 것처럼 실행하지 않는다. `evidence.feedback`과 Collector 원본 저장·스트리밍은 후속 구현 범위이고, Agent에게 Collector 제어 기능은 제공하지 않는다.
-
-### 메모리 전용 Fixture Adapter
-
-실제 OS 권한으로 오해하지 않도록 모든 이름에 `fixture-`를 사용하며 파일·명령·Network를 사용하지 않는다.
-
-- 권한 Profile: `fixture-container-readonly`, `fixture-container-write`, `fixture-host-readonly`, `fixture-host-write`
-- Tool: `fixture_file_read`, `fixture_file_write`, `fixture_service_status`
-- Planner: 미실행 Candidate를 등록 순서대로 선택
-- Verifier: Profile의 기대 허용·거부와 메모리 상태 변화를 독립 Evidence ID로 판정
-- Resetter: 성공한 fixture write를 메모리 baseline으로 복구
-- 실제 Harness 실행에는 주입하지 않는다. 별도 `/api/harness/fixture-runs` 자가진단에서만 사용하며 외부 시스템에 Side effect를 만들지 않는다.
+Harness Core와 Fixture Adapter는 내부 단위 테스트에서만 수명주기 회귀 검증에 사용한다. 현재 실제 Runtime은 129개 Tool 카탈로그 중 권한 프로파일과 직접 연결되는 5개 family를 OS 동작까지 구현하며, 나머지는 `implemented` 상태를 명시한다.
 
 ## 워크플로우 상태 관리
 
@@ -98,7 +81,7 @@ os-Agent-test/
 | Host Executor (`U1`) | `TB-HH-U1U2`, `TB-HC-U1C1`, `TB-HC-U1C2`, `TB-HC-U1C3` |
 | Container Executor (`C1`) | `TB-HC-C1U1`, `TB-HC-C1U2`, `TB-CC-C1C2`, `TB-CC-C1C3` |
 
-두 Executor Run은 동시에 실행되지 않는다. 표준 Run과 Live Harness가 같은 공통 잠금을 사용하며, 다른 Executor 실행 중 새 요청은 대기열에 넣지 않고 HTTP `409`로 거부한다. 이렇게 해야 한 Executor가 적용한 권한 Profile이나 Reset 과정이 다른 Executor Trial의 Evidence에 섞이지 않는다.
+두 Executor Run은 동시에 실행되지 않는다. 다른 Executor 실행 중 새 요청은 대기열에 넣지 않고 HTTP `409`로 거부한다. 이렇게 해야 한 Executor가 적용한 권한 Profile이나 Reset 과정이 다른 Executor Trial의 Evidence에 섞이지 않는다.
 
 ### Ubuntu Host 실행 경계
 

@@ -27,6 +27,7 @@ create table if not exists public.runs (
   action_path_id text not null default 'UNIMPLEMENTED',
   changed_variable text not null default 'UNIMPLEMENTED',
   planner_mode text not null check (planner_mode in ('local', 'openrouter')),
+  planner_model text,
   runtime_agent text not null default 'UNIMPLEMENTED',
   tool text check (tool in ('file_read', 'file_write', 'service_status')),
   tool_arguments jsonb not null default '{}'::jsonb
@@ -72,6 +73,7 @@ alter table public.runs add column if not exists workload_type text not null def
   check (workload_type in ('normal', 'attack', 'UNIMPLEMENTED'));
 alter table public.runs add column if not exists action_path_id text not null default 'UNIMPLEMENTED';
 alter table public.runs add column if not exists changed_variable text not null default 'UNIMPLEMENTED';
+alter table public.runs add column if not exists planner_model text;
 alter table public.runs add column if not exists policy_decision text not null default 'UNIMPLEMENTED'
   check (policy_decision in ('allowed', 'denied', 'UNIMPLEMENTED'));
 alter table public.runs add column if not exists authentication_result text not null default 'UNIMPLEMENTED'
@@ -122,6 +124,9 @@ create table if not exists public.host_executor_run_events
   (like public.run_events including all);
 create table if not exists public.container_executor_run_events
   (like public.run_events including all);
+
+alter table public.host_executor_runs add column if not exists planner_model text;
+alter table public.container_executor_runs add column if not exists planner_model text;
 
 alter table public.host_executor_runs drop constraint if exists host_executor_runs_subject_mode_check;
 alter table public.host_executor_runs add constraint host_executor_runs_subject_mode_check

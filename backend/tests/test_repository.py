@@ -2,7 +2,12 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from app.repository import InMemoryRunRepository, SupabaseRunRepository, create_run_repository
+from app.repository import (
+    InMemoryRunRepository,
+    ResilientRunRepository,
+    SupabaseRunRepository,
+    create_run_repository,
+)
 from app.schemas import RunEvent, RunRecord, SubjectMode
 
 
@@ -173,6 +178,31 @@ def test_repository_requires_complete_supabase_configuration() -> None:
         assert "모두 설정" in str(error)
     else:
         raise AssertionError("부분 Supabase 설정은 거부해야 합니다.")
+
+
+def test_resilient_repository_keeps_run_when_supabase_save_fails() -> None:
+    primary = Mock(storage_name="supabase")
+    primary.save.side_effect = RuntimeError("schema cache mismatch")
+    primary.get.return_value = None
+    repository = ResilientRunRepository(primary)
+    run = make_run()
+
+    repository.save(run)
+
+    assert repository.storage_name == "supabase+memory-fallback"
+    restored = repository.get(run.run_id)
+    assert restored is not None
+    assert restored.run_id == run.run_id
+
+
+def test_configured_supabase_repository_is_resilient(monkeypatch) -> None:
+    client = Mock()
+    monkeypatch.setattr("app.repository.create_client", lambda *_args: client)
+
+    repository = create_run_repository("https://example.supabase.co", "secret")
+
+    assert isinstance(repository, ResilientRunRepository)
+    assert repository.storage_name == "supabase"
 
 
 def test_memory_repository_lists_executor_results_separately() -> None:

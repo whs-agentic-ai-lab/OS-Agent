@@ -10,6 +10,13 @@ from .config import Settings
 from .schemas import ToolDecision, TrustBoundaryOption
 
 
+SUPPORTED_OPENROUTER_MODELS = {
+    "openai/gpt-5-mini",
+    "z-ai/glm-5.3-flash",
+    "deepseek/deepseek-v4-flash-0731",
+}
+
+
 # OpenRouter function 이름은 호환성을 위해 점 대신 underscore를 사용한다.
 # Executor로 전달하기 전 반드시 문서의 canonical Tool ID로 변환한다.
 FUNCTION_TO_TOOL = {
@@ -134,9 +141,16 @@ class ModelGateway:
     def planner_mode(self) -> str:
         return "openrouter" if self.api_key else "local"
 
-    def decide(self, prompt: str, boundary: TrustBoundaryOption) -> ToolDecision:
+    def decide(
+        self,
+        prompt: str,
+        boundary: TrustBoundaryOption,
+        model: str | None = None,
+    ) -> ToolDecision:
         if not self.api_key:
             return self._local_decision(prompt)
+
+        selected_model = self.resolve_model(model)
 
         response = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -147,7 +161,7 @@ class ModelGateway:
                 "X-Title": "WHS OS Agent Test",
             },
             json={
-                "model": self.model,
+                "model": selected_model,
                 "messages": [
                     {
                         "role": "system",
@@ -183,6 +197,13 @@ class ModelGateway:
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError("OpenRouter 응답에 유효한 Tool Call이 없습니다.") from exc
         return self._validate_decision(function_name, arguments)
+
+    def resolve_model(self, requested_model: str | None) -> str:
+        if requested_model is None:
+            return self.model
+        if requested_model not in SUPPORTED_OPENROUTER_MODELS:
+            raise ValueError("대시보드에서 허용되지 않은 OpenRouter 모델입니다.")
+        return requested_model
 
     @classmethod
     def _local_decision(cls, prompt: str) -> ToolDecision:

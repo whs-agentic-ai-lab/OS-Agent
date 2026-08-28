@@ -56,11 +56,23 @@ export interface OptionsResponse {
   trust_boundaries: TrustBoundaryOption[];
   permission_catalog_summary: PermissionCatalogSummary;
   planner_mode: "local" | "openrouter";
+  planner_models: PlannerModelOption[];
+}
+
+export type PlannerModelId =
+  | "openai/gpt-5-mini"
+  | "z-ai/glm-5.3-flash"
+  | "deepseek/deepseek-v4-flash-0731";
+
+export interface PlannerModelOption {
+  id: PlannerModelId;
+  label: string;
+  description: string;
 }
 
 export interface HealthResponse {
   status: string;
-  run_api_version?: "permission-control-runtime-v5";
+  run_api_version?: "permission-control-runtime-v5" | "permission-control-runtime-v6";
   harness_api_version?: "os-harness-v1";
   planner: string;
   storage: string;
@@ -68,100 +80,12 @@ export interface HealthResponse {
   active_executor?: SubjectModeId | null;
 }
 
-export type HarnessComponentName =
-  | "permission_provider"
-  | "tool_catalog"
-  | "planner"
-  | "executor"
-  | "verifier"
-  | "resetter";
-
-export interface HarnessComponentStatus {
-  name: HarnessComponentName;
-  ready: boolean;
-}
-
-export interface HarnessStatus {
-  version: "os-harness-v1";
-  status: "ready" | "waiting_for_components";
-  ready: boolean;
-  preserves_legacy_run_api: true;
-  components: HarnessComponentStatus[];
-  missing_components: HarnessComponentName[];
-}
-
-export interface HarnessBudget {
-  max_iterations: number;
-  max_tool_calls: number;
-  max_elapsed_seconds: number;
-  max_no_progress_iterations: number;
-  used_iterations?: number;
-  used_tool_calls?: number;
-  no_progress_iterations?: number;
-}
-
-export interface HarnessRunRequest {
-  objective: string;
-  subject_mode: SubjectModeId;
-  trust_boundary_id?: string;
-  scenario_id: string;
-  permission_profile?: Record<string, boolean>;
-  permission_profile_id?: string;
-  budget?: HarnessBudget;
-}
-
-export interface HarnessActionRecord {
-  sequence: number;
-  candidate: {
-    candidate_id: string;
-    tool_name: string;
-    target_resource: string;
-    risk_level: "observe" | "safe" | "reversible";
-    changes_state: boolean;
-  };
-  execution: {
-    success: boolean;
-    output: string;
-    error_code: string | null;
-    evidence: {
-      runtime_result?: {
-        tool?: string;
-      };
-      [key: string]: unknown;
-    };
-  };
-  verification: {
-    status: "VERIFIED" | "REJECTED" | "INCONCLUSIVE";
-    evidence_refs: string[];
-    checks: Record<string, boolean>;
-  };
-  reset: {
-    status: "RESET" | "RESET_FAILED" | "NOT_REQUIRED";
-    evidence_refs: string[];
-  };
-}
-
-export interface HarnessRunRecord {
-  run_id: string;
-  harness_version: "os-harness-v1";
-  status: "RECEIVED" | "RUNNING" | "COMPLETED" | "BLOCKED" | "FAILED";
-  objective: string;
-  subject_mode: SubjectModeId;
-  trust_boundary_id: string | null;
-  source_environment: EnvironmentNodeId | null;
-  target_environment: EnvironmentNodeId | null;
-  scenario_id: string;
-  budget: HarnessBudget;
-  missing_components: HarnessComponentName[];
-  actions: HarnessActionRecord[];
-  termination_reason: string | null;
-}
-
 export interface RunRequest {
   prompt: string;
   subject_mode: SubjectModeId;
   trust_boundary_id: string;
   permission_profile: Record<string, boolean>;
+  planner_model?: PlannerModelId;
 }
 
 export interface PermissionSelection {
@@ -216,6 +140,7 @@ export interface RunRecord {
   action_path_id?: string;
   changed_variable?: string;
   planner_mode: "local" | "openrouter";
+  planner_model: PlannerModelId | null;
   runtime_agent: string;
   tool: string | null;
   tool_arguments: Record<string, unknown>;

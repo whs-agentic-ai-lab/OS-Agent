@@ -12,7 +12,6 @@ secret:
 sources:
   host_journal:
     type: journald
-    current_boot_only: false
     since_now: false
     emit_cursor: true
     journalctl_path: /usr/bin/journalctl

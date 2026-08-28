@@ -18,6 +18,7 @@ while true; do
   /usr/bin/docker events \
     --since "$since" \
     --filter type=container \
+    --filter container=os-agent-runtime \
     --filter container=os-agent-container1 \
     --filter container=os-agent-container2 \
     --filter container=os-agent-container3 \

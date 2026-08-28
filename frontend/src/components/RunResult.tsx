@@ -37,6 +37,7 @@ export function RunResult({ run }: RunResultProps) {
         <div><dt>Runtime</dt><dd>{run.runtime_result ?? "—"}</dd></div>
         <div><dt>Exit code</dt><dd>{run.exit_code ?? "—"}</dd></div>
         <div><dt>Planner</dt><dd>{run.planner_mode}</dd></div>
+        <div><dt>Model</dt><dd>{run.planner_model ?? "로컬 규칙 플래너"}</dd></div>
         <div><dt>Runtime Agent</dt><dd>{run.runtime_agent}</dd></div>
       </dl>
 
