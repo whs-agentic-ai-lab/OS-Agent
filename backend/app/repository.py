@@ -1,3 +1,4 @@
+import logging
 from threading import Lock
 from typing import Protocol
 
@@ -13,6 +14,8 @@ RUN_TABLES = {
         "container_executor_run_events",
     ),
 }
+
+logger = logging.getLogger(__name__)
 
 
 class RunRepository(Protocol):
@@ -169,6 +172,63 @@ class SupabaseRunRepository:
         return False
 
 
+class ResilientRunRepository:
+    """Supabase 장애가 실제 실험 응답까지 실패시키지 않게 로컬로 복원합니다."""
+
+    def __init__(self, primary: RunRepository) -> None:
+        self._primary = primary
+        self._fallback = InMemoryRunRepository()
+        self._degraded = False
+
+    @property
+    def storage_name(self) -> str:
+        return "supabase+memory-fallback" if self._degraded else self._primary.storage_name
+
+    def _mark_degraded(self, operation: str) -> None:
+        self._degraded = True
+        logger.exception(
+            "Supabase %s 실패: 이번 프로세스의 로컬 메모리 저장소로 복원합니다.",
+            operation,
+        )
+
+    def save(self, run: RunRecord) -> None:
+        try:
+            self._primary.save(run)
+        except Exception:
+            self._mark_degraded("save")
+            self._fallback.save(run)
+
+    def get(self, run_id: str) -> RunRecord | None:
+        try:
+            stored = self._primary.get(run_id)
+            if stored is not None:
+                return stored
+        except Exception:
+            self._mark_degraded("get")
+        return self._fallback.get(run_id)
+
+    def list_runs(
+        self,
+        subject_mode: SubjectMode,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[RunRecord], int]:
+        if not self._degraded:
+            try:
+                return self._primary.list_runs(subject_mode, page, page_size)
+            except Exception:
+                self._mark_degraded("list")
+        return self._fallback.list_runs(subject_mode, page, page_size)
+
+    def delete(self, run_id: str) -> bool:
+        deleted = self._fallback.delete(run_id)
+        try:
+            return self._primary.delete(run_id) or deleted
+        except Exception:
+            self._mark_degraded("delete")
+            return deleted
+
+
 def create_run_repository(
     supabase_url: str | None,
     supabase_secret_key: str | None,
@@ -178,5 +238,7 @@ def create_run_repository(
             "SUPABASE_URL과 SUPABASE_SECRET_KEY(또는 SUPABASE_SERVICE_ROLE_KEY)를 모두 설정하세요."
         )
     if supabase_url and supabase_secret_key:
-        return SupabaseRunRepository(supabase_url, supabase_secret_key)
+        return ResilientRunRepository(
+            SupabaseRunRepository(supabase_url, supabase_secret_key)
+        )
     return InMemoryRunRepository()

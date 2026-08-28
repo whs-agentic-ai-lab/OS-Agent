@@ -1,4 +1,4 @@
-channel = .collector_channel
+channel = to_string!(.collector_channel)
 raw_message = if exists(.message) && is_string(.message) {
   string!(.message)
 } else {
@@ -8,7 +8,7 @@ raw_message = if exists(.message) && is_string(.message) {
 if exists(.message) && is_string(.message) {
   parsed, err = parse_json(.message)
   if err == null && is_object(parsed) {
-    . = merge(., parsed)
+    . = merge!(., parsed)
     del(.message)
   }
 }

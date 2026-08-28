@@ -75,6 +75,19 @@ class PermissionCatalogSummary(BaseModel):
     policy: str
 
 
+PlannerModel = Literal[
+    "openai/gpt-5-mini",
+    "z-ai/glm-5.3-flash",
+    "deepseek/deepseek-v4-flash-0731",
+]
+
+
+class PlannerModelOption(BaseModel):
+    id: PlannerModel
+    label: str
+    description: str
+
+
 class OptionsResponse(BaseModel):
     subject_modes: list[SubjectOption]
     permission_tests: dict[str, list[PermissionTest]]
@@ -82,6 +95,7 @@ class OptionsResponse(BaseModel):
     trust_boundaries: list[TrustBoundaryOption]
     permission_catalog_summary: PermissionCatalogSummary
     planner_mode: Literal["local", "openrouter"] = "local"
+    planner_models: list[PlannerModelOption] = Field(default_factory=list)
 
 
 class PermissionSelection(BaseModel):
@@ -94,6 +108,7 @@ class RunRequest(BaseModel):
     subject_mode: SubjectMode
     trust_boundary_id: str | None = None
     permission_profile: dict[str, bool] = Field(default_factory=dict)
+    planner_model: PlannerModel | None = None
     # v1 로그/클라이언트를 읽기 위한 호환 필드입니다. 신규 요청의 기준은
     # permission_profile 객체 하나이며 목록 단위 실행은 하지 않습니다.
     permissions: list[PermissionSelection] = Field(default_factory=list)
@@ -282,6 +297,7 @@ class RunRecord(BaseModel):
     action_path_id: str = "UNIMPLEMENTED"
     changed_variable: str = "UNIMPLEMENTED"
     planner_mode: Literal["local", "openrouter"]
+    planner_model: PlannerModel | None = None
     runtime_agent: str = "UNIMPLEMENTED"
     tool: str | None = None
     tool_arguments: dict[str, Any] = Field(default_factory=dict)

@@ -1,5 +1,6 @@
 locals {
   experiment_compose = templatefile("${path.module}/experiment-compose.yml.tpl", {
+    runtime_image_uri    = local.runtime_image_uri
     container1_image_uri = local.container1_image_uri
     target_image_uri     = local.target_image_uri
     topology_revision    = local.topology_revision
@@ -52,7 +53,7 @@ locals {
 
   minified_bootstrap_assets = {
     for name, content in local.bootstrap_assets : name => join("\n", [
-      for line in split("\n", content) : line
+      for line in split("\n", replace(content, "\r\n", "\n")) : line
       if trimspace(line) != "" && (
         !startswith(trimspace(line), "#") || startswith(trimspace(line), "#!")
       )
@@ -78,7 +79,7 @@ locals {
   })
 
   rendered_user_data = join("\n", [
-    for line in split("\n", local.rendered_user_data_source) : line
+    for line in split("\n", replace(local.rendered_user_data_source, "\r\n", "\n")) : line
     if trimspace(line) != "" && (
       !startswith(trimspace(line), "#") || startswith(trimspace(line), "#!")
     )

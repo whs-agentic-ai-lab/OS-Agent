@@ -1,10 +1,17 @@
-import type { DeploymentStatus, HarnessRunRecord, HarnessRunRequest, HarnessStatus, HealthResponse, OptionsResponse, RunDeleteResponse, RunListResponse, RunRecord, RunRequest, SubjectModeId, TunnelStatus } from "./types";
+import type { DeploymentStatus, HealthResponse, OptionsResponse, RunDeleteResponse, RunListResponse, RunRecord, RunRequest, SubjectModeId, TunnelStatus } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { detail?: string } | null;
-    throw new Error(body?.detail ?? `요청에 실패했습니다. (${response.status})`);
+    const body = (await response.json().catch(() => null)) as { detail?: unknown } | null;
+    const detail = typeof body?.detail === 'string'
+      ? body.detail
+      : Array.isArray(body?.detail)
+        ? body.detail
+          .map((item) => typeof item === 'object' && item !== null && 'msg' in item ? String(item.msg) : String(item))
+          .join(', ')
+        : null;
+    throw new Error(detail ?? `요청에 실패했습니다. (${response.status})`);
   }
   return response.json() as Promise<T>;
 }
@@ -19,35 +26,6 @@ export function getOptions(remote = false): Promise<OptionsResponse> {
 
 export function getHealth(remote = false): Promise<HealthResponse> {
   return request<HealthResponse>(agentPath("/api/health", remote));
-}
-
-export function getHarnessStatus(remote = false): Promise<HarnessStatus> {
-  return request<HarnessStatus>(agentPath("/api/harness/status", remote));
-}
-
-export function getFixtureHarnessStatus(): Promise<HarnessStatus> {
-  return request<HarnessStatus>("/api/harness/fixtures/status");
-}
-
-export function createFixtureHarnessRun(
-  payload: HarnessRunRequest,
-): Promise<HarnessRunRecord> {
-  return request<HarnessRunRecord>("/api/harness/fixture-runs", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
-export function createHarnessRun(
-  payload: HarnessRunRequest,
-  remote = false,
-): Promise<HarnessRunRecord> {
-  return request<HarnessRunRecord>(agentPath("/api/harness/runs", remote), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
 }
 
 export function createRun(payload: RunRequest, remote = false): Promise<RunRecord> {

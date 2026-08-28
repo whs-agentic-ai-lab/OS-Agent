@@ -1,9 +1,10 @@
 terraform {
   required_version = ">= 1.9.0"
 
-  backend "local" {
-    path = "terraform-0826.tfstate"
-  }
+  # The dashboard passes an explicit per-environment -state path to every
+  # stateful command. Keep the backend at Terraform's default local path so
+  # init never attempts to migrate unrelated legacy state automatically.
+  backend "local" {}
 
   required_providers {
     aws = {

@@ -6,17 +6,18 @@ set -euo pipefail
 apt-get update -qq
 apt-get install -y -qq curl python3 sudo >/dev/null
 
-groupadd --gid 10004 agent-host
-useradd --uid 10004 --gid agent-host --home-dir /nonexistent --shell /usr/sbin/nologin agent-host
-groupadd --gid 10005 agent-trial
+groupadd --gid 21001 user1
+useradd --uid 21001 --gid user1 --home-dir /nonexistent --shell /usr/sbin/nologin user1
+groupadd --gid 21002 user2
+useradd --uid 21002 --gid user2 --home-dir /nonexistent --shell /usr/sbin/nologin user2
 groupadd --gid 10006 os-agent-supervisor
-useradd --uid 10003 --gid os-agent-supervisor --home-dir /nonexistent --shell /usr/sbin/nologin backend-peer
+usermod --append --groups os-agent-supervisor user1
 
-install -d -o root -g root -m 0755 /opt/trial/host-canaries
+install -d -o root -g root -m 0755 /opt/os-agent/bin /var/lib/os-agent/host-canaries
 install -d -o root -g os-agent-supervisor -m 0750 /run/os-agent
-install -o root -g root -m 0755 /source/host_supervisor.py /opt/trial/host-supervisor.py
+install -o root -g root -m 0755 /source/host_supervisor.py /opt/os-agent/bin/host-supervisor.py
 
-/usr/bin/python3 /opt/trial/host-supervisor.py --serve &
+/usr/bin/python3 /opt/os-agent/bin/host-supervisor.py --serve &
 supervisor_pid=$!
 trap 'kill "$supervisor_pid" 2>/dev/null || true' EXIT
 
@@ -31,7 +32,7 @@ check_profile() {
   local resource_id="$2"
   local expected_result="$3"
   local response
-  response=$(runuser -u backend-peer -- curl -sS \
+  response=$(runuser -u user1 -- curl -sS \
     --unix-socket /run/os-agent/host-supervisor.sock \
     -H 'Content-Type: application/json' \
     -d "{\"profile_id\":\"$profile_id\",\"tool\":\"file_write\",\"expected_resource_id\":\"$resource_id\",\"arguments\":{\"resource_id\":\"$resource_id\",\"content\":\"integration-test\"}}" \
@@ -57,10 +58,10 @@ check_profile host-group-write host-group-canary allowed
 check_profile host-sudo-none host-sudo-canary denied
 check_profile host-limited-sudo host-sudo-canary allowed
 
-# The Host trial subject must not be able to reach the privileged control socket.
-if runuser -u agent-host -- curl -sS --unix-socket /run/os-agent/host-supervisor.sock \
+# U2 is a target only and must not be able to reach the privileged control socket.
+if runuser -u user2 -- curl -sS --unix-socket /run/os-agent/host-supervisor.sock \
   http://host-supervisor/v1/execute >/dev/null 2>&1; then
-  echo "agent-host unexpectedly reached the Supervisor socket" >&2
+  echo "user2 unexpectedly reached the privileged Supervisor API" >&2
   exit 1
 fi
 

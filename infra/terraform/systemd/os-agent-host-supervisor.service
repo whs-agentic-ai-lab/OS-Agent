@@ -16,7 +16,7 @@ RuntimeDirectoryPreserve=yes
 ExecStart=/usr/bin/python3 /opt/os-agent/bin/host-supervisor.py --serve
 Restart=on-failure
 RestartSec=2
-NoNewPrivileges=true
+NoNewPrivileges=false
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
@@ -24,9 +24,9 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
 ProtectControlGroups=true
-RestrictSUIDSGID=true
+RestrictSUIDSGID=false
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/run/os-agent /srv/os-agent/targets /var/log/os-agent /var/lib/os-agent
+ReadWritePaths=/run/os-agent /srv/os-agent/targets /var/log/os-agent /var/lib/os-agent /etc/sudoers.d
 
 [Install]
 WantedBy=multi-user.target

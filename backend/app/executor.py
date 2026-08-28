@@ -56,6 +56,11 @@ class RunCoordinator:
             requested_profile=profile_id,
             changed_variable=", ".join(changed_variables),
             planner_mode=self.model_gateway.planner_mode,
+            planner_model=(
+                self.model_gateway.resolve_model(request.planner_model)
+                if self.model_gateway.planner_mode == "openrouter"
+                else None
+            ),
         )
         try:
             self._event(
@@ -66,7 +71,11 @@ class RunCoordinator:
                 {"profile_id": profile_id, "permission_profile": request.permission_profile},
             )
             run.status = "DISPATCHING"
-            tool_decision = self.model_gateway.decide(request.prompt, boundary)
+            tool_decision = self.model_gateway.decide(
+                request.prompt,
+                boundary,
+                run.planner_model,
+            )
             self._event(
                 run,
                 "model",
@@ -76,6 +85,7 @@ class RunCoordinator:
                     "trust_boundary_id": boundary.id,
                     "tool": tool_decision.name,
                     "arguments": tool_decision.arguments,
+                    "model": run.planner_model,
                 },
             )
             self._event(

@@ -24,7 +24,7 @@ echo "Starting OS Agent topology ${topology_revision} bootstrap"
 # Private EC2 SG는 HTTP/80을 허용하지 않는다. Ubuntu package source도 HTTPS로 고정한다.
 while IFS= read -r source_file; do
   sed -i \
-    -E 's|http://([^/]*\.)?(archive|security)\.ubuntu\.com|https://\1\2.ubuntu.com|g' \
+    -E 's#http://([^/]*\.)?(archive|security)\.ubuntu\.com#https://\1\2.ubuntu.com#g' \
     "$source_file"
 done < <(find /etc/apt -maxdepth 3 -type f \( -name '*.list' -o -name '*.sources' \))
 
@@ -39,10 +39,20 @@ retry 6 apt-get install -y \
   sudo \
   python3 \
   util-linux \
+  unzip \
   auditd \
   audispd-plugins \
-  nftables \
-  awscli
+  nftables
+
+# Ubuntu 24.04에는 awscli apt 설치 후보가 없으므로 AWS 공식 검증 설치 스크립트를 사용한다.
+if ! command -v aws >/dev/null 2>&1; then
+  aws_cli_installer=/tmp/aws-cli-v2-install.sh
+  curl --proto '=https' --tlsv1.2 --retry 6 --retry-all-errors -fsSL \
+    https://awscli.amazonaws.com/v2/install.sh -o "$aws_cli_installer"
+  bash "$aws_cli_installer" --system
+  rm -f -- "$aws_cli_installer"
+fi
+aws --version
 
 install -m 0755 -d /etc/apt/keyrings
 curl --proto '=https' --tlsv1.2 --retry 6 --retry-all-errors -fsSL https://download.docker.com/linux/ubuntu/gpg \
@@ -115,13 +125,13 @@ install -d -o vector -g vector -m 0750 \
   /var/lib/vector \
   /var/lib/os-agent/evidence/collected
 
-install -d -o user1 -g user1 -m 0750 \
+install -d -o user1 -g user1 -m 0751 \
   /srv/os-agent/targets/host1
-install -d -o user2 -g user2 -m 0750 \
+install -d -o user2 -g user2 -m 0751 \
   /srv/os-agent/targets/host2
-install -d -o 22001 -g 22001 -m 0750 /srv/os-agent/targets/container1
-install -d -o 22002 -g 22002 -m 0750 /srv/os-agent/targets/container2
-install -d -o 22003 -g 22003 -m 0750 /srv/os-agent/targets/container3
+install -d -o 22001 -g 22001 -m 0751 /srv/os-agent/targets/container1
+install -d -o 22002 -g 22002 -m 0751 /srv/os-agent/targets/container2
+install -d -o 22003 -g 22003 -m 0751 /srv/os-agent/targets/container3
 
 asset_bundle="$(mktemp)"
 printf '%s' '${bootstrap_bundle_b64}' | base64 -d | gzip -dc >"$asset_bundle"
@@ -203,8 +213,8 @@ sed -i -E 's|^[[:space:]]*num_logs[[:space:]]*=.*|num_logs = 5|' /etc/audit/audi
 systemctl enable docker auditd nftables
 systemctl restart systemd-journald
 journalctl --flush
-systemctl restart docker
 systemctl restart nftables
+systemctl restart docker
 service auditd restart
 augenrules --load
 auditctl -l >/dev/null

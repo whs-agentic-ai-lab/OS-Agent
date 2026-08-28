@@ -5,7 +5,7 @@ umask 0027
 readonly OUTPUT=/var/log/os-agent/docker-logs.ndjson
 readonly STATE_DIR=/var/lib/os-agent/docker-log-relay
 readonly LOCK_FILE="$STATE_DIR/output.lock"
-readonly CONTAINERS=(os-agent-container1 os-agent-container2 os-agent-container3)
+readonly CONTAINERS=(os-agent-runtime os-agent-container1 os-agent-container2 os-agent-container3)
 
 install -d -o root -g vector -m 0750 "$(dirname "$OUTPUT")" "$STATE_DIR"
 touch "$OUTPUT"

@@ -18,7 +18,6 @@ export function EnvironmentSelector({ modes, selected, onChange }: EnvironmentSe
           >
             <input
               checked={selected === mode.id}
-              disabled={!mode.enabled}
               name="subject-mode"
               onChange={() => onChange(mode.id)}
               type="radio"
@@ -35,4 +34,3 @@ export function EnvironmentSelector({ modes, selected, onChange }: EnvironmentSe
     </fieldset>
   );
 }
-

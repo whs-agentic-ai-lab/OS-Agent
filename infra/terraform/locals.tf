@@ -4,7 +4,7 @@ locals {
   u1                = local.topology.host_users.U1
   u2                = local.topology.host_users.U2
   supervisor_group  = local.topology.system_groups.supervisor
-  resource_prefix   = "${var.project_name}-${var.environment_id}"
+  resource_prefix   = var.environment_id
 
   expected_action_paths = {
     U1C1 = { source = "U1", target = "C1" }

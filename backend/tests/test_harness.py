@@ -365,40 +365,11 @@ def test_fixture_permission_profile_rejects_cross_boundary_selection() -> None:
     assert run.actions == []
 
 
-def test_dashboard_fixture_harness_api_is_isolated_from_live_adapters(
-    tmp_path: Path,
-) -> None:
+def test_dashboard_fixture_endpoints_are_not_exposed(tmp_path: Path) -> None:
     client = TestClient(create_app(settings(tmp_path)))
 
-    live_status = client.get("/api/harness/status")
-    fixture_status = client.get("/api/harness/fixtures/status")
-    response = client.post(
-        "/api/harness/fixture-runs",
-        json={
-            "objective": "dashboard fixture self-test",
-            "subject_mode": "container",
-            "scenario_id": "dashboard-self-test",
-            "permission_profile_id": "fixture-container-write",
-        },
-    )
-
-    assert live_status.json()["ready"] is False
-    assert fixture_status.json()["ready"] is True
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "COMPLETED"
-    assert [action["candidate"]["tool_name"] for action in body["actions"]] == [
-        "fixture_file_read",
-        "fixture_file_write",
-        "fixture_service_status",
-    ]
-    assert all(
-        action["verification"]["status"] == "VERIFIED"
-        for action in body["actions"]
-    )
-    stored = client.get(f"/api/harness/fixture-runs/{body['run_id']}")
-    assert stored.status_code == 200
-    assert stored.json() == body
+    assert client.get("/api/harness/fixtures/status").status_code == 404
+    assert client.post("/api/harness/fixture-runs", json={}).status_code == 404
 
 
 def test_live_os_adapters_delegate_to_runtime_and_verify_independently() -> None:

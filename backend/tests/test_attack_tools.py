@@ -11,6 +11,8 @@ from app.attack_tools import (
     IMPLEMENTED_ATTACK_TOOLS,
     validate_attack_tool_call,
 )
+from app.catalog import TRUST_BOUNDARIES
+from app.config import Settings
 from app.model_gateway import ModelGateway
 from runtime_agent import runtime
 
@@ -87,6 +89,74 @@ def test_local_model_gateway_returns_canonical_structured_call() -> None:
         "resource_ref": "target-canary",
         "arguments": {"content": "test"},
     }
+
+
+def test_openrouter_gateway_uses_the_requested_dashboard_model(monkeypatch, tmp_path) -> None:
+    gateway = ModelGateway(
+        Settings(
+            openrouter_api_key="test-key",
+            openrouter_model="openai/gpt-4o-mini",
+            allowed_origins=("http://127.0.0.1:5173",),
+            runtime_dir=tmp_path,
+        )
+    )
+
+    class FakeResponse:
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "file_content",
+                                        "arguments": {
+                                            "action": "read",
+                                            "resource_ref": "target-canary",
+                                            "arguments": {},
+                                        },
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    captured: dict = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return FakeResponse()
+
+    monkeypatch.setattr("app.model_gateway.httpx.post", fake_post)
+    gateway.decide(
+        "Canary 파일을 읽어줘",
+        TRUST_BOUNDARIES[0],
+        "deepseek/deepseek-v4-flash-0731",
+    )
+
+    assert captured["model"] == "deepseek/deepseek-v4-flash-0731"
+
+
+def test_openrouter_gateway_rejects_models_outside_the_dashboard_allowlist(tmp_path) -> None:
+    gateway = ModelGateway(
+        Settings(
+            openrouter_api_key="test-key",
+            openrouter_model="openai/gpt-4o-mini",
+            allowed_origins=("http://127.0.0.1:5173",),
+            runtime_dir=tmp_path,
+        )
+    )
+
+    with pytest.raises(ValueError, match="허용되지 않은"):
+        gateway.resolve_model("example/unknown-model")
 
 
 def test_runtime_executes_registered_file_content_without_raw_path(monkeypatch, tmp_path) -> None:

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -144,6 +145,11 @@ def test_options_have_two_executors_eight_boundaries_and_attack_tool_catalog(tmp
         "process.procfs",
         "sudo.run",
     }
+    assert [item["id"] for item in body["planner_models"]] == [
+        "deepseek/deepseek-v4-flash-0731",
+        "z-ai/glm-5.3-flash",
+        "openai/gpt-5-mini",
+    ]
     assert {item["id"] for item in body["trust_boundaries"]} == {
         "TB-HH-U1U2",
         "TB-HC-U1C1",
@@ -160,7 +166,7 @@ def test_health_advertises_profile_runtime_api(tmp_path: Path) -> None:
     response = make_client(tmp_path).get("/api/health")
 
     assert response.status_code == 200
-    assert response.json()["run_api_version"] == "permission-control-runtime-v5"
+    assert response.json()["run_api_version"] == "permission-control-runtime-v6"
 
 
 def test_local_backend_disables_host_without_supervisor_socket(tmp_path: Path) -> None:
@@ -490,15 +496,134 @@ def test_reconcile_imports_existing_orphaned_flow_log_group(tmp_path: Path) -> N
             "import",
             f"-state={state_path}",
             "-input=false",
-            "-var=project_name=os-agent-test-vinny-abc123-permission",
+            "-var=project_name=os-agent",
             "-var=environment_id=os-agent-test-vinny-abc123-permission",
             "-var=created_by=vinny",
             "-var=owner_arn=arn:aws:sts::123456789012:assumed-role/Admin/vinny",
+            "-var=aws_profile=whs-team",
+            "-var=confirm_new_state=true",
             "aws_cloudwatch_log_group.vpc_flow_logs[0]",
             "/os-agent-test-vinny-abc123-permission/vpc-flow-logs",
         ],
         tmp_path,
     )
+
+
+def test_deploy_reconfigures_default_local_backend_and_uses_three_digest_images(
+    tmp_path: Path,
+) -> None:
+    manager = DeploymentManager(
+        Settings(
+            openrouter_api_key=None,
+            openrouter_model="test-model",
+            allowed_origins=("http://127.0.0.1:5173",),
+            runtime_dir=tmp_path / "runtime",
+            terraform_dir=tmp_path / "terraform",
+            backend_context=tmp_path / "backend",
+        )
+    )
+    manager._executables = {
+        "terraform": "terraform",
+        "aws": "aws",
+        "docker": "docker",
+    }
+    manager._reconcile_flow_log_group = Mock()
+    manager._command = Mock()
+    digest = "sha256:" + "a" * 64
+    manager._capture = Mock(
+        side_effect=[
+            "ami-0123456789abcdef0\n",
+            json.dumps(
+                {
+                    "runtime": "123.dkr.ecr.us-east-1.amazonaws.com/test-runtime",
+                    "container1": "123.dkr.ecr.us-east-1.amazonaws.com/test-container1",
+                    "target": "123.dkr.ecr.us-east-1.amazonaws.com/test-target",
+                }
+            ),
+            "ecr-password",
+            digest,
+            digest,
+            digest,
+            json.dumps({"trial_ec2_instance_id": {"value": "i-0123456789abcdef0"}}),
+        ]
+    )
+    environment = EnvironmentContext(
+        environment_name="0005",
+        environment_id="os-agent-test-hanbin-074709-0005",
+        created_by="hanbin",
+        owner_arn="arn:aws:iam::123456789012:user/hanbin",
+        account_id="123456789012",
+    )
+
+    manager._deploy(environment)
+
+    commands = [call.args[0] for call in manager._command.call_args_list]
+    assert ["terraform", "init", "-reconfigure", "-input=false"] in commands
+    assert any("-target=aws_ecr_repository.images" in command for command in commands)
+    build_commands = [command for command in commands if command[:2] == ["docker", "build"]]
+    assert len(build_commands) == 3
+    assert all("linux/amd64" in command for command in build_commands)
+    final_apply = [
+        command
+        for command in commands
+        if command[:2] == ["terraform", "apply"]
+        and "-target=aws_ecr_repository.images" not in command
+    ]
+    assert len(final_apply) == 1
+    assert f"-var=runtime_image_digest={digest}" in final_apply[0]
+    assert f"-var=container1_image_digest={digest}" in final_apply[0]
+    assert f"-var=target_image_digest={digest}" in final_apply[0]
+    assert manager.get_status().status == "succeeded"
+
+
+def test_destroy_without_state_is_a_safe_noop(tmp_path: Path) -> None:
+    manager = DeploymentManager(
+        Settings(
+            openrouter_api_key=None,
+            openrouter_model="test-model",
+            allowed_origins=("http://127.0.0.1:5173",),
+            runtime_dir=tmp_path / "runtime",
+            terraform_dir=tmp_path / "terraform",
+            backend_context=tmp_path / "backend",
+        )
+    )
+    manager._executables = {"terraform": "terraform", "aws": "aws"}
+    manager._command = Mock()
+    manager._delete_orphaned_flow_log_group = Mock()
+    environment = EnvironmentContext(
+        environment_name="0005",
+        environment_id="os-agent-test-hanbin-074709-0005",
+        created_by="hanbin",
+        owner_arn="arn:aws:iam::123456789012:user/hanbin",
+        account_id="123456789012",
+    )
+    manager._save_environment_context(environment)
+
+    manager._destroy(environment.environment_id)
+
+    manager._command.assert_called_once_with(
+        ["terraform", "init", "-reconfigure", "-input=false"],
+        manager.settings.terraform_dir,
+    )
+    assert manager.get_status().status == "succeeded"
+    assert "삭제할 Terraform 리소스가 없습니다" in manager.get_status().logs[-1].message
+
+
+def test_deployment_uses_controller_owned_terraform_data_dir(tmp_path: Path) -> None:
+    manager = DeploymentManager(
+        Settings(
+            openrouter_api_key=None,
+            openrouter_model="test-model",
+            allowed_origins=("http://127.0.0.1:5173",),
+            runtime_dir=tmp_path / "runtime",
+        )
+    )
+
+    environment = manager._environment()
+
+    expected = (tmp_path / "runtime" / "terraform-data" / "dashboard-controller").resolve()
+    assert Path(environment["TF_DATA_DIR"]) == expected
+    assert expected.is_dir()
 
 
 def test_environment_id_is_scoped_to_aws_identity(tmp_path: Path) -> None:
