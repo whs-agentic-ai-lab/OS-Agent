@@ -73,6 +73,7 @@ export interface PlannerModelOption {
 export interface HealthResponse {
   status: string;
   run_api_version?: "permission-control-runtime-v5" | "permission-control-runtime-v6";
+  agent_run_api_version?: "os-agent-orchestrator-v1" | "os-agent-orchestrator-v2";
   harness_api_version?: "os-harness-v1";
   planner: string;
   storage: string;
@@ -111,7 +112,7 @@ export interface PermissionRunResult {
 
 export interface RunEvent {
   sequence: number;
-  source: "profile" | "model" | "tool_runner" | "executor" | "runtime_agent" | "supervisor" | "verifier";
+  source: "profile" | "model" | "tool_runner" | "executor" | "runtime_agent" | "supervisor" | "verifier" | "orchestrator" | "recon" | "analyzer" | "planner" | "policy" | "rollback";
   event_type: string;
   message: string;
   payload: Record<string, unknown>;
@@ -171,6 +172,103 @@ export interface RunListResponse {
 export interface RunDeleteResponse {
   run_id: string;
   deleted: boolean;
+}
+
+export interface AgentBudget {
+  max_steps_per_tb: number;
+  max_tool_calls_per_tb: number;
+  max_elapsed_seconds_per_tb: number;
+  max_changed_targets_per_tb: number;
+  max_output_bytes_per_tool: number;
+}
+
+export interface FixedPermissionProfiles {
+  host: Record<string, boolean>;
+  container: Record<string, boolean>;
+}
+
+export interface AgentRunRequest {
+  scope: "all_trust_boundaries";
+  fixed_permission_profiles: FixedPermissionProfiles;
+  planner_model?: PlannerModelId;
+}
+
+export interface AgentFinding {
+  finding_id: string;
+  trust_boundary_id: string;
+  title: string;
+  preconditions: string[];
+  impact: string;
+  confidence: number;
+  evidence_refs: string[];
+  executable: boolean;
+  blocked_reason: string | null;
+}
+
+export interface AgentPlanStep {
+  step_id: string;
+  type: "observe" | "execute" | "verify" | "rollback";
+  tool: string;
+  action: string;
+  resource_ref: string;
+  expected_result: "allowed" | "denied" | "observed" | "restored";
+  status: string;
+}
+
+export interface TbScenario {
+  scenario_id: string;
+  trust_boundary_id: string;
+  risk_level: "critical" | "high" | "medium" | "low";
+  risk_score: number;
+  objective: string;
+  impact: string;
+  tool_implemented: boolean;
+  steps: AgentPlanStep[];
+}
+
+export interface TbResult {
+  trust_boundary_id: string;
+  source_environment: EnvironmentNodeId;
+  target_environment: EnvironmentNodeId;
+  verdict: "BROKEN" | "BLOCKED" | "INCONCLUSIVE";
+  highest_impact: string;
+  attack_path: string[];
+  fixed_permissions_used: string[];
+  effective_identity: Record<string, unknown>;
+  risk_score: number;
+  proof_level: "L0_INFERRED" | "L1_REACHABLE" | "L2_EXECUTED" | "L3_IMPACTED" | "L4_RESTORED";
+  evidence_refs: string[];
+  rollback_status: "NOT_REQUIRED" | "VERIFIED" | "FAILED";
+  scenario: TbScenario;
+  runtime_result: "allowed" | "denied" | "error" | null;
+  explanation: string;
+}
+
+export interface AgentRunRecord {
+  run_id: string;
+  objective: string;
+  scope: "all_trust_boundaries";
+  status: "RECEIVED" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED";
+  agent_stage: "profile" | "recon" | "analyze" | "plan" | "execute" | "compare" | "finished";
+  fixed_permission_profiles: FixedPermissionProfiles;
+  profile_hash: string;
+  effective_permissions: Record<string, Record<string, unknown>>;
+  recon_snapshot: Record<string, unknown>;
+  infrastructure_snapshot: Record<string, unknown>;
+  findings: AgentFinding[];
+  tb_scenarios: TbScenario[];
+  tb_results: TbResult[];
+  worst_case_scenario: TbScenario | null;
+  summary: { broken: number; blocked: number; inconclusive: number };
+  budget: AgentBudget;
+  planner_mode: "local" | "openrouter";
+  planner_model: PlannerModelId | null;
+  rollback_status: "NOT_REQUIRED" | "VERIFIED" | "FAILED";
+  profile_application_checks: Record<string, Record<string, boolean>>;
+  profile_warnings: string[];
+  events: RunEvent[];
+  created_at: string;
+  completed_at: string | null;
 }
 
 export type DeploymentState = "not_ready" | "idle" | "running" | "succeeded" | "failed";

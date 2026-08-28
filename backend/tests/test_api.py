@@ -14,12 +14,19 @@ from app.deployment import (
 from app.main import create_app
 from app.catalog import build_profile_id
 from app.permission_controls import PROFILE_DEFAULTS
-from app.schemas import RuntimeAgentResult, RuntimeDispatchRequest, SubjectMode
+from app.schemas import (
+    RuntimeAgentResult,
+    RuntimeDispatchRequest,
+    RuntimeResetRequest,
+    RuntimeResetResult,
+    SubjectMode,
+)
 
 
 class FakeRuntime:
     def __init__(self) -> None:
         self.requests: list[RuntimeDispatchRequest] = []
+        self.reset_requests: list[RuntimeResetRequest] = []
 
     @staticmethod
     def is_available(subject_mode: SubjectMode | None = None) -> bool:
@@ -103,6 +110,14 @@ class FakeRuntime:
             after_sha256=after,
         )
 
+    def reset_harness(self, request: RuntimeResetRequest) -> RuntimeResetResult:
+        self.reset_requests.append(request)
+        return RuntimeResetResult(
+            status="RESET",
+            evidence_refs=[f"reset:{request.trust_boundary_id}"],
+            restored_state={"target_environment": request.target_environment},
+        )
+
 
 def profile_for(mode: str, **updates: bool) -> dict[str, bool]:
     profile = dict(PROFILE_DEFAULTS[SubjectMode(mode)])
@@ -167,6 +182,58 @@ def test_health_advertises_profile_runtime_api(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert response.json()["run_api_version"] == "permission-control-runtime-v6"
+    assert response.json()["agent_run_api_version"] == "os-agent-orchestrator-v2"
+
+
+def test_agent_run_recons_and_tests_all_eight_boundaries_with_one_profile_hash(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    settings = Settings(
+        openrouter_api_key=None,
+        openrouter_model="test-model",
+        allowed_origins=("http://127.0.0.1:5173",),
+        runtime_dir=tmp_path,
+    )
+    client = TestClient(create_app(settings, runtime_client=runtime))
+
+    response = client.post(
+        "/api/agent-runs",
+        json={
+            "fixed_permission_profiles": {
+                "host": profile_for("host", group_write=True),
+                "container": profile_for(
+                    "container", mount_write=True, supplementary_group=True
+                ),
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "COMPLETED"
+    assert "공격 가설을 스스로 생성" in body["objective"]
+    assert body["profile_hash"].startswith("sha256:")
+    assert len(body["tb_results"]) == 8
+    assert body["summary"] == {"broken": 8, "blocked": 0, "inconclusive": 0}
+    assert {item["proof_level"] for item in body["tb_results"]} == {"L4_RESTORED"}
+    assert len(runtime.requests) == 10
+    assert len(runtime.reset_requests) == 10
+    assert all(
+        event["payload"]["profile_hash"] == body["profile_hash"]
+        for event in body["events"]
+    )
+    run_id = body["run_id"]
+    assert client.get(f"/api/agent-runs/{run_id}").status_code == 200
+    assert len(client.get(f"/api/agent-runs/{run_id}/findings").json()) == 8
+    assert len(client.get(f"/api/agent-runs/{run_id}/plan").json()) == 8
+
+
+def test_agent_run_rejects_user_supplied_prompt(tmp_path: Path) -> None:
+    response = make_client(tmp_path).post(
+        "/api/agent-runs",
+        json={"prompt": "사용자가 공격 명령을 선택한다"},
+    )
+
+    assert response.status_code == 422
 
 
 def test_local_backend_disables_host_without_supervisor_socket(tmp_path: Path) -> None:
