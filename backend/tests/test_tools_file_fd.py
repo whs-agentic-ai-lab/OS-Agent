@@ -14,7 +14,7 @@ import stat as stat_module
 
 import pytest
 
-from runtime_agent.tools import ToolContext, dispatch, known_tools
+from runtime_agent.tools import ToolContext, dispatch, known_tools, reset, verify
 
 
 @pytest.fixture
@@ -46,6 +46,7 @@ def test_all_5_2_tools_registered():
     expected = {
         "file.open": {"read", "write", "append", "execute", "opath"},
         "file.create": {"file", "directory", "fifo"},
+        "file.content": {"read", "write", "append", "truncate", "copy"},
         "file.remove": {"unlink", "rmdir"},
         "file.move_link": {"rename", "hardlink", "symlink", "follow"},
         "file.metadata": {"chmod", "chown", "chgrp", "set_times"},
@@ -57,6 +58,8 @@ def test_all_5_2_tools_registered():
         "fd.operate": {"read", "write", "seek", "truncate", "dup", "close"},
         "fd.transfer": {"inherit", "scm_send", "scm_receive", "pidfd_getfd"},
     }
+    assert len(expected) == 13
+    assert sum(len(actions) for actions in expected.values()) == 49
     for tool_id, actions in expected.items():
         assert tool_id in tools, f"{tool_id} 미등록"
         assert set(tools[tool_id]) == actions, f"{tool_id} action 불일치"
@@ -100,6 +103,80 @@ def test_file_create_and_registered(context, tmp_path):
     outcome = dispatch("file.create", "file", {"resource_ref": "target-dir", "name": "probe.bin"}, context)
     assert outcome.outcome == "ALLOWED"
     assert (tmp_path / "probe.bin").exists()
+
+
+@pytest.mark.parametrize("executor_mode", ["host", "container"])
+def test_file_content_read_allowed(context, executor_mode):
+    context.executor_mode = executor_mode
+    outcome = dispatch("file.content", "read", {"resource_ref": "target-canary"}, context)
+    assert outcome.outcome == "ALLOWED"
+    assert "decoy-marker" in outcome.output
+    assert outcome.rollback_status == "NOT_REQUIRED"
+    assert verify("file.content", "read", outcome) is True
+
+
+@pytest.mark.parametrize(
+    ("action", "arguments", "reached_size"),
+    [
+        ("write", {"content": "changed"}, len("changed")),
+        ("append", {"content": "changed"}, len("decoy-marker\nchanged")),
+        ("truncate", {}, 0),
+    ],
+)
+def test_file_content_changes_are_rolled_back(context, canary, action, arguments, reached_size):
+    before = canary.read_bytes()
+    outcome = dispatch(
+        "file.content",
+        action,
+        {"resource_ref": "target-canary", **arguments},
+        context,
+    )
+    assert outcome.outcome == "ALLOWED"
+    assert outcome.rollback_status == "VERIFIED"
+    assert outcome.state_reached["size"] == reached_size
+    assert outcome.state_before == outcome.state_after
+    assert canary.read_bytes() == before
+    assert verify("file.content", action, outcome) is True
+    assert reset("file.content", action, outcome, context) == "DONE"
+
+
+def test_file_content_copy_is_rolled_back(context, canary, tmp_path):
+    destination = tmp_path / "destination.txt"
+    destination.write_text("original", encoding="utf-8")
+    copy_context = ToolContext(
+        run_id=context.run_id,
+        action_id=context.action_id,
+        executor_mode=context.executor_mode,
+        trust_boundary_id=context.trust_boundary_id,
+        source=context.source,
+        target=context.target,
+        allowed_targets=frozenset({"target-canary", "target-copy"}),
+        resource_paths={"target-canary": str(canary), "target-copy": str(destination)},
+    )
+    outcome = dispatch(
+        "file.content",
+        "copy",
+        {"resource_ref": "target-canary", "dest_ref": "target-copy"},
+        copy_context,
+    )
+    assert outcome.outcome == "ALLOWED"
+    assert outcome.rollback_status == "VERIFIED"
+    assert outcome.state_reached["size"] == len(canary.read_bytes())
+    assert destination.read_text(encoding="utf-8") == "original"
+    assert verify("file.content", "copy", outcome) is True
+    assert reset("file.content", "copy", outcome, copy_context) == "DONE"
+
+
+def test_file_content_rejects_missing_or_oversized_content(context):
+    missing = dispatch("file.content", "write", {"resource_ref": "target-canary"}, context)
+    oversized = dispatch(
+        "file.content",
+        "append",
+        {"resource_ref": "target-canary", "content": "x" * 129},
+        context,
+    )
+    assert missing.outcome == "POLICY_BLOCKED"
+    assert oversized.outcome == "POLICY_BLOCKED"
 
 
 def test_fd_operate_read_allowed(context, canary):

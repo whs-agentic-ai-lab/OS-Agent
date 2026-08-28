@@ -1,4 +1,4 @@
-"""OStool 정리.md 5.2 파일·디렉터리·FD — 12개 Tool (file.content 제외, runtime.py 기구현).
+"""OStool 정리.md 5.2 파일·디렉터리·FD — canonical 13개 Tool / 49개 Action.
 
 각 register는 ToolSpec을 선언하고, dispatch가 실행 전에 요구 1·2·7을 자동 강제한다:
   1) allowed_executors / allowed_tbs — Executor·Trust Boundary 매트릭스
@@ -59,10 +59,92 @@ MAX_HANDLE_SZ = 128
 # resource_kind="path" tool은 어느 Executor에서도 시도 가능(권한은 OS가 결정) → 기본 executors 전체.
 _PATH = "path"
 _FD = "fd"
+_MAX_RESTORE_BYTES = 1024 * 1024
+_READ_OUTPUT_BYTES = 4096
 
 
 def _target_path(arguments: dict[str, Any], context: ToolContext) -> str:
     return context.resolve_path(str_arg(arguments, "resource_ref"))
+
+
+def _read_regular(path: str, *, limit: int, complete: bool) -> tuple[bytes, os.stat_result]:
+    """symlink/FIFO/device를 따르지 않고 제한된 크기의 일반 파일만 읽는다."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat_module.S_ISREG(st.st_mode):
+            raise ToolPolicyBlocked("file.content는 등록된 일반 파일 Target에만 사용할 수 있습니다.")
+        if complete and st.st_size > limit:
+            raise ToolPolicyBlocked(f"rollback 대상 파일은 {limit}바이트 이하여야 합니다.")
+        remaining = limit + (1 if complete else 0)
+        chunks: list[bytes] = []
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if complete and len(data) > limit:
+            raise ToolPolicyBlocked(f"rollback 대상 파일은 {limit}바이트 이하여야 합니다.")
+        return data[:limit], st
+    finally:
+        os.close(fd)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(errno_module.EIO, "파일 쓰기가 진행되지 않았습니다.")
+        view = view[written:]
+
+
+def _capture_for_restore(path: str, *, allow_missing: bool = False) -> tuple[bytes, os.stat_result] | None:
+    try:
+        return _read_regular(path, limit=_MAX_RESTORE_BYTES, complete=True)
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise
+
+
+def _restore_content(path: str, original: tuple[bytes, os.stat_result] | None) -> None:
+    if original is None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return
+
+    content, st = original
+    flags = os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        _write_all(fd, content)
+        os.fchmod(fd, stat_module.S_IMODE(st.st_mode))
+    finally:
+        os.close(fd)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+
+
+def _verify_file_content(outcome: ToolOutcome) -> bool:
+    if not outcome.attempted or outcome.outcome not in {"ALLOWED", "OS_DENIED"}:
+        return False
+    if outcome.action == "read" or outcome.outcome == "OS_DENIED":
+        return outcome.rollback_status != "FAILED"
+    return outcome.rollback_status == "VERIFIED" and outcome.state_before == outcome.state_after
+
+
+def _file_content_reset(outcome: ToolOutcome, context: ToolContext) -> None:
+    """inline rollback 뒤 현재 상태가 초기 상태와 같은지 Harness Reset 단계에서 재확인한다."""
+    del context
+    before = outcome.state_before or {}
+    path = before.get("path")
+    if not isinstance(path, str) or path_state(path) != before:
+        raise OSError(errno_module.EIO, "file.content 복구 상태 검증 실패")
 
 
 # ═══ 8. file.open ═══════════════════════════════════════════════════════════
@@ -160,6 +242,135 @@ def _file_create(action: str, arguments: dict[str, Any], context: ToolContext) -
     if outcome.outcome == "ALLOWED":
         outcome.state_after = {"path": target}  # Reset이 참조
     return outcome
+
+
+# ═══ 10. file.content (실제 I/O + 즉시 rollback) ═══════════════════════════
+_FILE_CONTENT_TOOL = "file.content"
+_CONTENT_READ_SPEC = ToolSpec(resource_kind=_PATH)
+_CONTENT_WRITE_SPEC = ToolSpec(
+    resource_kind=_PATH,
+    arg_schema={"content": str},
+    required_args=frozenset({"content"}),
+    reversible=True,
+)
+_CONTENT_MUTATE_SPEC = ToolSpec(resource_kind=_PATH, reversible=True)
+_CONTENT_COPY_SPEC = ToolSpec(
+    resource_kind=_PATH,
+    arg_schema={"dest_ref": str},
+    required_args=frozenset({"dest_ref"}),
+    reversible=True,
+)
+
+
+@register(_FILE_CONTENT_TOOL, "read", spec=_CONTENT_READ_SPEC, verify=_verify_file_content)
+def _file_content_read(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
+    path = _target_path(arguments, context)
+    before = path_state(path)
+
+    def _op() -> str:
+        data, st = _read_regular(path, limit=_READ_OUTPUT_BYTES, complete=False)
+        suffix = " (truncated)" if st.st_size > len(data) else ""
+        return f"{data.decode('utf-8', errors='replace')}{suffix}"
+
+    outcome = attempt(_FILE_CONTENT_TOOL, action, _op)
+    outcome.state_before = before
+    outcome.state_after = path_state(path)
+    outcome.rollback_status = "NOT_REQUIRED"
+    return outcome
+
+
+@register(
+    _FILE_CONTENT_TOOL,
+    "write",
+    spec=_CONTENT_WRITE_SPEC,
+    verify=_verify_file_content,
+    reset=_file_content_reset,
+)
+@register(
+    _FILE_CONTENT_TOOL,
+    "append",
+    spec=_CONTENT_WRITE_SPEC,
+    verify=_verify_file_content,
+    reset=_file_content_reset,
+)
+@register(
+    _FILE_CONTENT_TOOL,
+    "truncate",
+    spec=_CONTENT_MUTATE_SPEC,
+    verify=_verify_file_content,
+    reset=_file_content_reset,
+)
+def _file_content_change(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
+    path = _target_path(arguments, context)
+    original: dict[str, tuple[bytes, os.stat_result] | None] = {}
+
+    def _mutate() -> str:
+        original["value"] = _capture_for_restore(path)
+        try:
+            if action == "truncate":
+                os.truncate(path, 0)
+                return "truncated to 0B"
+            content = bounded_content(arguments).encode()
+            flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+            if action == "write":
+                flags |= os.O_TRUNC
+            else:
+                flags |= os.O_APPEND
+            fd = os.open(path, flags)
+            try:
+                _write_all(fd, content)
+            finally:
+                os.close(fd)
+            return f"{action} {len(content)}B"
+        except OSError:
+            _restore_content(path, original["value"])
+            raise
+
+    return probe(
+        _FILE_CONTENT_TOOL,
+        action,
+        mutate=_mutate,
+        snapshot_state=lambda: path_state(path),
+        restore=lambda: _restore_content(path, original["value"]),
+    )
+
+
+@register(
+    _FILE_CONTENT_TOOL,
+    "copy",
+    spec=_CONTENT_COPY_SPEC,
+    verify=_verify_file_content,
+    reset=_file_content_reset,
+)
+def _file_content_copy(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
+    source = _target_path(arguments, context)
+    destination = context.resolve_path(str_arg(arguments, "dest_ref"))
+    if os.path.abspath(source) == os.path.abspath(destination):
+        raise ToolInputError("copy의 source와 destination은 서로 다른 resource_ref여야 합니다.")
+    original: dict[str, tuple[bytes, os.stat_result] | None] = {}
+
+    def _mutate() -> str:
+        source_content, _ = _read_regular(source, limit=_MAX_RESTORE_BYTES, complete=True)
+        original["value"] = _capture_for_restore(destination, allow_missing=True)
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(destination, flags, 0o600)
+            try:
+                _write_all(fd, source_content)
+            finally:
+                os.close(fd)
+            return f"copied {len(source_content)}B"
+        except OSError:
+            _restore_content(destination, original["value"])
+            raise
+
+    return probe(
+        _FILE_CONTENT_TOOL,
+        action,
+        mutate=_mutate,
+        snapshot_state=lambda: path_state(destination),
+        restore=lambda: _restore_content(destination, original["value"]),
+    )
 
 
 # ═══ 11. file.remove (destructive) ══════════════════════════════════════════
