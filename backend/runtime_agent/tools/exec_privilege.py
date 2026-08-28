@@ -34,7 +34,8 @@ from .base import (
     probe,
     register,
     identity_snapshot,
-    path_state,
+    register_reset,
+    register_verifier,
     str_arg,
 )
 
@@ -94,7 +95,7 @@ def _exec_run_do(arguments: Dict[str, Any], context: ToolContext) -> Dict[str, A
         }
     except subprocess.TimeoutExpired:
         raise TimeoutError("Execution timeout")
-    except Exception as e:
+    except Exception:
         raise
 
 
@@ -175,7 +176,7 @@ def _exec_env_do(arguments: Dict[str, Any], context: ToolContext) -> Dict[str, A
             "identity_before": identity_before,
             "identity_after": identity_after,
         }
-    except Exception as e:
+    except Exception:
         raise
 
 
@@ -706,6 +707,54 @@ def _chroot_run(action: str, arguments: Dict[str, Any], context: ToolContext) ->
         return f"chroot attempted exit={code}"
 
     return attempt(_CHROOT_TOOL, "run", _op)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5.3 Tool별 Verifier / inline Reset 확인
+# ══════════════════════════════════════════════════════════════════════════════
+_EXEC_ACTIONS = {
+    _EXEC_RUN_TOOL: frozenset({"binary", "script", "interpreter", "path_lookup"}),
+    _EXEC_ENV_TOOL: frozenset({"run"}),
+    _EXEC_PRIV_TOOL: frozenset({"suid_exec", "sgid_exec", "filecap_exec"}),
+    _FILECAP_TOOL: frozenset({"get", "set_probe", "remove_probe"}),
+    _SUDO_TOOL: frozenset({"list", "run_probe"}),
+    _POLKIT_TOOL: frozenset({"check", "invoke"}),
+    _DBUS_TOOL: frozenset({"call"}),
+    _SUPERVISOR_TOOL: frozenset({"request"}),
+    _TOOLCHAIN_TOOL: frozenset({"compile", "interpret"}),
+    _CHROOT_TOOL: frozenset({"create", "run"}),
+}
+_INLINE_REVERSIBLE = frozenset({
+    (_FILECAP_TOOL, "set_probe"),
+    (_FILECAP_TOOL, "remove_probe"),
+})
+
+
+def _verify_execution(outcome: ToolOutcome) -> bool:
+    if not outcome.attempted or outcome.outcome not in {"ALLOWED", "OS_DENIED"}:
+        return False
+    if outcome.rollback_status == "FAILED":
+        return False
+    if outcome.identity_after != outcome.identity_before:
+        return False
+    if (outcome.tool, outcome.action) in _INLINE_REVERSIBLE:
+        return outcome.outcome == "OS_DENIED" or (
+            outcome.rollback_status == "VERIFIED" and outcome.changed is False
+        )
+    return True
+
+
+def _confirm_execution_reset(outcome: ToolOutcome, context: ToolContext) -> None:
+    del context
+    if outcome.rollback_status != "VERIFIED" or outcome.changed:
+        raise OSError(errno_module.EIO, "execution inline rollback was not verified")
+
+
+for _tool_id, _actions in _EXEC_ACTIONS.items():
+    for _action_id in _actions:
+        register_verifier(_tool_id, _action_id, _verify_execution)
+        if (_tool_id, _action_id) in _INLINE_REVERSIBLE:
+            register_reset(_tool_id, _action_id, _confirm_execution_reset)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import os
 
 import pytest
 
-from runtime_agent.tools import ToolContext, dispatch, known_tools
+from runtime_agent.tools import ToolContext, dispatch, known_tools, verify
 
 
 @pytest.fixture
@@ -38,6 +38,10 @@ def test_all_5_5_tools_registered():
         "process.signal": {"send_pid", "send_group", "send_session"},
         "process.ptrace": {"attach", "read", "write", "trace_syscalls", "detach"},
         "process.memory": {"read", "write"},
+        "process.procfs": {
+            "read_environ", "read_cmdline", "read_maps", "read_mem",
+            "list_fd", "read_root", "read_cwd",
+        },
         "process.security_state": {"set_dumpable", "set_ptracer", "set_name", "set_core_limit"},
         "process.pidfd": {"open", "signal", "wait", "getfd"},
         "process.schedule": {"set_nice", "set_priority", "set_scheduler", "set_affinity"},
@@ -51,6 +55,21 @@ def test_all_5_5_tools_registered():
     for tool_id, actions in expected.items():
         assert tool_id in tools, f"{tool_id} 미등록"
         assert set(tools[tool_id]) == actions, f"{tool_id} action 불일치"
+    assert len(expected) == 14
+    assert sum(map(len, expected.values())) == 51
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self"), reason="Linux procfs가 필요한 테스트")
+@pytest.mark.parametrize(
+    "action",
+    ["read_environ", "read_cmdline", "read_maps", "read_mem", "list_fd", "read_root", "read_cwd"],
+)
+def test_procfs_self_actions_are_registered_and_verified(context, action):
+    outcome = dispatch("process.procfs", action, {}, context)
+    assert outcome.attempted is True
+    assert outcome.outcome in {"ALLOWED", "OS_DENIED", "ERROR"}
+    if outcome.outcome in {"ALLOWED", "OS_DENIED"}:
+        assert verify("process.procfs", action, outcome) is True
 
 
 def test_spawn_allowed(context):
@@ -115,11 +134,25 @@ def test_set_affinity_probe_rolls_back(context):
 
 
 def test_set_nice_probe(context):
+    # setpriority는 비특권 프로세스가 값을 올릴 수는 있어도 되돌리는 건 EPERM으로 실패한다
+    # (POSIX). 그래서 이 tool은 자식 프로세스에서만 시도하고 버리는 _in_child_probe 방식으로
+    # 구현되어 있다 — 부모(에이전트) 상태가 애초에 안 바뀌므로 rollback이 NOT_REQUIRED다.
     outcome = dispatch("process.schedule", "set_nice", {"nice": 5}, context)
     assert outcome.attempted is True
     assert outcome.outcome in STRUCTURED
     if outcome.outcome == "ALLOWED":
-        assert outcome.rollback_status == "VERIFIED"
+        assert outcome.rollback_status == "NOT_REQUIRED"
+        # 부모 프로세스의 실제 nice 값은 자식 시도와 무관하게 그대로여야 한다.
+        assert os.getpriority(os.PRIO_PROCESS, 0) == 0
+
+
+def test_set_priority_probe(context):
+    outcome = dispatch("process.schedule", "set_priority", {"priority": 3}, context)
+    assert outcome.attempted is True
+    assert outcome.outcome in STRUCTURED
+    if outcome.outcome == "ALLOWED":
+        assert outcome.rollback_status == "NOT_REQUIRED"
+        assert os.getpriority(os.PRIO_PROCESS, 0) == 0
 
 
 def test_mlock_probe(context):

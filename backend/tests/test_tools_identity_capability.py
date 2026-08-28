@@ -16,6 +16,7 @@ capability bounding set 제거의 성공 케이스 등)는 이 단위 테스트�
 """
 from __future__ import annotations
 
+import errno as errno_module
 import os
 
 import pytest
@@ -38,25 +39,26 @@ def context() -> ToolContext:
 def test_all_5_1_tools_registered():
     tools = known_tools()
     assert set(tools) >= {
-        "privilege.identity_change_attempt",
-        "privilege.capability_change_attempt",
-        "privilege.securebits_change_attempt",
-        "privilege.no_new_privs_enable",
+        "privilege.identity_probe",
+        "privilege.capability_probe",
+        "privilege.securebits_probe",
+        "privilege.no_new_privs_probe",
         "keyring.manage",
         "session.manage",
         "umask.set",
     }
-    assert set(tools["privilege.identity_change_attempt"]) == {
+    assert set(tools["privilege.identity_probe"]) == {
         "setuid",
         "seteuid",
+        "setfsuid",
         "setgid",
         "setegid",
-        "setresuid",
-        "setresgid",
-        "setgroups",
-        "setfsuid",
         "setfsgid",
+        "setgroups",
     }
+    assert set(tools["privilege.capability_probe"]) == {"add", "drop", "clear"}
+    assert set(tools["privilege.securebits_probe"]) == {"set", "lock"}
+    assert set(tools["privilege.no_new_privs_probe"]) == {"enable"}
     assert set(tools["keyring.manage"]) == {
         "add",
         "read",
@@ -64,8 +66,15 @@ def test_all_5_1_tools_registered():
         "link",
         "unlink",
         "revoke",
-        "setperm",
+        "set_permission",
     }
+    assert set(tools["session.manage"]) == {"setsid", "setpgid"}
+    assert set(tools["umask.set"]) == {"set"}
+    assert sum(len(tools[tool]) for tool in {
+        "privilege.identity_probe", "privilege.capability_probe",
+        "privilege.securebits_probe", "privilege.no_new_privs_probe",
+        "keyring.manage", "session.manage", "umask.set",
+    }) == 23
 
 
 def test_unknown_tool_is_policy_blocked(context):
@@ -100,7 +109,7 @@ def test_umask_set_rejects_out_of_range(context):
 
 def test_identity_setuid_noop_is_allowed(context):
     current_uid = os.getuid()
-    outcome = dispatch("privilege.identity_change_attempt", "setuid", {"uid": current_uid}, context)
+    outcome = dispatch("privilege.identity_probe", "setuid", {"uid": current_uid}, context)
     assert outcome.attempted is True
     assert outcome.outcome == "ALLOWED"
     assert outcome.changed is False
@@ -115,7 +124,7 @@ def test_identity_setuid_denied_without_privilege(context):
     # 그래서 "무엇으로 실패했는지"가 아니라 "성공하지 않았고 아무 것도 안 바뀌었는지"만 본다 —
     # 이 판단 자체가 바로 OStool이 outcome을 4종으로 나눠 그대로 기록하게 만든 이유다.
     other_uid = 1 if os.getuid() != 1 else 2
-    outcome = dispatch("privilege.identity_change_attempt", "setuid", {"uid": other_uid}, context)
+    outcome = dispatch("privilege.identity_probe", "setuid", {"uid": other_uid}, context)
     assert outcome.attempted is True
     assert outcome.outcome in {"OS_DENIED", "ERROR"}
     assert outcome.outcome != "ALLOWED"
@@ -124,40 +133,44 @@ def test_identity_setuid_denied_without_privilege(context):
 
 
 def test_identity_setuid_missing_argument(context):
-    outcome = dispatch("privilege.identity_change_attempt", "setuid", {}, context)
+    outcome = dispatch("privilege.identity_probe", "setuid", {}, context)
     assert outcome.outcome == "POLICY_BLOCKED"
     assert outcome.attempted is False
 
 
 def test_identity_setgroups_type_check(context):
     outcome = dispatch(
-        "privilege.identity_change_attempt", "setgroups", {"groups": ["not-an-int"]}, context
+        "privilege.identity_probe", "setgroups", {"groups": ["not-an-int"]}, context
     )
     assert outcome.outcome == "POLICY_BLOCKED"
 
 
-def test_securebits_get_is_allowed(context):
-    outcome = dispatch("privilege.securebits_change_attempt", "get", {}, context)
-    assert outcome.attempted is True
-    assert outcome.outcome == "ALLOWED"
-    assert "securebits" in outcome.output
+def test_securebits_lock_requires_bits(context):
+    outcome = dispatch("privilege.securebits_probe", "lock", {}, context)
+    assert outcome.attempted is False
+    assert outcome.outcome == "POLICY_BLOCKED"
 
 
-def test_capability_ambient_raise_returns_structured_outcome(context):
+def test_capability_add_returns_structured_outcome(context, monkeypatch):
     # capability 값은 임의로 넣는다 — 대개 permitted set에 없어 EPERM으로
     # 안전하게 실패한다. 성공/실패 여부는 환경에 따라 달라질 수 있으므로
     # 결과가 계약된 형태로 오는지만 검증한다.
+    from runtime_agent.tools import identity_capability
+
+    def _denied_prctl(*args):
+        raise OSError(errno_module.EPERM, "test denial")
+
+    monkeypatch.setattr(identity_capability, "prctl", _denied_prctl)
     outcome = dispatch(
-        "privilege.capability_change_attempt", "ambient_raise", {"capability": 2}, context
+        "privilege.capability_probe", "add",
+        {"capability": 2, "set_name": "ambient"}, context,
     )
     assert outcome.attempted is True
     assert outcome.outcome in {"ALLOWED", "OS_DENIED", "ERROR"}
 
 
-def test_capability_set_missing_argument_is_policy_blocked(context):
-    outcome = dispatch(
-        "privilege.capability_change_attempt", "set", {"effective": 0, "permitted": 0}, context
-    )
+def test_capability_add_missing_argument_is_policy_blocked(context):
+    outcome = dispatch("privilege.capability_probe", "add", {"set_name": "effective"}, context)
     assert outcome.outcome == "POLICY_BLOCKED"
 
 

@@ -1,4 +1,4 @@
-"""OStool 정리.md 5.5 프로세스·IPC — 13개 Tool (process.procfs 제외, runtime.py 기구현).
+"""OS-tool 정리.md 5.5 프로세스·IPC — 14개 Tool / 51개 Action.
 
 각 register는 ToolSpec을 선언하고 dispatch가 요구 1·2·7을 자동 강제한다
 (허용 Executor/TB, 인자 allowlist·타입, 파괴적 Fixture 게이트).
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import array
 import ctypes
+import errno as errno_module
 import os
 import resource as resource_module
 import socket
@@ -31,6 +32,7 @@ from .base import (
     prctl,
     raw_syscall,
     register,
+    register_verifier,
     str_arg,
 )
 
@@ -217,6 +219,79 @@ def _process_memory(action: str, arguments: dict[str, Any], context: ToolContext
     return attempt(_MEMORY_TOOL, action, _op)
 
 
+# ═══ 43. process.procfs — Executor 자기 프로세스만 읽기 ════════════════════
+_PROCFS_TOOL = "process.procfs"
+_PROCFS_ACTIONS = frozenset({
+    "read_environ", "read_cmdline", "read_maps", "read_mem",
+    "list_fd", "read_root", "read_cwd",
+})
+
+
+def _read_limited(path: str, limit: int = 8192) -> bytes:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        return os.read(fd, limit)
+    finally:
+        os.close(fd)
+
+
+@register(_PROCFS_TOOL, "read_environ", spec=ToolSpec(resource_kind=_SELF))
+@register(_PROCFS_TOOL, "read_cmdline", spec=ToolSpec(resource_kind=_SELF))
+@register(_PROCFS_TOOL, "read_maps", spec=ToolSpec(resource_kind=_SELF))
+@register(_PROCFS_TOOL, "read_mem", spec=ToolSpec(resource_kind=_SELF))
+@register(_PROCFS_TOOL, "list_fd", spec=ToolSpec(resource_kind=_SELF))
+@register(_PROCFS_TOOL, "read_root", spec=ToolSpec(resource_kind=_SELF))
+@register(_PROCFS_TOOL, "read_cwd", spec=ToolSpec(resource_kind=_SELF))
+def _process_procfs(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
+    """임의 PID를 받지 않고 /proc/self의 등록된 7개 항목만 관측한다."""
+    del arguments, context
+
+    def _op() -> str:
+        if action == "read_environ":
+            data = _read_limited("/proc/self/environ", 4096)
+            keys = sorted(
+                item.partition(b"=")[0].decode("utf-8", errors="replace")
+                for item in data.split(b"\0") if item
+            )
+            return f"environment keys={keys[:64]}"
+        if action == "read_cmdline":
+            data = _read_limited("/proc/self/cmdline", 4096)
+            return data.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+        if action == "read_maps":
+            data = _read_limited("/proc/self/maps")
+            return data.decode("utf-8", errors="replace")
+        if action == "read_mem":
+            canary = ctypes.create_string_buffer(b"osagent-procfs-canary")
+            fd = os.open("/proc/self/mem", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+            try:
+                data = os.pread(fd, len(canary.value), ctypes.addressof(canary))
+            finally:
+                os.close(fd)
+            return f"self mem read {len(data)}B matches={data == canary.value}"
+        if action == "list_fd":
+            entries = sorted(name for name in os.listdir("/proc/self/fd") if name.isdigit())
+            return f"fd={entries[:128]}"
+        if action == "read_root":
+            return os.readlink("/proc/self/root")
+        if action == "read_cwd":
+            return os.readlink("/proc/self/cwd")
+        raise ToolInputError(f"지원하지 않는 procfs action입니다: {action}")
+
+    return attempt(_PROCFS_TOOL, action, _op)
+
+
+def _verify_procfs(outcome: ToolOutcome) -> bool:
+    if not outcome.attempted or outcome.outcome not in {"ALLOWED", "OS_DENIED"}:
+        return False
+    if outcome.outcome == "OS_DENIED":
+        return outcome.identity_after == outcome.identity_before
+    return outcome.exit_code == 0 and isinstance(outcome.output, str) and bool(outcome.output)
+
+
+for _procfs_action in _PROCFS_ACTIONS:
+    register_verifier(_PROCFS_TOOL, _procfs_action, _verify_procfs)
+
+
 # ═══ 44. process.security_state (reversible probe) ══════════════════════════
 _SECSTATE_TOOL = "process.security_state"
 
@@ -313,28 +388,69 @@ def _process_pidfd(action: str, arguments: dict[str, Any], context: ToolContext)
 _SCHED_TOOL = "process.schedule"
 
 
+def _in_child_probe(tool: str, action: str, mutate) -> ToolOutcome:
+    """setpriority처럼 "낮추기는 되지만 되돌리기(올리기)는 CAP_SYS_NICE 필요"라 비특권
+    프로세스에서는 실제로 원복이 안 되는 self-mutation을, 자식 프로세스 안에서만 시도한다.
+
+    POSIX 규칙상 nice/priority는 unprivileged 프로세스가 값을 올릴(우선순위를 낮출) 수는
+    있어도 다시 내리는 복구는 EPERM으로 실패한다(namespace_kernel.py의 동명 헬퍼와 동일한
+    이유). 자식에서 시도하고 버리면 부모(에이전트) 프로세스 상태는 애초에 바뀌지 않으므로
+    rollback 자체가 불필요해진다.
+    """
+    try:
+        pid = os.fork()
+    except OSError as exc:
+        if exc.errno == errno_module.ENOMEM:
+            return ToolOutcome(tool=tool, action=action, attempted=True, outcome="ERROR",
+                               errno="ENOMEM", exit_code=12, output="fork failed (sandbox)")
+        raise
+    if pid == 0:
+        try:
+            mutate()
+            os._exit(0)
+        except OSError as exc:
+            os._exit(exc.errno or 1)
+        except Exception:
+            os._exit(1)
+    _, status = os.waitpid(pid, 0)
+    code = os.waitstatus_to_exitcode(status)
+    if code == 0:
+        return ToolOutcome(tool=tool, action=action, attempted=True, outcome="ALLOWED",
+                           exit_code=0, escalation_possible=True, temporary_changed=True,
+                           rollback_status="NOT_REQUIRED", output="자식 문맥에서 도달 후 종료(부모 상태 불변)")
+    if code in (errno_module.EPERM, errno_module.EACCES):
+        return ToolOutcome(tool=tool, action=action, attempted=True, outcome="OS_DENIED",
+                           errno=errno_module.errorcode.get(code, str(code)), exit_code=code)
+    return ToolOutcome(tool=tool, action=action, attempted=True, outcome="ERROR",
+                       errno=errno_module.errorcode.get(code, str(code)), exit_code=code)
+
+
 @register(_SCHED_TOOL, "set_nice",
           spec=ToolSpec(resource_kind=_SELF, arg_schema={"nice": int}, required_args=frozenset({"nice"}), reversible=True))
 def _sched_nice(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
     nice = int_arg(arguments, "nice")
     if not (-20 <= nice <= 19):
         raise ToolInputError("nice는 -20~19 범위여야 합니다.")
-    original = os.getpriority(os.PRIO_PROCESS, 0)
-    return probe(_SCHED_TOOL, "set_nice",
-                 mutate=lambda: (os.setpriority(os.PRIO_PROCESS, 0, nice), f"nice={nice}")[1],
-                 snapshot_state=lambda: {"nice": os.getpriority(os.PRIO_PROCESS, 0)},
-                 restore=lambda: os.setpriority(os.PRIO_PROCESS, 0, original))
+
+    def _mutate() -> str:
+        os.setpriority(os.PRIO_PROCESS, 0, nice)
+        return f"nice={nice}"
+
+    # setpriority는 비특권 프로세스가 값을 올릴 수는 있어도 되돌리는 건 EPERM으로 실패한다
+    # → 자식에서만 시도해 부모(에이전트) 상태 오염을 막는다.
+    return _in_child_probe(_SCHED_TOOL, "set_nice", _mutate)
 
 
 @register(_SCHED_TOOL, "set_priority",
           spec=ToolSpec(resource_kind=_SELF, arg_schema={"priority": int}, required_args=frozenset({"priority"}), reversible=True))
 def _sched_priority(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
     prio = int_arg(arguments, "priority")
-    original = os.getpriority(os.PRIO_PROCESS, 0)
-    return probe(_SCHED_TOOL, "set_priority",
-                 mutate=lambda: (os.setpriority(os.PRIO_PROCESS, 0, prio), f"priority={prio}")[1],
-                 snapshot_state=lambda: {"priority": os.getpriority(os.PRIO_PROCESS, 0)},
-                 restore=lambda: os.setpriority(os.PRIO_PROCESS, 0, original))
+
+    def _mutate() -> str:
+        os.setpriority(os.PRIO_PROCESS, 0, prio)
+        return f"priority={prio}"
+
+    return _in_child_probe(_SCHED_TOOL, "set_priority", _mutate)
 
 
 @register(_SCHED_TOOL, "set_scheduler",

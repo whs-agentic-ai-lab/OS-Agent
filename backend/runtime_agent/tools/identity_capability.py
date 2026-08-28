@@ -1,11 +1,11 @@
-"""OStool 정리.md 5.1 신분·Capability — 7개 Tool.
+"""OS-tool 정리.md 5.1 신분·Capability — 7개 Tool / 23개 Action.
 
 | # | Tool | 비고 |
 |---|------|------|
-| 1 | privilege.identity_change_attempt | UID/EUID/FSUID/GID/EGID/FSGID·보조 그룹 |
-| 2 | privilege.capability_change_attempt | P/E/I/A/B capability 추가·제거·clear |
-| 3 | privilege.securebits_change_attempt | securebit 설정·잠금 |
-| 4 | privilege.no_new_privs_enable | no_new_privs 활성화 |
+| 1 | privilege.identity_probe | UID/EUID/FSUID/GID/EGID/FSGID·보조 그룹 |
+| 2 | privilege.capability_probe | P/E/I/A/B capability 추가·제거·clear |
+| 3 | privilege.securebits_probe | securebit 설정·잠금 |
+| 4 | privilege.no_new_privs_probe | no_new_privs 활성화 |
 | 5 | keyring.manage | Key 추가·조회·수정·연결·해제·폐기·권한 변경 |
 | 6 | session.manage | setsid, setpgid |
 | 7 | umask.set | 현재 공격 문맥 umask 변경 |
@@ -76,10 +76,10 @@ def _str_arg(arguments: dict[str, Any], key: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 1. privilege.identity_change_attempt
+# 1. privilege.identity_probe
 # ---------------------------------------------------------------------------
 
-_IDENTITY_TOOL = "privilege.identity_change_attempt"
+_IDENTITY_TOOL = "privilege.identity_probe"
 
 
 @register(_IDENTITY_TOOL, "setuid")
@@ -104,32 +104,6 @@ def _setgid(action: str, arguments: dict[str, Any], context: ToolContext) -> Too
 def _setegid(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
     egid = _int_arg(arguments, "egid")
     return attempt(_IDENTITY_TOOL, action, lambda: (os.setegid(egid), f"egid -> {egid}")[1])
-
-
-@register(_IDENTITY_TOOL, "setresuid")
-def _setresuid(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
-    ruid = _int_arg(arguments, "ruid")
-    euid = _int_arg(arguments, "euid")
-    suid = _int_arg(arguments, "suid")
-
-    def _op() -> str:
-        os.setresuid(ruid, euid, suid)
-        return f"resuid -> ({ruid}, {euid}, {suid})"
-
-    return attempt(_IDENTITY_TOOL, action, _op)
-
-
-@register(_IDENTITY_TOOL, "setresgid")
-def _setresgid(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
-    rgid = _int_arg(arguments, "rgid")
-    egid = _int_arg(arguments, "egid")
-    sgid = _int_arg(arguments, "sgid")
-
-    def _op() -> str:
-        os.setresgid(rgid, egid, sgid)
-        return f"resgid -> ({rgid}, {egid}, {sgid})"
-
-    return attempt(_IDENTITY_TOOL, action, _op)
 
 
 @register(_IDENTITY_TOOL, "setgroups")
@@ -174,79 +148,93 @@ def _setfsgid(action: str, arguments: dict[str, Any], context: ToolContext) -> T
 
 
 # ---------------------------------------------------------------------------
-# 2. privilege.capability_change_attempt
+# 2. privilege.capability_probe
 # ---------------------------------------------------------------------------
 
-_CAP_TOOL = "privilege.capability_change_attempt"
-
-_AMBIENT_OPS = {
-    "ambient_raise": base.PR_CAP_AMBIENT_RAISE,
-    "ambient_lower": base.PR_CAP_AMBIENT_LOWER,
-}
-
-for _action_name, _op_code in _AMBIENT_OPS.items():
-
-    def _make_ambient(action_name: str, op_code: int) -> None:
-        @register(_CAP_TOOL, action_name)
-        def _ambient(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
-            cap = _int_arg(arguments, "capability")
-
-            def _op() -> str:
-                prctl(base.PR_CAP_AMBIENT, op_code, cap, 0, 0)
-                return f"ambient capability {cap} {action}"
-
-            return attempt(_CAP_TOOL, action, _op)
-
-    _make_ambient(_action_name, _op_code)
+_CAP_TOOL = "privilege.capability_probe"
+_CAP_SETS = frozenset({"effective", "permitted", "inheritable", "ambient", "bounding"})
 
 
-@register(_CAP_TOOL, "ambient_clear_all")
-def _ambient_clear_all(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
+def _capability_arg(arguments: dict[str, Any]) -> int:
+    capability = _int_arg(arguments, "capability")
+    if not 0 <= capability <= 31:
+        raise ToolInputError("capability는 현재 구현 범위인 0~31이어야 합니다.")
+    return capability
+
+
+def _cap_set_name(arguments: dict[str, Any], *, default: str = "effective") -> str:
+    name = arguments.get("set_name", default)
+    if name not in _CAP_SETS:
+        raise ToolInputError(f"set_name은 {sorted(_CAP_SETS)} 중 하나여야 합니다.")
+    return name
+
+
+def _change_epi(set_name: str, capability: int, *, add: bool) -> None:
+    effective, permitted, inheritable = base.capget_raw()
+    values = {"effective": effective, "permitted": permitted, "inheritable": inheritable}
+    bit = 1 << capability
+    values[set_name] = values[set_name] | bit if add else values[set_name] & ~bit
+    base.capset_raw(values["effective"], values["permitted"], values["inheritable"])
+
+
+@register(_CAP_TOOL, "add")
+def _cap_add(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
+    capability = _capability_arg(arguments)
+    set_name = _cap_set_name(arguments)
+
     def _op() -> str:
-        prctl(base.PR_CAP_AMBIENT, base.PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
-        return "ambient capability set 전체 clear"
+        if set_name in {"effective", "permitted", "inheritable"}:
+            _change_epi(set_name, capability, add=True)
+        elif set_name == "ambient":
+            prctl(base.PR_CAP_AMBIENT, base.PR_CAP_AMBIENT_RAISE, capability, 0, 0)
+        else:
+            raise OSError(1, "Linux bounding capability set에는 capability를 다시 추가할 수 없습니다.")
+        return f"{set_name} capability {capability} add"
 
     return attempt(_CAP_TOOL, action, _op)
 
 
-@register(_CAP_TOOL, "bounding_drop")
-def _bounding_drop(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
-    cap = _int_arg(arguments, "capability")
+@register(_CAP_TOOL, "drop")
+def _cap_drop(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
+    capability = _capability_arg(arguments)
+    set_name = _cap_set_name(arguments)
 
     def _op() -> str:
-        prctl(base.PR_CAPBSET_DROP, cap, 0, 0, 0)
-        return f"bounding set에서 capability {cap} 제거"
+        if set_name in {"effective", "permitted", "inheritable"}:
+            _change_epi(set_name, capability, add=False)
+        elif set_name == "ambient":
+            prctl(base.PR_CAP_AMBIENT, base.PR_CAP_AMBIENT_LOWER, capability, 0, 0)
+        else:
+            prctl(base.PR_CAPBSET_DROP, capability, 0, 0, 0)
+        return f"{set_name} capability {capability} drop"
 
     return attempt(_CAP_TOOL, action, _op)
 
 
-@register(_CAP_TOOL, "set")
-def _cap_set(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
-    effective = _int_arg(arguments, "effective")
-    permitted = _int_arg(arguments, "permitted")
-    inheritable = _int_arg(arguments, "inheritable")
+@register(_CAP_TOOL, "clear")
+def _cap_clear(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
+    set_name = _cap_set_name(arguments)
 
     def _op() -> str:
-        base.capset_raw(effective, permitted, inheritable)
-        return "capset(2)로 하위 32bit E/P/I capability set을 직접 설정"
+        if set_name in {"effective", "permitted", "inheritable"}:
+            effective, permitted, inheritable = base.capget_raw()
+            values = {"effective": effective, "permitted": permitted, "inheritable": inheritable}
+            values[set_name] = 0
+            base.capset_raw(values["effective"], values["permitted"], values["inheritable"])
+        elif set_name == "ambient":
+            prctl(base.PR_CAP_AMBIENT, base.PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
+        else:
+            raise OSError(1, "Linux bounding capability set은 일괄 clear할 수 없습니다.")
+        return f"{set_name} capability clear"
 
     return attempt(_CAP_TOOL, action, _op)
 
 
 # ---------------------------------------------------------------------------
-# 3. privilege.securebits_change_attempt
+# 3. privilege.securebits_probe
 # ---------------------------------------------------------------------------
 
-_SECUREBITS_TOOL = "privilege.securebits_change_attempt"
-
-
-@register(_SECUREBITS_TOOL, "get")
-def _securebits_get(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
-    def _op() -> str:
-        current = prctl(base.PR_GET_SECUREBITS, 0, 0, 0, 0)
-        return f"현재 securebits={bin(current)}"
-
-    return attempt(_SECUREBITS_TOOL, action, _op)
+_SECUREBITS_TOOL = "privilege.securebits_probe"
 
 
 @register(_SECUREBITS_TOOL, "set")
@@ -260,11 +248,25 @@ def _securebits_set(action: str, arguments: dict[str, Any], context: ToolContext
     return attempt(_SECUREBITS_TOOL, action, _op)
 
 
+@register(_SECUREBITS_TOOL, "lock")
+def _securebits_lock(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
+    bits = _int_arg(arguments, "bits")
+    if bits < 0 or bits > 0x55:
+        raise ToolInputError("bits는 securebit 값 비트 범위(0x00~0x55)여야 합니다.")
+    locked = bits | (bits << 1)
+
+    def _op() -> str:
+        prctl(base.PR_SET_SECUREBITS, locked, 0, 0, 0)
+        return f"securebits lock -> {bin(locked)}"
+
+    return attempt(_SECUREBITS_TOOL, action, _op)
+
+
 # ---------------------------------------------------------------------------
-# 4. privilege.no_new_privs_enable
+# 4. privilege.no_new_privs_probe
 # ---------------------------------------------------------------------------
 
-_NNP_TOOL = "privilege.no_new_privs_enable"
+_NNP_TOOL = "privilege.no_new_privs_probe"
 
 
 @register(_NNP_TOOL, "enable")
@@ -392,8 +394,8 @@ def _keyring_revoke(action: str, arguments: dict[str, Any], context: ToolContext
     return attempt(_KEYRING_TOOL, action, _op)
 
 
-@register(_KEYRING_TOOL, "setperm")
-def _keyring_setperm(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
+@register(_KEYRING_TOOL, "set_permission")
+def _keyring_set_permission(action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
     key_id = _int_arg(arguments, "key_id")
     permissions = _int_arg(arguments, "permissions")
 
