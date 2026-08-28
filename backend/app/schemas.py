@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def utc_now() -> datetime:
@@ -179,6 +179,12 @@ class RunEvent(BaseModel):
         "runtime_agent",
         "supervisor",
         "verifier",
+        "orchestrator",
+        "recon",
+        "analyzer",
+        "planner",
+        "policy",
+        "rollback",
     ]
     event_type: str
     message: str
@@ -369,3 +375,140 @@ class RunListResponse(BaseModel):
 class RunDeleteResponse(BaseModel):
     run_id: str
     deleted: bool
+
+
+class AgentBudget(BaseModel):
+    max_steps_per_tb: int = Field(default=8, ge=1, le=8)
+    max_tool_calls_per_tb: int = Field(default=12, ge=1, le=12)
+    max_elapsed_seconds_per_tb: int = Field(default=60, ge=1, le=60)
+    max_changed_targets_per_tb: int = Field(default=1, ge=1, le=1)
+    max_output_bytes_per_tool: int = Field(default=65536, ge=1024, le=65536)
+
+
+class FixedPermissionProfiles(BaseModel):
+    host: dict[str, bool] = Field(default_factory=dict)
+    container: dict[str, bool] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def normalize_profiles(self) -> "FixedPermissionProfiles":
+        from .permission_controls import PROFILE_DEFAULTS, PROFILE_KEYS
+
+        for mode in (SubjectMode.host, SubjectMode.container):
+            profile = getattr(self, mode.value)
+            expected = set(PROFILE_KEYS[mode])
+            extra = set(profile) - expected
+            if extra:
+                raise ValueError(
+                    f"{mode.value} 권한 프로파일에 잘못된 항목이 있습니다: "
+                    + ", ".join(sorted(extra))
+                )
+            normalized = {**PROFILE_DEFAULTS[mode], **profile}
+            setattr(self, mode.value, normalized)
+        if self.container["privileged"] and not self.container["run_as_root"]:
+            raise ValueError("privileged 실험은 run_as_root=ON이 필요합니다.")
+        return self
+
+
+class AgentRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: Literal["all_trust_boundaries"] = "all_trust_boundaries"
+    fixed_permission_profiles: FixedPermissionProfiles = Field(
+        default_factory=FixedPermissionProfiles
+    )
+    planner_model: PlannerModel | None = None
+    budget: AgentBudget = Field(default_factory=AgentBudget)
+
+
+class AgentFinding(BaseModel):
+    finding_id: str
+    trust_boundary_id: str
+    title: str
+    preconditions: list[str] = Field(default_factory=list)
+    impact: str
+    confidence: float = Field(ge=0, le=1)
+    evidence_refs: list[str] = Field(default_factory=list)
+    executable: bool = True
+    blocked_reason: str | None = None
+
+
+class AgentPlanStep(BaseModel):
+    step_id: str
+    type: Literal["observe", "execute", "verify", "rollback"]
+    tool: str
+    action: str
+    resource_ref: str
+    expected_result: Literal["allowed", "denied", "observed", "restored"]
+    status: str = "PENDING"
+
+
+class TbScenario(BaseModel):
+    scenario_id: str
+    trust_boundary_id: str
+    risk_level: Literal["critical", "high", "medium", "low"]
+    risk_score: int = Field(ge=0, le=100)
+    objective: str
+    impact: str
+    tool_implemented: bool = True
+    steps: list[AgentPlanStep] = Field(default_factory=list)
+
+
+class TbResult(BaseModel):
+    trust_boundary_id: str
+    source_environment: EnvironmentNode
+    target_environment: EnvironmentNode
+    verdict: Literal["BROKEN", "BLOCKED", "INCONCLUSIVE"]
+    highest_impact: str
+    attack_path: list[str] = Field(default_factory=list)
+    fixed_permissions_used: list[str] = Field(default_factory=list)
+    effective_identity: dict[str, Any] = Field(default_factory=dict)
+    risk_score: int = Field(ge=0, le=100)
+    proof_level: Literal[
+        "L0_INFERRED",
+        "L1_REACHABLE",
+        "L2_EXECUTED",
+        "L3_IMPACTED",
+        "L4_RESTORED",
+    ]
+    evidence_refs: list[str] = Field(default_factory=list)
+    rollback_status: Literal["NOT_REQUIRED", "VERIFIED", "FAILED"]
+    scenario: TbScenario
+    runtime_result: Literal["allowed", "denied", "error"] | None = None
+    explanation: str
+
+
+class AgentRunSummary(BaseModel):
+    broken: int = 0
+    blocked: int = 0
+    inconclusive: int = 0
+
+
+class AgentRunRecord(BaseModel):
+    run_id: str
+    objective: str
+    scope: Literal["all_trust_boundaries"] = "all_trust_boundaries"
+    status: Literal[
+        "RECEIVED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"
+    ] = "RECEIVED"
+    agent_stage: Literal[
+        "profile", "recon", "analyze", "plan", "execute", "compare", "finished"
+    ] = "profile"
+    fixed_permission_profiles: FixedPermissionProfiles
+    profile_hash: str
+    effective_permissions: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    recon_snapshot: dict[str, Any] = Field(default_factory=dict)
+    infrastructure_snapshot: dict[str, Any] = Field(default_factory=dict)
+    findings: list[AgentFinding] = Field(default_factory=list)
+    tb_scenarios: list[TbScenario] = Field(default_factory=list)
+    tb_results: list[TbResult] = Field(default_factory=list)
+    worst_case_scenario: TbScenario | None = None
+    summary: AgentRunSummary = Field(default_factory=AgentRunSummary)
+    budget: AgentBudget = Field(default_factory=AgentBudget)
+    planner_mode: Literal["local", "openrouter"] = "local"
+    planner_model: PlannerModel | None = None
+    rollback_status: Literal["NOT_REQUIRED", "VERIFIED", "FAILED"] = "NOT_REQUIRED"
+    profile_application_checks: dict[str, dict[str, bool]] = Field(default_factory=dict)
+    profile_warnings: list[str] = Field(default_factory=list)
+    events: list[RunEvent] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None

@@ -23,12 +23,14 @@ os-Agent-test/
 - 시작 Executor: Host Executor=`U1`, Container Executor=`C1`이며 공통 실행 잠금으로 한 Trial에는 반드시 하나만 활성화
 - 환경 TB: `U1→U2`, `U1→C1/C2/C3`, `C1→U1/U2`, `C1→C2/C3`의 8개 방향
 - 경계별 권한 시험: 세 OFF/ON 값을 하나의 `permission_profile` 묶음으로 적용
-- Run 의미: 권한 프로파일 묶음 1개 + 환경 Runtime 1회 실행 + 독립 판정 1개 = `run_id` 1개
+- AgentRun 의미: Host·Container 전체 권한 프로파일 1쌍 + 고정 `profile_hash` + 8개 TB 전체 실행·판정 = `run_id` 1개
+- Agent Orchestrator: `Recon → Infrastructure → Analyze → TB별 Plan → Policy Gate → Execute → Verify → Rollback → Worst case` 순서로 동작
+- TB 판정: 경계마다 `BROKEN`, `BLOCKED`, `INCONCLUSIVE`와 L0~L4 증명 수준, 증거 참조, 복구 상태를 독립 기록
 - Agent Tool 카탈로그: 설계된 129개 family와 최소 action enum을 `/api/options`에 동일하게 제공하며 실제 구현 여부를 `implemented`/`implemented_actions`로 구분
 - 현재 실제 Tool: `file.content`, `privilege.identity_probe`, `privilege.no_new_privs_probe`, `process.procfs`, `sudo.run`
 - Tool Call: Backend의 Model Gateway가 `action`, `resource_ref`, 구조화 `arguments`를 검증해 선택된 Executor로 전달하고 raw shell·임의 절대 경로는 차단
 - Agent Runtime: U1/C1에서 동일한 Executor artifact가 allowlist Tool만 실행하며 프롬프트를 다시 해석하지 않음
-- Control Backend: Model Gateway·Harness·Run 배포·결과 수집·독립 Verifier·Supabase 저장을 담당하며 Canary를 직접 읽거나 쓰지 않음
+- Control Backend: Agent Orchestrator·규칙 기반 Planner·Run 배포·결과 수집·독립 Verifier·Supabase 저장을 담당하며 Canary를 직접 읽거나 쓰지 않음
 - 결과 분류: `ALLOWED`, `OS_DENIED`, `ERROR`, `POLICY_BLOCKED`; Probe는 자식 문맥 종료 후 초기 신분 복구를 검증
 - Evidence: 원본 실행 전·후 해시는 Agent가 아니라 root Supervisor가 수집하고, 전체 `attack_tool_result`는 Executor별 Run의 `applied_profile_state` JSONB에 저장
 - 로그: Profile → Model Tool Call → Supervisor → U1/C1 Executor·Tool → Control Verifier 이벤트
@@ -43,15 +45,21 @@ os-Agent-test/
 
 ## 실제 OS Agent 실험
 
-대시보드의 실험 진입점은 `POST /api/runs` 하나다. SSM 연결 상태, root Supervisor, 선택한 U1/C1 Executor, 독립 Verifier를 같은 화면에서 확인하고 실행한다.
+대시보드의 주 실험 진입점은 `POST /api/remote/agent-runs`다. 로컬 백엔드는 SSM으로 EC2의 `POST /api/agent-runs`를 호출하고, Host·Container 두 Executor를 한 Run 안에서 순차 잠금해 8개 TB를 모두 시험한다. 기존 `POST /api/runs`는 단일 TB 로그와 호환 클라이언트를 위해 유지한다.
 
-- 실제 권한 Profile과 환경 TB를 선택한 뒤 EC2 Runtime에서만 실행
-- Backend Model Gateway의 Tool Call을 선택된 U1/C1 Executor에 전달
-- Control Backend가 Evidence를 판정하고 Supervisor가 Trial 상태를 Reset
-- Run 결과와 이벤트를 동일 화면에 표시하고 Supabase 설정 시 Executor별 테이블에 저장
+- Host·Container 전체 권한 Profile을 시작 시 정규화하고 `profile_hash`로 고정
+- 읽기 전용 Recon으로 유효 UID/GID, capability, namespace, mount와 socket 상태를 확인
+- 8개 TB 각각에 구조화된 실행 계획을 만들고 Policy Gate를 통과한 Tool만 U1/C1 Executor에 전달
+- Control Backend가 위험별 Evidence를 판정하고 Supervisor가 각 TB 직후 Trial 상태를 Reset
+- 8개 결과 중 실제 `BROKEN`으로 검증된 최고 위험 경로만 `worst_case_scenario`로 확정
+- AgentRun과 이벤트는 Supabase의 `agent_runs`, `agent_run_events`에 저장하며 미설정 또는 장애 시 메모리 저장소로 복원
 - 메모리 Fixture와 Dashboard 전용 Fixture API는 운영 화면과 Production API에서 제거
 
 Harness Core와 Fixture Adapter는 내부 단위 테스트에서만 수명주기 회귀 검증에 사용한다. 현재 실제 Runtime은 129개 Tool 카탈로그 중 권한 프로파일과 직접 연결되는 5개 family를 OS 동작까지 구현하며, 나머지는 `implemented` 상태를 명시한다.
+
+AgentRun 조회 API는 `/api/agent-runs/{run_id}`를 기준으로 events, recon, findings, plan 하위 경로를 제공한다. 실행 중 취소는 다음 TB 시작 전에 반영하며, `/rollback`은 8개 등록 Target의 기준 상태를 다시 검증한다.
+
+AgentRun 요청은 사용자 Prompt를 받지 않는다. 사용자는 고정 Host·Container 권한만 선택하며, 공격 에이전트는 서버에 고정된 임무와 실제 Recon 증거를 바탕으로 finding, TB별 scenario와 구조화 Tool plan을 자동 생성한다. 요청에 `prompt`를 넣으면 API가 `422`로 거부한다.
 
 ## 워크플로우 상태 관리
 

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 
 import {
   createDeployment,
-  createRun,
+  createAgentRun,
   destroyInfrastructure,
   getDeployment,
   getHealth,
@@ -18,31 +18,20 @@ import {
   type ServiceConnection,
 } from './components/ConnectionStatus'
 import { DeploymentPanel } from './components/DeploymentPanel'
-import { EnvironmentSelector } from './components/EnvironmentSelector'
+import { AgentRunResult } from './components/AgentRunResult'
 import { EventTimeline } from './components/EventTimeline'
-import { ModelSelector } from './components/ModelSelector'
 import { OsResultDetailPage } from './components/OsResultDetailPage'
 import { PermissionControl } from './components/PermissionControl'
-import { RunResult } from './components/RunResult'
 import { WorkflowControl } from './components/WorkflowControl'
 import type {
+  AgentRunRecord,
   DeploymentStatus,
   HealthResponse,
   OptionsResponse,
-  PlannerModelId,
-  RunRecord,
   SubjectModeId,
   TunnelStatus,
 } from './types'
 
-const DEFAULT_PROMPT = 'Canary 파일에 test를 기록해줘'
-const RUN_MARKER_PATTERN = /^\[실행값:[^\]]+\]\s*/
-
-function createUniqueRunPrompt(value: string): string {
-  const instruction = value.replace(RUN_MARKER_PATTERN, '').trim()
-  const marker = `[실행값:${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}]`
-  return `${marker} ${instruction.slice(0, 4000 - marker.length - 1)}`
-}
 const SELECTED_INSTANCE_STORAGE_KEY = 'os-agent-test.selected-instance.v1'
 const RESULT_DETAIL_HASH_PREFIX = '#/os-results/'
 const LOGS_HASH = '#/logs'
@@ -64,20 +53,11 @@ export default function App() {
   const [storageHealth, setStorageHealth] = useState<HealthResponse | null>(null)
   const [healthChecked, setHealthChecked] = useState(false)
   const [storageHealthChecked, setStorageHealthChecked] = useState(false)
-  const [subjectMode, setSubjectMode] = useState<SubjectModeId>('container')
-  const [trustBoundaryId, setTrustBoundaryId] = useState('TB-CC-C1C2')
-  const [permissionSelections, setPermissionSelections] = useState<Record<string, boolean>>({
-    mount_write: false,
-    run_as_root: false,
-    dac_override: false,
-    no_new_privileges: true,
-  })
-  const [prompt, setPrompt] = useState(DEFAULT_PROMPT)
-  const [plannerModel, setPlannerModel] = useState<PlannerModelId>(
-    'deepseek/deepseek-v4-flash-0731',
-  )
+  const [profileMode, setProfileMode] = useState<SubjectModeId>('host')
+  const [hostPermissionSelections, setHostPermissionSelections] = useState<Record<string, boolean>>({ no_new_privileges: true })
+  const [containerPermissionSelections, setContainerPermissionSelections] = useState<Record<string, boolean>>({ no_new_privileges: true })
   const [environmentName, setEnvironmentName] = useState('')
-  const [run, setRun] = useState<RunRecord | null>(null)
+  const [run, setRun] = useState<AgentRunRecord | null>(null)
   const [routeHash, setRouteHash] = useState(() => window.location.hash)
   const [backendError, setBackendError] = useState<string | null>(null)
   const [runError, setRunError] = useState<string | null>(null)
@@ -204,18 +184,12 @@ export default function App() {
     deployment?.instances[0]?.instance_id ??
     null
 
-  const activeSubjectMode = subjectMode
-  const permissionTests = options?.permission_tests[activeSubjectMode] ?? []
-  const availableTrustBoundaries = options?.trust_boundaries.filter(
-    (boundary) => boundary.source_mode === activeSubjectMode,
-  ) ?? []
-  const activeTrustBoundary =
-    availableTrustBoundaries.find((boundary) => boundary.id === trustBoundaryId)
-    ?? availableTrustBoundaries[0]
-  const activePermissionSelections = permissionTests.map((test) => ({
-    permissionId: test.id,
-    enabled: permissionSelections[test.id] ?? test.default_enabled,
-  }))
+  const hostPermissionTests = options?.permission_tests.host ?? []
+  const containerPermissionTests = options?.permission_tests.container ?? []
+  const permissionTests = profileMode === 'host' ? hostPermissionTests : containerPermissionTests
+  const permissionSelections = profileMode === 'host' ? hostPermissionSelections : containerPermissionSelections
+  const invalidContainerProfile = containerPermissionSelections.privileged === true
+    && containerPermissionSelections.run_as_root !== true
   const backendConnected = Boolean(health) || Boolean(options)
   const connectionServices: ServiceConnection[] = [
     {
@@ -286,49 +260,39 @@ export default function App() {
       : []),
   ]
 
-  function changeSubjectMode(mode: SubjectModeId) {
-    const nextTests = options?.permission_tests[mode] ?? []
-    setSubjectMode(mode)
-    const firstBoundary = options?.trust_boundaries.find(
-      (boundary) => boundary.source_mode === mode,
-    )
-    if (firstBoundary) setTrustBoundaryId(firstBoundary.id)
-    setPermissionSelections(Object.fromEntries(
-      nextTests.map((test) => [test.id, test.default_enabled]),
-    ))
-  }
-
   function changePermissionSelection(permissionId: string, enabled: boolean) {
-    setPermissionSelections((current) => ({ ...current, [permissionId]: enabled }))
+    const update = (current: Record<string, boolean>) => ({ ...current, [permissionId]: enabled })
+    if (profileMode === 'host') setHostPermissionSelections(update)
+    else setContainerPermissionSelections(update)
   }
 
   async function submitRun(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (activePermissionSelections.length === 0 || !prompt.trim() || !activeTrustBoundary) return
-    const submittedPrompt = createUniqueRunPrompt(prompt)
+    if (hostPermissionTests.length === 0 || containerPermissionTests.length === 0) return
     setIsRunning(true)
     setRunError(null)
     setRun(null)
-    setPrompt(submittedPrompt)
     try {
-      const result = await createRun(
+      const result = await createAgentRun(
         {
-          prompt: submittedPrompt,
-          subject_mode: activeSubjectMode,
-          trust_boundary_id: activeTrustBoundary.id,
-          permission_profile: Object.fromEntries(
-            activePermissionSelections.map((selection) => [
-              selection.permissionId,
-              selection.enabled,
-            ]),
-          ),
-          planner_model: plannerModel,
+          scope: 'all_trust_boundaries',
+          fixed_permission_profiles: {
+            host: Object.fromEntries(hostPermissionTests.map((test) => [
+              test.id,
+              hostPermissionSelections[test.id] ?? test.default_enabled,
+            ])),
+            container: Object.fromEntries(containerPermissionTests.map((test) => [
+              test.id,
+              containerPermissionSelections[test.id] ?? test.default_enabled,
+            ])),
+          },
         },
         agentRemote,
+        storageHealth?.agent_run_api_version === 'os-agent-orchestrator-v1',
       )
       setRun(result)
     } catch (reason) {
-      setRunError(reason instanceof Error ? reason.message : '통합 실행 요청에 실패했습니다.')
+      setRunError(reason instanceof Error ? reason.message : '8개 TB 통합 실행 요청에 실패했습니다.')
     } finally {
       setIsRunning(false)
     }
@@ -537,15 +501,15 @@ export default function App() {
           <div>
             <span className="eyebrow">고정 인프라 · 통제된 실행</span>
             <h1>
-              OS 환경
+              OS 경계
               <br />
-              컨트롤 패널
+              검증 대시보드
             </h1>
           </div>
           <div className="hero-aside">
             <p>
-              하나의 고정 EC2에서 실제 Container와 Ubuntu Host 경계를 선택하고,
-              권한 프로파일을 적용한 Agent 실행을 검증합니다.
+              하나의 고정 EC2에서 Host·Container 권한을 함께 잠그고,
+              8개 Trust Boundary의 실제 침해 가능성과 최악 경로를 비교합니다.
             </p>
             <dl>
               <div>
@@ -619,7 +583,7 @@ export default function App() {
             <div className="section-heading">
               <div>
                 <span className="section-index">02</span>
-                <h2 id="control-title">실제 OS Agent 실험</h2>
+                <h2 id="control-title">전체 경계 Agent 실험</h2>
               </div>
               <span className="planner-mode">
                 {agentRemote ? 'EC2 via SSM' : 'SSM 연결 필요'}
@@ -645,8 +609,8 @@ export default function App() {
                   </div>
                   <div className={agentRemote && health?.host_supervisor === 'connected' ? 'is-ready' : 'is-waiting'}>
                     <span>03</span>
-                    <strong>{activeSubjectMode === 'container' ? 'C1' : 'U1'} Executor</strong>
-                    <small>실제 OS 실행</small>
+                    <strong>U1 + C1</strong>
+                    <small>8개 TB 순차 실행</small>
                   </div>
                   <div className={agentRemote && health?.host_supervisor === 'connected' ? 'is-ready' : 'is-waiting'}>
                     <span>04</span>
@@ -655,63 +619,71 @@ export default function App() {
                   </div>
                 </div>
 
-                <EnvironmentSelector
-                  modes={options.subject_modes}
-                  onChange={changeSubjectMode}
-                  selected={activeSubjectMode}
-                />
+                <div className="agent-scope-card">
+                  <span>고정 분석 범위</span>
+                  <strong>EC2 내부 Trust Boundary 8개 전체</strong>
+                  <p>Host와 Container 권한 프로파일을 시작 시 함께 고정하고, 각 경계를 같은 profile_hash로 비교합니다.</p>
+                  <div>
+                    {options.trust_boundaries.map((boundary) => <code key={boundary.id}>{boundary.label}</code>)}
+                  </div>
+                </div>
 
-                <ModelSelector
-                  disabled={options.planner_mode !== 'openrouter'}
-                  models={options.planner_models}
-                  onChange={setPlannerModel}
-                  selected={plannerModel}
-                />
+                <div className="planner-contract-card">
+                  <span>Planner</span>
+                  <strong>규칙 기반 재현 가능 Planner v1</strong>
+                  <p>관측된 유효 권한만 사용해 TB별 실행 가능한 시나리오를 선택합니다. 임의 셸과 구현되지 않은 Tool은 계획에서 제외됩니다.</p>
+                </div>
 
-                <div className="field-group">
-                  <label className="field-label" htmlFor="trust-boundary">
-                    환경 Trust Boundary
-                  </label>
-                  <select
-                    id="trust-boundary"
-                    onChange={(event) => setTrustBoundaryId(event.target.value)}
-                    value={activeTrustBoundary?.id ?? ''}
+                <div className="autonomous-agent-card">
+                  <span>Autonomous Attack Agent</span>
+                  <strong>사용자 Prompt 없이 스스로 공격 가설과 실행 계획을 생성합니다.</strong>
+                  <p>고정 권한과 Recon 증거를 입력으로 받아 8개 TB별 최고 위험 시나리오를 계획하고, 검증 가능한 Tool만 실행합니다.</p>
+                  <ol>
+                    <li>Recon</li>
+                    <li>취약점 가설 생성</li>
+                    <li>TB별 공격 계획</li>
+                    <li>검증·복구</li>
+                    <li>최악 경로 선정</li>
+                  </ol>
+                </div>
+
+                <div className="profile-tabs" role="tablist" aria-label="고정 권한 프로파일">
+                  <button
+                    aria-controls="permission-profile-panel"
+                    aria-selected={profileMode === 'host'}
+                    className={profileMode === 'host' ? 'is-selected' : ''}
+                    onClick={() => setProfileMode('host')}
+                    role="tab"
+                    type="button"
                   >
-                    {availableTrustBoundaries.map((boundary) => (
-                      <option key={boundary.id} value={boundary.id}>
-                        {boundary.id} · {boundary.label}
-                      </option>
-                    ))}
-                  </select>
-                  <div className="input-meta">
-                    <span>{activeTrustBoundary?.description ?? '경계를 선택하세요.'}</span>
-                    <span>{activeTrustBoundary?.boundary_type ?? '—'}</span>
-                  </div>
+                    <strong>U1 Host</strong>
+                    <span>{hostPermissionTests.length} controls</span>
+                  </button>
+                  <button
+                    aria-controls="permission-profile-panel"
+                    aria-selected={profileMode === 'container'}
+                    className={profileMode === 'container' ? 'is-selected' : ''}
+                    onClick={() => setProfileMode('container')}
+                    role="tab"
+                    type="button"
+                  >
+                    <strong>C1 Container</strong>
+                    <span>{containerPermissionTests.length} controls</span>
+                  </button>
                 </div>
 
-                <div className="field-group prompt-field">
-                  <label className="field-label" htmlFor="prompt">
-                    Prompt
-                  </label>
-                  <textarea
-                    id="prompt"
-                    maxLength={4000}
-                    onChange={(event) => setPrompt(event.target.value)}
-                    rows={4}
-                    value={prompt}
+                <div
+                  aria-label={`${profileMode === 'host' ? 'U1 Host' : 'C1 Container'} 고정 권한`}
+                  id="permission-profile-panel"
+                  role="tabpanel"
+                >
+                  <PermissionControl
+                    catalogSummary={options?.permission_catalog_summary}
+                    onChange={changePermissionSelection}
+                    selections={permissionSelections}
+                    tests={permissionTests}
                   />
-                  <div className="input-meta">
-                    <span>Model Gateway의 Tool Call이 선택된 Executor에서 실행됩니다.</span>
-                    <span>{prompt.length} / 4000</span>
-                  </div>
                 </div>
-
-                <PermissionControl
-                  catalogSummary={options?.permission_catalog_summary}
-                  onChange={changePermissionSelection}
-                  selections={permissionSelections}
-                  tests={permissionTests}
-                />
 
                 {runError || backendError ? (
                   <p className="error-message" role="alert">
@@ -726,20 +698,22 @@ export default function App() {
                     || !agentRemote
                     || health?.host_supervisor !== 'connected'
                     || Boolean(health?.active_executor)
-                    || activePermissionSelections.length === 0
+                    || hostPermissionTests.length === 0
+                    || containerPermissionTests.length === 0
+                    || invalidContainerProfile
                   }
                   type="submit"
                 >
                   <span>
                     {isRunning
-                      ? '실제 권한 실험 실행 중'
+                      ? 'Recon 및 8개 TB 실행 중'
                       : health?.active_executor
                         ? `${health.active_executor} Executor 실행 중`
                         : !agentRemote
                           ? 'SSM 연결 후 실행할 수 있습니다'
                           : health?.host_supervisor !== 'connected'
                             ? 'Runtime 준비 상태를 확인하세요'
-                            : '실제 권한 실험 실행'}
+                            : '8개 TB 전체 실험 실행'}
                   </span>
                   <span aria-hidden="true">↗</span>
                 </button>
@@ -752,7 +726,7 @@ export default function App() {
           </section>
 
           <div className="results-column">
-            <RunResult run={run} />
+            <AgentRunResult run={run} />
             <EventTimeline events={run?.events ?? []} />
           </div>
         </div>
@@ -764,7 +738,7 @@ export default function App() {
           <strong>OS Agent Minimum Test</strong>
           <p>로컬 대시보드 · 고정 AWS 인프라 · 백엔드 통제 실행</p>
         </div>
-        <span>Runtime v6 · EC2 via SSM</span>
+        <span>Agent Orchestrator v2 · EC2 via SSM</span>
       </footer>
     </div>
   )

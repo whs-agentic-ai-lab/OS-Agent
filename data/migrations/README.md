@@ -15,6 +15,8 @@ Executor 결과는 다음 네 테이블로 물리 분리한다.
 
 원격 프로젝트에는 `profile_runtime_v2`와 `split_executor_run_storage` 마이그레이션이 적용되어 있으며, `schema.sql`의 idempotent 구문으로 같은 상태를 재현할 수 있다.
 
+8개 TB 전체 Orchestrator 실행은 `agent_runs`, `agent_run_events`에 별도로 저장한다. 두 Executor의 단일 실행 로그를 물리적으로 합치지 않고, AgentRun에는 고정 `profile_hash`, Recon/Infrastructure snapshot, findings, TB별 plan/result, worst-case와 참조 이벤트를 저장한다. 적용 SQL은 `20260828194500_add_agent_orchestrator_runs.sql`이다.
+
 1. Supabase CLI를 설치하고 `supabase --version` 및 `supabase migration new --help`를 확인한다.
 2. 신규 변경은 `supabase migration new <name>`으로 파일을 생성한다.
 3. `schema.sql`의 해당 변경 내용을 생성된 파일에 옮긴다.
