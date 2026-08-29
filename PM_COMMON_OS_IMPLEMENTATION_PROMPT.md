@@ -41,7 +41,7 @@
 → 실행 직전 Guardrail 검사
 → Action 실행
 → 독립 Verifier 검증
-→ Reset 또는 OS 인프라 복구
+→ 일반 도메인은 Tool Resetter로 복구 / OS는 실험환경 전체 초기화
 → 결과와 증거 저장
 → 회귀 평가
 → 선택적 최소 권한 조합 실험
@@ -76,13 +76,13 @@ Recon과 Action을 구분하고, 각 Tool은 가능한 범위에서 다음 메�
 - 대상 자원을 식별하는 필드
 - 필요한 권한 또는 OS 조건
 - 독립 Verifier
-- Resetter 또는 명시적인 OS 복구 전략
+- 일반 도메인의 Resetter 또는 OS 전용 실험환경 초기화 전략
 - 검증 가능한 예상 Impact Fact
 
 다음 Action은 자동 실행하지 않고 fail-closed 처리한다.
 
 - 독립 Verifier가 없음
-- 가역 변경인데 Resetter와 OS 복구 전략이 모두 없음
+- 일반 도메인의 가역 변경인데 Resetter가 없거나, OS Action인데 실험환경 초기화 전략이 없음
 - 입력 스키마가 추가 필드를 허용함
 - 등록 이름, 실행 명세, Adapter 도메인이 불일치함
 - Verifier나 복구에 필요한 조건이 계약에 누락됨
@@ -126,7 +126,7 @@ Recon과 Action을 구분하고, 각 Tool은 가능한 범위에서 다음 메�
 - 대상이 승인된 OS 환경과 Trust Boundary 안에 있음
 - Candidate와 대상이 Agent State에 Grounding됨
 - 독립 Verifier 존재
-- 가역 변경에 Resetter 또는 OS 복구 전략 존재
+- 일반 도메인의 가역 변경에는 Resetter가 있고, OS에는 Tool Resetter가 아닌 실험환경 초기화 전략이 존재
 - Verifier와 복구 경로가 필요한 권한/조건을 충족
 - 변경 전 Baseline이 유효함
 - Frozen Scenario라면 허용 Tool과 대상 목록 및 실행 순서가 정확히 일치함
@@ -140,7 +140,8 @@ Recon과 Action을 구분하고, 각 Tool은 가능한 범위에서 다음 메�
 - 검증 상태는 `VERIFIED`, `REJECTED`, `INCONCLUSIVE` 또는 기존 모델의 명확한 동등 상태를 사용한다.
 - Action API/명령의 성공만으로 Scenario 성공을 선언하지 않는다.
 - 최종 영향은 독립 Evidence로 확인된 Impact Fact를 통해서만 확정한다.
-- Reset은 Receipt에 기록된 정확한 변경만 되돌리고, 복구 후 상태를 다시 확인하여 별도 Reset Receipt를 남긴다.
+- 일반 도메인의 Tool Reset은 Receipt에 기록된 정확한 변경만 되돌리고, 복구 후 상태를 다시 확인하여 별도 Reset Receipt를 남긴다.
+- 위 Tool Reset 규칙은 OS에 적용하지 않는다. OS는 아래 OS 전용 요구사항에 따라 Tool Resetter 없이 실험환경 전체를 초기화한다.
 - Action Evidence ID와 Verifier Evidence ID의 재사용을 금지한다.
 
 ### 10. Idempotency, 재시도, 오류 분류
@@ -156,7 +157,8 @@ Recon과 Action을 구분하고, 각 Tool은 가능한 범위에서 다음 메�
 - 다단계 Scenario는 앞 단계의 실제 출력이 다음 단계의 인자로 연결되어야 한다.
 - 선언된 Tool 순서와 실제 실행 순서가 정확히 일치해야 한다.
 - 연결이 끊기면 `SCENARIO_CHAIN_BLOCKED` 또는 기존 동등 상태로 종료한다.
-- Scenario 단위 Reset은 실행 역순으로 수행한다.
+- 일반 도메인의 Scenario 단위 Tool Reset은 실행 역순으로 수행한다.
+- OS에는 역순 Tool Reset을 적용하지 않고, Scenario 종료 후 실험환경 전체 초기화를 한 번 수행한다.
 - 명백히 변경이 접수되지 않은 `ACCESS_DENIED`, `INVALID_INPUT`, `NOT_FOUND`에는 존재하지 않는 대상의 Reset을 호출하지 않는다.
 - 변경 가능성이 남는 `TIMEOUT`, `EXECUTION_ERROR`는 복구 필요 여부를 보수적으로 판단한다.
 - Reset 실패 시 Action/Verifier 결과를 보존하고 다음 Scenario를 중단한다.
@@ -240,8 +242,15 @@ Evidence Bundle은 최소한 다음 구조 또는 기존 저장소의 동등 구
 
 - AWS의 Verifier Role/Reset Role을 OS에 강제로 도입하지 않는다.
 - OS에서는 독립된 Control Backend/Verifier 경로 또는 현재 구현된 독립 검증 Adapter를 사용한다.
-- OS 변경의 Reset은 Tool별 Resetter 또는 Terraform 기반 환경 재생성/복구 전략 중 하나로 명시한다.
-- Terraform 복구를 사용하는 Action은 Tool별 Resetter 부재만으로 거부하지 않되, 등록된 복구 전략, Baseline Snapshot, 복구 확인 방법이 없으면 fail-closed 처리한다.
+- **OS Action은 Tool에 등록된 Resetter를 사용하지 않는다.** Tool별 변경 취소 함수를 추가하거나 실행하지 않는다.
+- OS의 Reset은 개별 변경을 역순으로 되돌리는 방식이 아니라, Terraform 등 승인된 프로비저닝 경로로 **실험환경 전체를 초기 Baseline 상태로 재생성·초기화하는 방식**으로 통일한다.
+- OS Tool 계약에는 Tool Resetter 대신 `environment_reinitialize`에 해당하는 환경 초기화 전략 ID, Baseline Snapshot/버전, 초기화 완료 검증 방법을 연결한다. 기존 모델을 확장할 때도 Tool Resetter처럼 보이거나 호출되는 인터페이스로 우회 구현하지 않는다.
+- OS Action 등록과 Guardrail은 Tool Resetter 부재만으로 거부하지 않는다. 대신 등록된 실험환경 초기화 전략, 초기 Baseline, 초기화 실행 주체, 초기화 후 검증 계약 중 하나라도 없으면 fail-closed 처리한다.
+- Action과 독립 Verifier의 Evidence를 먼저 영속화한 뒤 실험환경 초기화를 수행한다. 초기화 과정이 기존 Action/Verifier Evidence를 덮어쓰거나 삭제하면 안 된다.
+- OS Scenario가 성공, 실패, Timeout, 예외 중 어느 상태로 끝나더라도 변경 가능성이 있었다면 동일한 환경 초기화 경로를 예약한다. `ACCESS_DENIED`, 입력 검증 실패처럼 Action이 시작되지 않은 경우에만 초기화를 생략할 수 있으며 그 판단 근거를 이벤트로 남긴다.
+- 초기화 완료 후에는 파일·권한·사용자/그룹·서비스·프로세스·컨테이너·Trust Boundary 등 버전 고정 Baseline의 필수 항목을 독립적으로 확인한다. 단순히 Terraform 명령이 성공했다는 이유만으로 초기화 성공을 선언하지 않는다.
+- 실험환경 초기화가 실패하거나 Baseline 검증이 실패하면 Action/Verifier 결과를 보존하고 `CAMPAIGN_STOPPED_RESET_FAILED` 또는 기존 동등 상태로 종료하며 다음 Scenario를 실행하지 않는다.
+- `reset_after_run=false`이면 첫 상태 변경 뒤 환경을 유지하고 추가 Scenario를 생성하지 않는다.
 - 실제 Terraform 실행은 이번 작업에서 하지 않는다. 인터페이스, 상태 전이, 계약, 테스트 더블로만 검증한다.
 
 ### 4. OS 권한 최소화
@@ -282,12 +291,14 @@ Evidence Bundle은 최소한 다음 구조 또는 기존 저장소의 동등 구
 - OS 입력의 누락/추가 키와 잘못된 Boolean 타입 거부
 - 승인되지 않은 Host ID와 불일치 Trust Boundary 거부
 - Frontier에 없는 Candidate 및 임의 인자 거부
-- Verifier/복구 전략이 없는 변경 Action의 fail-closed 처리
+- 일반 도메인은 Verifier/Resetter가 없을 때, OS는 Verifier/실험환경 초기화 전략이 없을 때 fail-closed 처리
 - Action/Verifier Evidence 독립성
 - Idempotency Key 안정성과 중복 실행 방지
 - 오류 분류와 재시도 허용 범위
 - 다단계 출력 연결 및 실행 순서 검사
-- 역순 Reset과 Reset 실패 시 캠페인 중단
+- 일반 도메인의 역순 Tool Reset
+- OS에서 Tool Resetter가 호출되지 않고 Scenario 종료 후 실험환경 전체 초기화가 정확히 한 번 수행되는지 검증
+- OS 환경 초기화 후 Baseline 독립 검증 및 초기화 실패 시 캠페인 중단
 - Context Isolation과 Credential/비밀값 Redaction
 - Evidence Bundle Hash 위변조 검출
 - Frozen Scenario의 목표·Tool·대상 고정
