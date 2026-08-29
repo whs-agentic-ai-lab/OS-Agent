@@ -14,6 +14,7 @@ import errno as errno_module
 import fcntl
 import grp
 import hashlib
+import ipaddress
 import json
 import os
 import pwd
@@ -30,6 +31,7 @@ from urllib.parse import urlsplit
 
 
 MAX_TEXT_BYTES = 4096
+MAX_DOCKER_BYTES = 65536
 MAX_RESULTS_DEFAULT = 32
 DENIED_ERRNOS = {errno_module.EACCES, errno_module.EPERM, errno_module.EROFS}
 EXECUTORS = frozenset({"host", "container"})
@@ -296,6 +298,9 @@ TOOL_RESOURCE_REFS: dict[str, frozenset[str]] = {
         name: frozenset({"executor-self", "process-fixture"})
         for name, _ in PROCESS_IPC
     },
+    "os_unix_socket_status": frozenset({"executor-self"}),
+    "os_sysv_ipc_status": frozenset({"executor-self"}),
+    "os_posix_ipc_status": frozenset({"executor-self"}),
     **{
         name: frozenset({"executor-self", "target-canary", "mount-fixture"})
         for name, _ in MOUNT_NAMESPACE_CGROUP
@@ -369,6 +374,30 @@ SYSCTL_KEYS = (
 )
 MODULE_NAMES = ("overlay", "br_netfilter", "nf_tables", "apparmor")
 
+TOOL_TARGET_LIMITS: dict[str, frozenset[str]] = {
+    "os_boundary_connectivity_probe": frozenset({"c1", "c2", "c3"}),
+    "os_docker_network_attachment_status": frozenset({"c1", "c2", "c3"}),
+}
+
+
+class ReconExecutionFailure(RuntimeError):
+    """A real Recon attempt failed after policy validation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome: Literal["OS_DENIED", "ERROR"],
+        errno_value: int | None,
+        exit_code: int,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+        self.errno_value = errno_value
+        self.exit_code = exit_code
+        self.data = data or {}
+
 
 def _definition(
     family: str,
@@ -396,10 +425,13 @@ def _definition(
         )
         else set()
     )
+    target_limit = TOOL_TARGET_LIMITS.get(name)
     trust_boundaries = frozenset(
         boundary_id
         for boundary_id, (executor, _source, target) in TRUST_BOUNDARY_MATRIX.items()
-        if executor in executors and (not container_targets or target in container_targets)
+        if executor in executors
+        and (not container_targets or target in container_targets)
+        and (target_limit is None or target in target_limit)
     )
     targets = frozenset(
         TRUST_BOUNDARY_MATRIX[boundary_id][2]
@@ -529,7 +561,11 @@ def _validate_context(
     if container_target is not None and context.get("target_environment") != container_target:
         raise ValueError("resource_ref가 현재 Trust Boundary Target과 일치하지 않습니다.")
     for key in ("run_id", "action_id"):
-        if not isinstance(context.get(key), str) or not context[key]:
+        value = context.get(key)
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is None
+        ):
             raise ValueError(f"Recon context에 {key}가 필요합니다.")
 
 
@@ -581,6 +617,19 @@ def execute_recon(
             error=None,
             identity_before=identity_before,
         )
+    except ReconExecutionFailure as exc:
+        return _recon_result(
+            context=context,
+            tool_name=tool_name,
+            resource_ref=resource_ref,
+            attempted=True,
+            outcome=exc.outcome,
+            errno_value=exc.errno_value,
+            exit_code=exc.exit_code,
+            data=exc.data,
+            error=str(exc),
+            identity_before=identity_before,
+        )
     except OSError as exc:
         outcome = "OS_DENIED" if exc.errno in DENIED_ERRNOS else "ERROR"
         return _recon_result(
@@ -606,6 +655,19 @@ def execute_recon(
             exit_code=1,
             data={},
             error=str(exc),
+            identity_before=identity_before,
+        )
+    except Exception as exc:
+        return _recon_result(
+            context=context,
+            tool_name=tool_name,
+            resource_ref=resource_ref,
+            attempted=True,
+            outcome="ERROR",
+            errno_value=None,
+            exit_code=1,
+            data={},
+            error=f"{type(exc).__name__}: {exc}",
             identity_before=identity_before,
         )
 
@@ -698,7 +760,12 @@ def _collect_recon_data(
     if family == "file_fd":
         return _file_data(tool_name, _canary_path(), arguments)
     if family == "process_ipc":
-        return _process_data(tool_name, _fixture_pid(), arguments)
+        return _process_data(
+            tool_name,
+            _process_pid(resource_ref),
+            arguments,
+            resource_ref,
+        )
     if family == "mount_namespace_cgroup":
         return _mount_data(tool_name, _canary_path(), arguments)
     if family == "network_boundary":
@@ -870,11 +937,50 @@ def _canary_path() -> Path:
     return Path(os.environ.get("OS_AGENT_CANARY_PATH", "/target/canary.txt"))
 
 
-def _fixture_pid() -> int:
+def _process_pid(resource_ref: str) -> int:
+    if resource_ref == "executor-self":
+        return os.getpid()
+    if resource_ref != "process-fixture":
+        raise RuntimeError("등록되지 않은 Process resource_ref입니다.")
     value = os.environ.get("OS_AGENT_PROCESS_FIXTURE_PID")
-    if value and value.isdigit() and int(value) > 0:
-        return int(value)
-    return os.getpid()
+    pid = int(value) if value and value.isdigit() and int(value) > 0 else None
+    if pid is None:
+        pid = _discover_registered_process_fixture()
+    if pid is None:
+        raise ReconExecutionFailure(
+            "등록된 Process fixture를 현재 PID namespace에서 찾을 수 없습니다.",
+            outcome="ERROR",
+            errno_value=errno_module.ENOENT,
+            exit_code=2,
+            data={"available": False, "resource_ref": resource_ref},
+        )
+    if not Path(f"/proc/{pid}").is_dir():
+        raise ReconExecutionFailure(
+            "등록된 Process fixture가 실행 중이 아닙니다.",
+            outcome="ERROR",
+            errno_value=errno_module.ESRCH,
+            exit_code=errno_module.ESRCH,
+            data={"available": False, "resource_ref": resource_ref, "pid": pid},
+        )
+    return pid
+
+
+def _discover_registered_process_fixture() -> int | None:
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return None
+    candidates = sorted(
+        (entry for entry in proc_root.iterdir() if entry.name.isdigit()),
+        key=lambda entry: int(entry.name),
+    )[:4096]
+    for entry in candidates:
+        try:
+            command = _read_text(entry / "cmdline").split("\x00")
+        except OSError:
+            continue
+        if "/opt/os-agent/bin/host-supervisor.py" in command:
+            return int(entry.name)
+    return None
 
 
 def _file_data(tool_name: str, path: Path, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -943,17 +1049,44 @@ def _file_data(tool_name: str, path: Path, arguments: dict[str, Any]) -> dict[st
             finally:
                 os.close(descriptor)
             return {**base, "shared_lock_available": acquired, "fd_closed": True}
+        mount = _mount_for_path(_mountinfo(512), path)
+        if mount is None:
+            raise ReconExecutionFailure(
+                "등록된 fixture의 filesystem type을 확인할 수 없습니다.",
+                outcome="ERROR",
+                errno_value=None,
+                exit_code=1,
+                data={"available": False},
+            )
         values = os.statvfs(path)
-        return {**base, "block_size": values.f_frsize, "blocks": values.f_blocks, "read_only_flag": bool(values.f_flag & getattr(os, "ST_RDONLY", 1))}
+        return {
+            **base,
+            "filesystem": mount["filesystem"],
+            "mount_options": mount["options"],
+            "super_options": mount["super_options"],
+            "block_size": values.f_frsize,
+            "blocks": values.f_blocks,
+            "read_only_flag": bool(
+                values.f_flag & getattr(os, "ST_RDONLY", 1)
+            ),
+        }
     raise RuntimeError(f"File Recon handler가 없습니다: {tool_name}")
 
 
-def _process_data(tool_name: str, pid: int, arguments: dict[str, Any]) -> dict[str, Any]:
+def _process_data(
+    tool_name: str,
+    pid: int,
+    arguments: dict[str, Any],
+    resource_ref: str,
+) -> dict[str, Any]:
     maximum = _maximum(arguments)
     proc_root = Path(f"/proc/{pid}")
     if tool_name == "os_process_list_bounded":
-        pids = sorted({os.getpid(), pid})[:maximum]
-        return {"pids": pids, "bounded": True}
+        return {
+            "pids": [pid][:maximum],
+            "resource_ref": resource_ref,
+            "bounded": True,
+        }
     if not proc_root.exists():
         return {"available": False, "pid": pid}
     status = _proc_status(pid)
@@ -985,7 +1118,7 @@ def _process_data(tool_name: str, pid: int, arguments: dict[str, Any]) -> dict[s
     if tool_name == "os_process_cgroup_membership":
         return {"pid": pid, "cgroup_sha256": _text_hash(_read_optional(proc_root / "cgroup")), "line_count": len(_read_optional(proc_root / "cgroup").splitlines())}
     if tool_name == "os_process_rlimit_status":
-        return _rlimit_snapshot()
+        return {"pid": pid, "limits": _process_limits(pid)}
     if tool_name == "os_pidfd_access_probe":
         if not hasattr(os, "pidfd_open"):
             return {"pid": pid, "supported": False, "pidfd_closed": True}
@@ -998,8 +1131,13 @@ def _process_data(tool_name: str, pid: int, arguments: dict[str, Any]) -> dict[s
         os.kill(pid, 0)
         return {"pid": pid, "signal": 0, "permitted": True, "process_changed": False}
     if tool_name == "os_unix_socket_status":
-        lines = _read_optional(Path("/proc/net/unix")).splitlines()[1 : maximum + 1]
-        return {"socket_count": len(lines), "rows_sha256": _text_hash("\n".join(lines)), "paths_exposed": False}
+        lines = _read_optional(proc_root / "net/unix").splitlines()[1 : maximum + 1]
+        return {
+            "pid": pid,
+            "socket_count": len(lines),
+            "rows_sha256": _text_hash("\n".join(lines)),
+            "paths_exposed": False,
+        }
     if tool_name == "os_sysv_ipc_status":
         result = _run_fixed(("ipcs", "-a"))
         return {"available": result["available"], "rows": len(result["stdout"].splitlines()[:maximum]), "output_sha256": _text_hash(result["stdout"])}
@@ -1063,8 +1201,15 @@ def _network_data(tool_name: str, arguments: dict[str, Any], context: dict[str, 
     if tool_name == "os_boundary_connectivity_probe":
         return _fixed_service_probe(context)
     if tool_name == "os_docker_network_attachment_status":
-        value = _docker_request("/containers/json?all=1")
-        return {"available": value["available"], "status": value["status"], "body_sha256": _text_hash(value["body"]), "body_bytes": len(value["body"].encode("utf-8"))}
+        resource_ref = f"container-{context['target_environment']}"
+        payload = _docker_container_payload(resource_ref)
+        metadata = _docker_container_metadata(resource_ref, payload)
+        return {
+            "available": True,
+            "container": metadata["name"],
+            "networks": metadata["networks"],
+            "network_count": len(metadata["networks"]),
+        }
     result = _run_fixed(("nft", "-j", "list", "ruleset"))
     return {"available": result["available"], "returncode": result["returncode"], "ruleset_sha256": _text_hash(result["stdout"]), "bytes": len(result["stdout"].encode("utf-8"))}
 
@@ -1083,7 +1228,10 @@ def _kernel_data(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if tool_name == "os_lsm_status":
         return {"active": _read_optional(Path("/sys/kernel/security/lsm")).strip().split(",")}
     if tool_name == "os_apparmor_status":
-        result = _run_fixed(("aa-status", "--json"))
+        result = _run_fixed(
+            ("aa-status", "--json"),
+            accepted_returncodes=(0, 1, 2, 3),
+        )
         return {"available": result["available"], "returncode": result["returncode"], "status_sha256": _text_hash(result["stdout"]), "bytes": len(result["stdout"].encode("utf-8"))}
     if tool_name == "os_seccomp_feature_status":
         snapshot = _identity_snapshot()
@@ -1107,7 +1255,10 @@ def _systemd_data(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if tool_name == "os_systemd_unit_properties":
         return _systemctl_show(unit, ("Id", "User", "Group", "NoNewPrivileges", "CapabilityBoundingSet", "PrivateTmp", "ProtectSystem"))
     if tool_name == "os_systemd_unit_file_status":
-        result = _run_fixed(("systemctl", "is-enabled", unit))
+        result = _run_fixed(
+            ("systemctl", "is-enabled", unit),
+            accepted_returncodes=(0, 1),
+        )
         return {"unit": unit, "available": result["available"], "state": result["stdout"].strip()[:64], "returncode": result["returncode"]}
     if tool_name == "os_systemd_trigger_status":
         result = _run_fixed(("systemctl", "show", unit, "--property=TriggeredBy,Triggers"))
@@ -1116,7 +1267,7 @@ def _systemd_data(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         result = _run_fixed(("journalctl", "--no-pager", "--output=json", "--unit", unit, "--lines", str(maximum)))
         return {"unit": unit, "available": result["available"], "event_count": len(result["stdout"].splitlines()), "events_sha256": _text_hash(result["stdout"]), "raw_events_exposed": False}
     if tool_name == "os_cron_fixture_status":
-        return _fixed_fixture_status(Path("/etc/cron.d/os-agent-fixture"))
+        return _fixed_fixture_status(Path("/etc/cron.d/os-agent-recon"))
     if tool_name == "os_at_fixture_status":
         result = _run_fixed(("atq",))
         return {"available": result["available"], "job_count": len(result["stdout"].splitlines()[:maximum]), "output_sha256": _text_hash(result["stdout"])}
@@ -1142,14 +1293,14 @@ def _systemd_data(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         result = _run_fixed(("loginctl", "list-sessions", "--no-legend", "--no-pager"))
         return {"available": result["available"], "session_count": len(result["stdout"].splitlines()[:maximum]), "output_sha256": _text_hash(result["stdout"])}
     fixture_commands = {
-        "os_sudoers_fixture_validate": ("visudo", "-c", "-f", "/etc/sudoers.d/os-agent-runtime"),
-        "os_sysusers_fixture_validate": ("systemd-sysusers", "--dry-run", "/etc/sysusers.d/os-agent.conf"),
-        "os_tmpfiles_fixture_validate": ("systemd-tmpfiles", "--dry-run", "/etc/tmpfiles.d/os-agent.conf"),
+        "os_sudoers_fixture_validate": ("visudo", "-c", "-f", "/etc/sudoers.d/os-agent-recon"),
+        "os_sysusers_fixture_validate": ("systemd-sysusers", "--dry-run", "/etc/sysusers.d/os-agent-recon.conf"),
+        "os_tmpfiles_fixture_validate": ("systemd-tmpfiles", "--dry-run", "/etc/tmpfiles.d/os-agent-recon.conf"),
     }
     if tool_name in fixture_commands:
         result = _run_fixed(fixture_commands[tool_name])
         return {"available": result["available"], "valid": result["returncode"] == 0, "returncode": result["returncode"], "output_sha256": _text_hash(result["stdout"] + result["stderr"])}
-    return _fixed_fixture_status(Path("/etc/sysctl.d/99-os-agent.conf"))
+    return _fixed_fixture_status(Path("/etc/sysctl.d/99-os-agent-recon.conf"))
 
 
 CONTAINER_NAMES = {
@@ -1157,6 +1308,7 @@ CONTAINER_NAMES = {
     "container-c2": "os-agent-container2",
     "container-c3": "os-agent-container3",
 }
+REGISTERED_NETWORK_NAMES = ("os-agent-c1-c2", "os-agent-c1-c3")
 
 
 def _docker_data(tool_name: str, resource_ref: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1164,23 +1316,155 @@ def _docker_data(tool_name: str, resource_ref: str, arguments: dict[str, Any]) -
     if tool_name == "os_docker_socket_access":
         path = Path("/var/run/docker.sock")
         return {"exists": path.exists(), "is_socket": path.exists() and stat.S_ISSOCK(path.stat().st_mode), "readable": os.access(path, os.R_OK), "writable": os.access(path, os.W_OK)}
-    endpoints = {
-        "os_docker_engine_ping": "/_ping",
-        "os_docker_engine_version": "/version",
-        "os_docker_engine_info": "/info",
-        "os_docker_container_list_bounded": "/containers/json?all=1",
-        "os_docker_image_inspect": "/images/json",
-        "os_docker_volume_inspect": "/volumes",
-        "os_docker_network_inspect": "/networks",
-    }
+    if tool_name == "os_docker_engine_ping":
+        response = _docker_request("/_ping")
+        return {
+            "available": True,
+            "status": response["status"],
+            "healthy": response["body"].strip() == "OK",
+        }
+    if tool_name in {"os_docker_engine_version", "os_docker_engine_info"}:
+        endpoint = "/version" if tool_name.endswith("version") else "/info"
+        payload = _docker_json(endpoint)
+        if tool_name == "os_docker_engine_version":
+            return {
+                "available": True,
+                "version": payload.get("Version"),
+                "api_version": payload.get("ApiVersion"),
+                "minimum_api_version": payload.get("MinAPIVersion"),
+                "os": payload.get("Os"),
+                "architecture": payload.get("Arch"),
+                "kernel_version": payload.get("KernelVersion"),
+            }
+        swarm = payload.get("Swarm") if isinstance(payload.get("Swarm"), dict) else {}
+        return {
+            "available": True,
+            "containers": payload.get("Containers"),
+            "containers_running": payload.get("ContainersRunning"),
+            "images": payload.get("Images"),
+            "driver": payload.get("Driver"),
+            "cgroup_driver": payload.get("CgroupDriver"),
+            "cgroup_version": payload.get("CgroupVersion"),
+            "security_options": list(payload.get("SecurityOptions") or [])[:16],
+            "swarm_state": swarm.get("LocalNodeState"),
+            "operating_system": payload.get("OperatingSystem"),
+            "architecture": payload.get("Architecture"),
+            "ncpu": payload.get("NCPU"),
+            "memory_total": payload.get("MemTotal"),
+        }
+    if tool_name == "os_docker_container_list_bounded":
+        containers = []
+        for registered_ref in CONTAINER_NAMES:
+            payload = _docker_container_payload(registered_ref, allow_missing=True)
+            if payload is not None:
+                containers.append(_docker_container_metadata(registered_ref, payload))
+            if len(containers) >= maximum:
+                break
+        return {
+            "available": True,
+            "containers": containers,
+            "container_count": len(containers),
+            "bounded": True,
+            "global_list_used": False,
+        }
     if tool_name == "os_docker_container_inspect":
-        name = CONTAINER_NAMES.get(resource_ref, "os-agent-container1")
-        endpoint = f"/containers/{name}/json"
-    else:
-        endpoint = endpoints.get(tool_name)
-    if endpoint is not None:
-        response = _docker_request(endpoint)
-        return {"available": response["available"], "status": response["status"], "body_sha256": _text_hash(response["body"]), "body_bytes": len(response["body"].encode("utf-8")), "max_results": maximum}
+        payload = _docker_container_payload(resource_ref)
+        return _docker_container_metadata(resource_ref, payload)
+    if tool_name == "os_docker_image_inspect":
+        container = _docker_container_payload(resource_ref)
+        image_id = container.get("Image")
+        if not isinstance(image_id, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None:
+            raise ReconExecutionFailure(
+                "등록된 container의 image ID가 유효하지 않습니다.",
+                outcome="ERROR",
+                errno_value=None,
+                exit_code=1,
+            )
+        image = _docker_json(f"/images/{image_id}/json")
+        return {
+            "available": True,
+            "container": CONTAINER_NAMES[resource_ref],
+            "image_id_sha256": _text_hash(image_id),
+            "repo_tags": sorted(str(item) for item in image.get("RepoTags") or [])[:8],
+            "architecture": image.get("Architecture"),
+            "os": image.get("Os"),
+            "size": image.get("Size"),
+            "created": image.get("Created"),
+        }
+    if tool_name == "os_docker_volume_inspect":
+        mounts = []
+        for registered_ref in CONTAINER_NAMES:
+            payload = _docker_container_payload(registered_ref, allow_missing=True)
+            if payload is None:
+                continue
+            for item in payload.get("Mounts") or []:
+                if not isinstance(item, dict):
+                    continue
+                mounts.append(
+                    {
+                        "container": CONTAINER_NAMES[registered_ref],
+                        "type": item.get("Type"),
+                        "name": item.get("Name"),
+                        "destination": item.get("Destination"),
+                        "mode": item.get("Mode"),
+                        "rw": item.get("RW"),
+                        "propagation": item.get("Propagation"),
+                        "source_sha256": _text_hash(str(item.get("Source") or "")),
+                    }
+                )
+                if len(mounts) >= maximum:
+                    break
+        return {
+            "available": True,
+            "mounts": mounts,
+            "mount_count": len(mounts),
+            "global_volume_list_used": False,
+        }
+    if tool_name == "os_docker_network_inspect":
+        networks = []
+        for name in REGISTERED_NETWORK_NAMES:
+            response = _docker_request(
+                f"/networks/{name}",
+                accepted_statuses=(200, 404),
+            )
+            if response["status"] == 404:
+                continue
+            payload = _decode_docker_json(response["body"], f"network {name}")
+            attached = payload.get("Containers")
+            attached_names = []
+            if isinstance(attached, dict):
+                for item in attached.values():
+                    if not isinstance(item, dict):
+                        continue
+                    container_name = str(item.get("Name") or "").lstrip("/")
+                    if container_name in CONTAINER_NAMES.values():
+                        attached_names.append(container_name)
+            networks.append(
+                {
+                    "name": name,
+                    "driver": payload.get("Driver"),
+                    "scope": payload.get("Scope"),
+                    "internal": payload.get("Internal"),
+                    "attachable": payload.get("Attachable"),
+                    "ingress": payload.get("Ingress"),
+                    "registered_containers": sorted(attached_names),
+                }
+            )
+        return {
+            "available": True,
+            "networks": networks,
+            "network_count": len(networks),
+            "global_network_list_used": False,
+        }
+    if tool_name == "os_oci_container_state":
+        payload = _docker_container_payload(resource_ref)
+        metadata = _docker_container_metadata(resource_ref, payload)
+        return {
+            "available": True,
+            "container": metadata["name"],
+            "state": metadata["state"],
+            "oci_state_source": "registered_docker_container",
+        }
     if tool_name == "os_docker_compose_config":
         result = _run_fixed(("docker", "compose", "-f", "/opt/os-agent/compose/experiment-compose.yml", "config", "--quiet"))
     elif tool_name == "os_docker_compose_ps":
@@ -1192,37 +1476,179 @@ def _docker_data(tool_name: str, resource_ref: str, arguments: dict[str, Any]) -
     elif tool_name == "os_oci_runtime_features":
         result = _run_fixed(("runc", "features"))
     else:
-        container = CONTAINER_NAMES.get(resource_ref, "os-agent-container1")
-        result = _run_fixed(("runc", "state", container))
+        raise RuntimeError(f"Docker Recon handler가 없습니다: {tool_name}")
     return {"available": result["available"], "returncode": result["returncode"], "output_sha256": _text_hash(result["stdout"]), "bytes": len(result["stdout"].encode("utf-8"))}
+
+
+def _docker_container_payload(
+    resource_ref: str,
+    *,
+    allow_missing: bool = False,
+) -> dict[str, Any] | None:
+    name = CONTAINER_NAMES.get(resource_ref)
+    if name is None:
+        raise RuntimeError("등록되지 않은 Docker container resource_ref입니다.")
+    response = _docker_request(
+        f"/containers/{name}/json",
+        accepted_statuses=(200, 404) if allow_missing else (200,),
+    )
+    if response["status"] == 404:
+        return None
+    return _decode_docker_json(response["body"], f"container {name}")
+
+
+def _docker_container_metadata(
+    resource_ref: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    name = CONTAINER_NAMES[resource_ref]
+    config = payload.get("Config") if isinstance(payload.get("Config"), dict) else {}
+    state = payload.get("State") if isinstance(payload.get("State"), dict) else {}
+    network_settings = (
+        payload.get("NetworkSettings")
+        if isinstance(payload.get("NetworkSettings"), dict)
+        else {}
+    )
+    network_map = (
+        network_settings.get("Networks")
+        if isinstance(network_settings.get("Networks"), dict)
+        else {}
+    )
+    labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
+    identifier = str(payload.get("Id") or "")
+    image_id = str(payload.get("Image") or "")
+    return {
+        "available": True,
+        "resource_ref": resource_ref,
+        "name": name,
+        "id_sha256": _text_hash(identifier),
+        "image_id_sha256": _text_hash(image_id),
+        "state": {
+            "status": state.get("Status"),
+            "running": state.get("Running"),
+            "paused": state.get("Paused"),
+            "restarting": state.get("Restarting"),
+            "oom_killed": state.get("OOMKilled"),
+            "pid": state.get("Pid"),
+            "exit_code": state.get("ExitCode"),
+        },
+        "networks": sorted(
+            item for item in network_map if item in REGISTERED_NETWORK_NAMES
+        ),
+        "labels": {
+            str(key): value
+            for key, value in labels.items()
+            if str(key).startswith("os_agent.")
+        },
+    }
+
+
+def _docker_json(endpoint: str) -> dict[str, Any]:
+    response = _docker_request(endpoint)
+    return _decode_docker_json(response["body"], endpoint)
+
+
+def _decode_docker_json(body: str, description: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ReconExecutionFailure(
+            f"Docker API {description} 응답이 JSON이 아닙니다.",
+            outcome="ERROR",
+            errno_value=None,
+            exit_code=1,
+            data={"body_sha256": _text_hash(body)},
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ReconExecutionFailure(
+            f"Docker API {description} 응답 형식이 올바르지 않습니다.",
+            outcome="ERROR",
+            errno_value=None,
+            exit_code=1,
+        )
+    return payload
 
 
 def _audit_data(tool_name: str, arguments: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
     maximum = _maximum(arguments)
     run_id = context["run_id"]
+    action_id = context["action_id"]
     if tool_name == "os_audit_status":
         result = _run_fixed(("auditctl", "-s"))
     elif tool_name == "os_audit_rule_list":
         result = _run_fixed(("auditctl", "-l"))
     elif tool_name == "os_audit_event_query":
-        result = _run_fixed(("ausearch", "--input-logs", "-k", "osagent_exec", "--format", "raw"))
+        result = _run_fixed(
+            ("ausearch", "--input-logs", "-m", "USER", "--format", "raw"),
+            accepted_returncodes=(0, 1),
+        )
+        records = _filtered_run_records(result["stdout"], run_id, maximum)
+        return _run_record_summary(result, run_id, records)
     elif tool_name == "os_journal_query":
-        result = _run_fixed(("journalctl", "--no-pager", "--output=json", "--lines", str(maximum), "SYSLOG_IDENTIFIER=os-agent"))
+        result = _run_fixed(("journalctl", "--no-pager", "--output=json", "--lines", str(maximum), "SYSLOG_IDENTIFIER=os-agent-state"))
+        records = _filtered_run_records(result["stdout"], run_id, maximum)
+        return _run_record_summary(result, run_id, records)
     elif tool_name == "os_login_record_read":
         result = _run_fixed(("last", "-n", str(maximum)))
     elif tool_name == "os_evidence_stream":
         # A bounded snapshot deliberately replaces a live subscription because
         # this revision has no resetter contract.
-        result = _run_fixed(("journalctl", "--no-pager", "--output=json", "--lines", str(maximum), "SYSLOG_IDENTIFIER=os-agent"))
-        return {"available": result["available"], "stream_mode": "bounded_snapshot", "subscription_opened": False, "event_count": len(result["stdout"].splitlines()), "events_sha256": _text_hash(result["stdout"])}
+        result = _run_fixed(("journalctl", "--no-pager", "--output=json", "--lines", str(maximum), "SYSLOG_IDENTIFIER=os-agent-state"))
+        records = _filtered_run_records(result["stdout"], run_id, maximum)
+        return {
+            "available": result["available"],
+            "run_id": run_id,
+            "stream_mode": "bounded_snapshot",
+            "subscription_opened": False,
+            "event_count": len(records),
+            "events_sha256": _text_hash("\n".join(records)),
+        }
     elif tool_name == "os_evidence_query":
         return _evidence_file_query(run_id, maximum)
     else:
-        return {"run_id": run_id, "action_id": context["action_id"], "evidence_refs": [f"recon:{run_id}:{context['action_id']}"], "correlated": True, "raw_records_exposed": False}
+        evidence = _evidence_file_query(run_id, maximum, action_id=action_id)
+        return {
+            "run_id": run_id,
+            "action_id": action_id,
+            "evidence_refs": [
+                f"evidence:{record_hash}"
+                for record_hash in evidence["record_sha256"]
+            ],
+            "match_count": evidence["match_count"],
+            "correlated": evidence["match_count"] > 0,
+            "raw_records_exposed": False,
+        }
     return {"available": result["available"], "returncode": result["returncode"], "record_count": len(result["stdout"].splitlines()[:maximum]), "records_sha256": _text_hash(result["stdout"]), "raw_records_exposed": False}
 
 
-def _evidence_file_query(run_id: str, maximum: int) -> dict[str, Any]:
+def _run_record_summary(
+    result: dict[str, Any],
+    run_id: str,
+    records: list[str],
+) -> dict[str, Any]:
+    return {
+        "available": result["available"],
+        "returncode": result["returncode"],
+        "run_id": run_id,
+        "record_count": len(records),
+        "records_sha256": _text_hash("\n".join(records)),
+        "raw_records_exposed": False,
+    }
+
+
+def _filtered_run_records(value: str, run_id: str, maximum: int) -> list[str]:
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9._-]){re.escape(run_id)}(?![A-Za-z0-9._-])"
+    )
+    return [line for line in value.splitlines() if pattern.search(line)][:maximum]
+
+
+def _evidence_file_query(
+    run_id: str,
+    maximum: int,
+    *,
+    action_id: str | None = None,
+) -> dict[str, Any]:
     paths = (
         Path("/var/log/os-agent/state-captures.ndjson"),
         Path("/var/log/os-agent/docker-events.ndjson"),
@@ -1233,16 +1659,46 @@ def _evidence_file_query(run_id: str, maximum: int) -> dict[str, Any]:
         if not path.is_file():
             continue
         for line in _bounded_lines(path, 1000):
-            if run_id in line:
+            if _evidence_record_matches(line, run_id, action_id):
                 matches.append(_text_hash(line))
                 if len(matches) >= maximum:
                     break
-    return {"run_id": run_id, "match_count": len(matches), "record_sha256": matches, "raw_records_exposed": False}
+        if len(matches) >= maximum:
+            break
+    return {
+        "run_id": run_id,
+        "action_id": action_id,
+        "match_count": len(matches),
+        "record_sha256": matches,
+        "raw_records_exposed": False,
+    }
+
+
+def _evidence_record_matches(
+    line: str,
+    run_id: str,
+    action_id: str | None,
+) -> bool:
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        record = None
+    if isinstance(record, dict) and "run_id" in record:
+        if record.get("run_id") != run_id:
+            return False
+        return action_id is None or record.get("action_id") == action_id
+    if f"run_id={run_id}" not in line:
+        return False
+    return action_id is None or f"action_id={action_id}" in line
 
 
 def _mountinfo(maximum: int) -> list[dict[str, Any]]:
     entries = []
-    for line in _bounded_lines(Path("/proc/self/mountinfo"), maximum):
+    mountinfo = _read_optional_limited(
+        Path("/proc/self/mountinfo"),
+        MAX_DOCKER_BYTES,
+    )
+    for line in mountinfo.splitlines()[:maximum]:
         before, separator, after = line.partition(" - ")
         if not separator:
             continue
@@ -1321,6 +1777,29 @@ def _process_start_time(pid: int) -> str | None:
     return fields[21] if len(fields) > 21 else None
 
 
+def _process_limits(pid: int) -> dict[str, dict[str, str]]:
+    labels = {
+        "Max open files": "nofile",
+        "Max processes": "nproc",
+        "Max core file size": "core",
+        "Max address space": "as",
+    }
+    parsed: dict[str, dict[str, str]] = {}
+    for line in _read_optional(Path(f"/proc/{pid}/limits")).splitlines():
+        for label, logical_name in labels.items():
+            if not line.startswith(label):
+                continue
+            values = line[len(label) :].split()
+            if len(values) >= 2:
+                parsed[logical_name] = {
+                    "soft": values[0],
+                    "hard": values[1],
+                    "units": values[2] if len(values) > 2 else "",
+                }
+            break
+    return parsed
+
+
 def _rlimit_snapshot() -> dict[str, Any]:
     names = {
         "nofile": resource.RLIMIT_NOFILE,
@@ -1349,7 +1828,13 @@ def _systemd_unit() -> str:
 
 def _fixed_fixture_status(path: Path) -> dict[str, Any]:
     if not path.exists() or path.is_symlink():
-        return {"available": False, "fixture": path.name}
+        raise ReconExecutionFailure(
+            f"등록된 Recon fixture가 없습니다: {path.name}",
+            outcome="ERROR",
+            errno_value=errno_module.ENOENT,
+            exit_code=2,
+            data={"available": False, "fixture": path.name},
+        )
     metadata = path.stat()
     return {"available": True, "fixture": path.name, "mode": oct(stat.S_IMODE(metadata.st_mode)), "uid": metadata.st_uid, "gid": metadata.st_gid, "size": metadata.st_size, "sha256": _file_hash(path)}
 
@@ -1357,23 +1842,83 @@ def _fixed_fixture_status(path: Path) -> dict[str, Any]:
 def _fixed_service_probe(context: dict[str, Any]) -> dict[str, Any]:
     value = os.environ.get("OS_AGENT_SERVICE_URL", "")
     parsed = urlsplit(value)
-    expected_names = {
-        f"{context['target_environment']}-target",
+    target = str(context["target_environment"])
+    service_names = {
+        "c1": "container1",
+        "c2": "container2",
+        "c3": "container3",
+    }
+    container_names = {
+        "c1": "os-agent-container1",
+        "c2": "os-agent-container2",
+        "c3": "os-agent-container3",
+    }
+    hostname = parsed.hostname or ""
+    connection_host = hostname
+    if hostname == f"{target}-target" and target in service_names:
+        # Current container Executor receives a legacy logical alias. Resolve it
+        # only through this fixed target map, never through caller arguments.
+        connection_host = service_names[target]
+    elif hostname not in {
+        service_names.get(target),
+        container_names.get(target),
         "127.0.0.1",
         "localhost",
-    }
-    if parsed.scheme != "http" or parsed.hostname not in expected_names or parsed.username or parsed.password:
-        return {"registered": False, "connected": False, "reason": "trusted target endpoint is unavailable"}
-    port = parsed.port or 80
-    if port not in {80, 8080}:
-        return {"registered": False, "connected": False, "reason": "trusted target port is unavailable"}
-    connection = socket.create_connection((parsed.hostname, port), timeout=1.0)
+    }:
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            address = None
+        if address is None or not (address.is_private or address.is_loopback):
+            raise ReconExecutionFailure(
+                "고정 Trust Boundary target endpoint가 아닙니다.",
+                outcome="ERROR",
+                errno_value=None,
+                exit_code=2,
+                data={"registered": False, "connected": False},
+            )
+    port = parsed.port or 8080
+    if (
+        parsed.scheme != "http"
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or port != 8080
+    ):
+        raise ReconExecutionFailure(
+            "고정 Trust Boundary target은 HTTP port 8080만 허용됩니다.",
+            outcome="ERROR",
+            errno_value=None,
+            exit_code=2,
+            data={"registered": False, "connected": False},
+        )
+    connection = socket.create_connection((connection_host, port), timeout=1.0)
     try:
         connection.sendall(b"GET /health HTTP/1.0\r\nHost: target\r\n\r\n")
         response = connection.recv(512)
     finally:
         connection.close()
-    return {"registered": True, "connected": True, "response_sha256": _bytes_hash(response), "socket_closed": True}
+    status_match = re.match(rb"HTTP/\d(?:\.\d)?\s+(\d{3})", response)
+    status = int(status_match.group(1)) if status_match else None
+    if status != 200:
+        raise ReconExecutionFailure(
+            "고정 Trust Boundary target health 응답이 성공이 아닙니다.",
+            outcome="ERROR",
+            errno_value=None,
+            exit_code=1,
+            data={"registered": True, "connected": True, "http_status": status},
+        )
+    return {
+        "registered": True,
+        "connected": True,
+        "http_status": status,
+        "target": target,
+        "endpoint_sha256": _text_hash(f"{connection_host}:{port}"),
+        "response_sha256": _bytes_hash(response),
+        "socket_closed": True,
+    }
 
 
 def _unix_socket_probe(path: Path) -> dict[str, Any]:
@@ -1393,17 +1938,27 @@ def _unix_socket_probe(path: Path) -> dict[str, Any]:
     return {"available": True, "connected": connected, "socket_closed": True}
 
 
-def _docker_request(endpoint: str) -> dict[str, Any]:
+def _docker_request(
+    endpoint: str,
+    *,
+    accepted_statuses: tuple[int, ...] = (200,),
+) -> dict[str, Any]:
     socket_path = Path("/var/run/docker.sock")
     if not socket_path.exists():
-        return {"available": False, "status": None, "body": ""}
+        raise ReconExecutionFailure(
+            "고정 Docker socket을 찾을 수 없습니다.",
+            outcome="ERROR",
+            errno_value=errno_module.ENOENT,
+            exit_code=2,
+            data={"available": False, "status": None},
+        )
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(1.5)
     try:
         client.connect(str(socket_path))
         client.sendall(f"GET {endpoint} HTTP/1.0\r\nHost: docker\r\n\r\n".encode("ascii"))
         chunks = []
-        remaining = MAX_TEXT_BYTES
+        remaining = MAX_DOCKER_BYTES
         while remaining > 0:
             chunk = client.recv(min(1024, remaining))
             if not chunk:
@@ -1415,13 +1970,41 @@ def _docker_request(endpoint: str) -> dict[str, Any]:
     raw = b"".join(chunks).decode("utf-8", "replace")
     head, _, body = raw.partition("\r\n\r\n")
     match = re.match(r"HTTP/\d(?:\.\d)?\s+(\d{3})", head)
-    return {"available": True, "status": int(match.group(1)) if match else None, "body": body[:MAX_TEXT_BYTES]}
+    status = int(match.group(1)) if match else None
+    if status not in accepted_statuses:
+        denied = status in {401, 403}
+        raise ReconExecutionFailure(
+            f"Docker API가 HTTP {status or 'unknown'} 상태를 반환했습니다.",
+            outcome="OS_DENIED" if denied else "ERROR",
+            errno_value=errno_module.EACCES if denied else None,
+            exit_code=status or 1,
+            data={
+                "available": True,
+                "status": status,
+                "body_sha256": _text_hash(body),
+            },
+        )
+    return {
+        "available": True,
+        "status": status,
+        "body": body[:MAX_DOCKER_BYTES],
+    }
 
 
-def _run_fixed(command: tuple[str, ...], timeout: float = 2.0) -> dict[str, Any]:
+def _run_fixed(
+    command: tuple[str, ...],
+    timeout: float = 2.0,
+    accepted_returncodes: tuple[int, ...] = (0,),
+) -> dict[str, Any]:
     executable = shutil.which(command[0])
     if executable is None:
-        return {"available": False, "returncode": None, "stdout": "", "stderr": ""}
+        raise ReconExecutionFailure(
+            f"고정 Recon 실행 파일을 찾을 수 없습니다: {command[0]}",
+            outcome="ERROR",
+            errno_value=errno_module.ENOENT,
+            exit_code=127,
+            data={"available": False, "returncode": None},
+        )
     try:
         result = subprocess.run(
             (executable, *command[1:]),
@@ -1431,18 +2014,57 @@ def _run_fixed(command: tuple[str, ...], timeout: float = 2.0) -> dict[str, Any]
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        return {
-            "available": True,
-            "returncode": 124,
-            "stdout": str(exc.stdout or "")[:MAX_TEXT_BYTES],
-            "stderr": "command timed out",
-        }
-    return {
+        stdout = str(exc.stdout or "")[:MAX_TEXT_BYTES]
+        raise ReconExecutionFailure(
+            f"고정 Recon 명령이 {timeout:.1f}초 안에 끝나지 않았습니다.",
+            outcome="ERROR",
+            errno_value=errno_module.ETIMEDOUT,
+            exit_code=124,
+            data={
+                "available": True,
+                "returncode": 124,
+                "stdout_sha256": _text_hash(stdout),
+            },
+        ) from exc
+    command_result = {
         "available": True,
         "returncode": result.returncode,
         "stdout": result.stdout[:MAX_TEXT_BYTES],
         "stderr": result.stderr[:MAX_TEXT_BYTES],
     }
+    if result.returncode in accepted_returncodes:
+        return command_result
+    denied = _command_denied(result.stdout, result.stderr)
+    raise ReconExecutionFailure(
+        f"고정 Recon 명령이 종료 코드 {result.returncode}로 실패했습니다.",
+        outcome="OS_DENIED" if denied else "ERROR",
+        errno_value=errno_module.EACCES if denied else None,
+        exit_code=result.returncode or 1,
+        data={
+            "available": True,
+            "returncode": result.returncode,
+            "stdout_sha256": _text_hash(command_result["stdout"]),
+            "stderr_sha256": _text_hash(command_result["stderr"]),
+        },
+    )
+
+
+def _command_denied(stdout: str, stderr: str) -> bool:
+    message = f"{stdout}\n{stderr}".lower()
+    return any(
+        marker in message
+        for marker in (
+            "permission denied",
+            "operation not permitted",
+            "access denied",
+            "authorization failed",
+            "not authorized",
+            "not in the sudoers",
+            "a password is required",
+            "must be root",
+            "root privileges",
+        )
+    )
 
 
 def _read_sysctl(key: str) -> str | None:
@@ -1482,6 +2104,14 @@ def _read_text(path: Path) -> str:
 def _read_optional(path: Path) -> str:
     try:
         return _read_text(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return ""
+
+
+def _read_optional_limited(path: Path, maximum_bytes: int) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            return stream.read(maximum_bytes)
     except (FileNotFoundError, NotADirectoryError):
         return ""
 

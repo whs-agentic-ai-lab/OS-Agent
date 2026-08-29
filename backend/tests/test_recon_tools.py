@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import subprocess
 from collections import Counter
 from pathlib import Path
 
@@ -66,6 +69,85 @@ def context_for_resource(resource_ref: str) -> dict:
         )
         return value
     return context(subject_mode="host")
+
+
+def context_for_definition(
+    definition: recon_tools.ReconToolDefinition,
+    resource_ref: str | None = None,
+) -> dict:
+    required_target = {
+        "container-c1": "c1",
+        "container-c2": "c2",
+        "container-c3": "c3",
+    }.get(resource_ref or "")
+    boundary_id = next(
+        boundary
+        for boundary in sorted(definition.trust_boundaries)
+        if required_target is None
+        or recon_tools.TRUST_BOUNDARY_MATRIX[boundary][2] == required_target
+    )
+    executor, source, target = recon_tools.TRUST_BOUNDARY_MATRIX[boundary_id]
+    value = context(subject_mode=executor)
+    value.update(
+        trust_boundary_id=boundary_id,
+        source_environment=source,
+        target_environment=target,
+    )
+    return value
+
+
+def docker_response(endpoint: str, **_kwargs) -> dict:
+    image_id = "sha256:" + "a" * 64
+    if endpoint == "/_ping":
+        body = "OK"
+    elif endpoint == "/version":
+        body = json.dumps({"Version": "test", "ApiVersion": "1.45"})
+    elif endpoint == "/info":
+        body = json.dumps({"Containers": 3, "SecurityOptions": []})
+    elif endpoint.startswith("/containers/"):
+        name = endpoint.split("/")[2]
+        body = json.dumps(
+            {
+                "Id": name + "-id",
+                "Image": image_id,
+                "Config": {"Labels": {"os_agent.managed": "true"}},
+                "State": {"Status": "running", "Running": True, "Pid": 42},
+                "NetworkSettings": {
+                    "Networks": {"os-agent-c1-c2": {}}
+                },
+                "Mounts": [
+                    {
+                        "Type": "bind",
+                        "Source": "/registered/source",
+                        "Destination": "/workspace",
+                        "Mode": "rw",
+                        "RW": True,
+                        "Propagation": "rprivate",
+                    }
+                ],
+            }
+        )
+    elif endpoint.startswith("/images/"):
+        body = json.dumps(
+            {
+                "RepoTags": ["os-agent:test"],
+                "Architecture": "arm64",
+                "Os": "linux",
+                "Size": 1,
+            }
+        )
+    elif endpoint.startswith("/networks/"):
+        body = json.dumps(
+            {
+                "Driver": "bridge",
+                "Scope": "local",
+                "Internal": True,
+                "Containers": {},
+            }
+        )
+    else:
+        raise AssertionError(f"unexpected global Docker endpoint: {endpoint}")
+    return {"available": True, "status": 200, "body": body}
 
 
 def arguments_for(definition: recon_tools.ReconToolDefinition) -> dict:
@@ -140,7 +222,7 @@ def test_recon_policy_rejects_raw_inputs_and_matrix_mismatch() -> None:
     assert result["attempted"] is False
 
     wrong_container = recon_tools.execute_recon(
-        "os_container_inspect",
+        "os_docker_container_inspect",
         "observe",
         "container-c1",
         {},
@@ -199,9 +281,9 @@ def test_all_113_handlers_dispatch_without_leaving_fixture_changes(monkeypatch, 
     monkeypatch.setattr(
         recon_tools,
         "_run_fixed",
-        lambda command, timeout=2.0: {
-            "available": False,
-            "returncode": None,
+        lambda command, timeout=2.0, **_kwargs: {
+            "available": True,
+            "returncode": 0,
             "stdout": "",
             "stderr": "",
         },
@@ -209,7 +291,7 @@ def test_all_113_handlers_dispatch_without_leaving_fixture_changes(monkeypatch, 
     monkeypatch.setattr(
         recon_tools,
         "_docker_request",
-        lambda endpoint: {"available": False, "status": None, "body": ""},
+        docker_response,
     )
     monkeypatch.setattr(
         recon_tools,
@@ -229,7 +311,7 @@ def test_all_113_handlers_dispatch_without_leaving_fixture_changes(monkeypatch, 
     outcomes = Counter()
     for definition in recon_tools.RECON_TOOL_CATALOG:
         resource_ref = sorted(definition.resource_refs)[0]
-        execution_context = context_for_resource(resource_ref)
+        execution_context = context_for_definition(definition, resource_ref)
         result = recon_tools.execute_recon(
             definition.name,
             "observe",
@@ -257,9 +339,9 @@ def test_container_runtime_dispatch_and_host_only_policy(monkeypatch) -> None:
     monkeypatch.setattr(
         recon_tools,
         "_run_fixed",
-        lambda command, timeout=2.0: {
-            "available": False,
-            "returncode": None,
+        lambda command, timeout=2.0, **_kwargs: {
+            "available": True,
+            "returncode": 0,
             "stdout": "",
             "stderr": "",
         },
@@ -310,6 +392,15 @@ def test_runtime_packaging_includes_recon_module() -> None:
     assert "runtime_agent/recon_tools.py /app/recon_tools.py" in dockerfile
     assert "runtime_agent/recon_tools.py" in user_data
     assert "/opt/os-agent/bin/recon_tools.py" in user_data
+    for fixture in (
+        "/etc/cron.d/os-agent-recon",
+        "/etc/sudoers.d/os-agent-recon",
+        "/etc/sysusers.d/os-agent-recon.conf",
+        "/etc/tmpfiles.d/os-agent-recon.conf",
+        "/etc/sysctl.d/99-os-agent-recon.conf",
+    ):
+        assert fixture in user_data
+    assert "/etc/sudoers.d/os-agent-runtime" not in user_data
 
 
 def test_runtime_dispatches_registered_recon_tool(monkeypatch, tmp_path) -> None:
@@ -369,3 +460,249 @@ def test_evidence_stream_is_bounded_snapshot_without_subscription(monkeypatch) -
     assert result["data"]["stream_mode"] == "bounded_snapshot"
     assert result["data"]["subscription_opened"] is False
     assert result["cleanup_status"] == "NOT_REQUIRED"
+
+
+def test_fixed_command_failures_are_not_reported_as_allowed(monkeypatch) -> None:
+    monkeypatch.setattr(recon_tools.shutil, "which", lambda _name: None)
+    missing = recon_tools.execute_recon(
+        "os_securebits_snapshot",
+        "observe",
+        "executor-self",
+        {},
+        context(),
+    )
+    assert missing["outcome"] == "ERROR"
+    assert missing["exit_code"] == 127
+
+    monkeypatch.setattr(recon_tools.shutil, "which", lambda _name: "/fixed/sudo")
+    monkeypatch.setattr(
+        recon_tools.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=["sudo"],
+            returncode=1,
+            stdout="",
+            stderr="permission denied",
+        ),
+    )
+    denied = recon_tools.execute_recon(
+        "os_sudo_authorization_probe",
+        "observe",
+        "executor-self",
+        {},
+        context(),
+    )
+    assert denied["outcome"] == "OS_DENIED"
+    assert denied["errno"] is not None
+
+
+def test_process_resource_ref_selects_executor_or_registered_fixture(monkeypatch) -> None:
+    assert recon_tools._process_pid("executor-self") == os.getpid()
+
+    monkeypatch.delenv("OS_AGENT_PROCESS_FIXTURE_PID", raising=False)
+    unavailable = recon_tools.execute_recon(
+        "os_process_status",
+        "observe",
+        "process-fixture",
+        {},
+        context(),
+    )
+    assert unavailable["outcome"] == "ERROR"
+    assert unavailable["data"]["resource_ref"] == "process-fixture"
+
+    fixture_pid = 4242
+    original_is_dir = Path.is_dir
+    monkeypatch.setenv("OS_AGENT_PROCESS_FIXTURE_PID", str(fixture_pid))
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda value: True
+        if str(value) == f"/proc/{fixture_pid}"
+        else original_is_dir(value),
+    )
+    assert recon_tools._process_pid("process-fixture") == fixture_pid
+
+
+def test_docker_recon_uses_only_registered_object_endpoints(monkeypatch) -> None:
+    endpoints = []
+
+    def recorded_response(endpoint: str, **kwargs) -> dict:
+        endpoints.append(endpoint)
+        return docker_response(endpoint, **kwargs)
+
+    monkeypatch.setattr(recon_tools, "_docker_request", recorded_response)
+    listed = recon_tools.execute_recon(
+        "os_docker_container_list_bounded",
+        "observe",
+        "docker-engine",
+        {"max_results": 3},
+        context(),
+    )
+    image = recon_tools.execute_recon(
+        "os_docker_image_inspect",
+        "observe",
+        "container-c1",
+        {},
+        context_for_resource("container-c1"),
+    )
+
+    assert listed["outcome"] == "ALLOWED"
+    assert listed["data"]["container_count"] == 3
+    assert image["outcome"] == "ALLOWED"
+    assert "/containers/json?all=1" not in endpoints
+    assert "/images/json" not in endpoints
+    assert "/volumes" not in endpoints
+    assert "/networks" not in endpoints
+    assert all(
+        endpoint.startswith(("/containers/os-agent-", "/images/sha256:"))
+        for endpoint in endpoints
+    )
+
+
+def test_docker_http_denial_is_reported_as_os_denied(monkeypatch) -> None:
+    class DeniedSocket:
+        def connect(self, _path: str) -> None:
+            return None
+
+        def sendall(self, _value: bytes) -> None:
+            return None
+
+        def recv(self, _maximum: int) -> bytes:
+            if getattr(self, "_read", False):
+                return b""
+            self._read = True
+            return b"HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
+
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    original_exists = Path.exists
+    monkeypatch.setattr(
+        Path,
+        "exists",
+        lambda value: True
+        if str(value) == "/var/run/docker.sock"
+        else original_exists(value),
+    )
+    monkeypatch.setattr(recon_tools.socket, "socket", lambda *_args: DeniedSocket())
+    result = recon_tools.execute_recon(
+        "os_docker_engine_ping",
+        "observe",
+        "docker-engine",
+        {},
+        context(),
+    )
+
+    assert result["outcome"] == "OS_DENIED"
+    assert result["errno"] is not None
+    assert result["data"]["status"] == 403
+
+
+def test_boundary_probe_maps_registered_target_to_port_8080(monkeypatch) -> None:
+    calls = []
+
+    class FakeConnection:
+        def sendall(self, value: bytes) -> None:
+            calls.append(value)
+
+        def recv(self, _maximum: int) -> bytes:
+            return b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+
+        def close(self) -> None:
+            calls.append("closed")
+
+    monkeypatch.setenv("OS_AGENT_SERVICE_URL", "http://c2-target")
+    monkeypatch.setattr(
+        recon_tools.socket,
+        "create_connection",
+        lambda endpoint, timeout: calls.append((endpoint, timeout)) or FakeConnection(),
+    )
+    result = recon_tools.execute_recon(
+        "os_boundary_connectivity_probe",
+        "observe",
+        "target-service",
+        {},
+        context(subject_mode="container"),
+    )
+
+    assert result["outcome"] == "ALLOWED"
+    assert calls[0] == (("container2", 8080), 1.0)
+    assert calls[-1] == "closed"
+
+
+def test_audit_and_evidence_results_are_current_run_scoped(monkeypatch) -> None:
+    current = '{"MESSAGE":"run_id=recon-run-0001 action_id=recon-action-0001"}'
+    other = '{"MESSAGE":"run_id=recon-run-00010 action_id=recon-action-0001"}'
+    monkeypatch.setattr(
+        recon_tools,
+        "_run_fixed",
+        lambda command, timeout=2.0, **_kwargs: {
+            "available": True,
+            "returncode": 0,
+            "stdout": current + "\n" + other + "\n",
+            "stderr": "",
+        },
+    )
+    journal = recon_tools.execute_recon(
+        "os_journal_query",
+        "observe",
+        "audit-evidence",
+        {"max_results": 10},
+        context(),
+    )
+    assert journal["outcome"] == "ALLOWED"
+    assert journal["data"]["record_count"] == 1
+
+    monkeypatch.setattr(
+        recon_tools,
+        "_evidence_file_query",
+        lambda run_id, maximum, action_id=None: {
+            "run_id": run_id,
+            "action_id": action_id,
+            "match_count": 0,
+            "record_sha256": [],
+            "raw_records_exposed": False,
+        },
+    )
+    correlation = recon_tools.execute_recon(
+        "os_evidence_correlate",
+        "observe",
+        "audit-evidence",
+        {},
+        context(),
+    )
+    assert correlation["outcome"] == "ALLOWED"
+    assert correlation["data"]["correlated"] is False
+    assert correlation["data"]["evidence_refs"] == []
+
+
+def test_filesystem_type_status_returns_actual_mount_type(monkeypatch, tmp_path) -> None:
+    canary = tmp_path / "canary.txt"
+    canary.write_text("filesystem", encoding="utf-8")
+    monkeypatch.setenv("OS_AGENT_CANARY_PATH", str(canary))
+    monkeypatch.setattr(
+        recon_tools,
+        "_mountinfo",
+        lambda _maximum: [
+            {
+                "mount_depth": 1,
+                "_mount_point": "/",
+                "filesystem": "overlay",
+                "options": ["rw"],
+                "super_options": ["rw"],
+            }
+        ],
+    )
+    result = recon_tools.execute_recon(
+        "os_filesystem_type_status",
+        "observe",
+        "target-canary",
+        {},
+        context(),
+    )
+
+    assert result["outcome"] == "ALLOWED"
+    assert result["data"]["filesystem"] == "overlay"

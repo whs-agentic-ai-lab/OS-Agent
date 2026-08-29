@@ -111,7 +111,12 @@ install -d -o root -g root -m 0755 \
   /etc/os-agent \
   /etc/docker \
   /etc/audit/rules.d \
+  /etc/cron.d \
   /etc/systemd/journald.conf.d \
+  /etc/sudoers.d \
+  /etc/sysctl.d \
+  /etc/sysusers.d \
+  /etc/tmpfiles.d \
   /etc/nftables.d \
   /etc/vector \
   /etc/vector/secrets \
@@ -210,6 +215,36 @@ chmod 0750 /opt/os-agent/scripts/*.sh
 chown root:vector /etc/vector/vector.yaml /etc/vector/normalize.vrl /etc/vector/secrets
 chmod 0640 /etc/vector/vector.yaml /etc/vector/normalize.vrl
 chmod 0750 /etc/vector/secrets
+
+# Recon 전용 persistence fixture. 기존 Action Tool의 sudoers/profile 파일과
+# 경로를 분리하고 모두 무동작 주석 파일로 유지한다.
+cat >/etc/cron.d/os-agent-recon <<'RECON_CRON_EOF'
+# OS-Agent Recon fixture; intentionally contains no scheduled command.
+RECON_CRON_EOF
+cat >/etc/sudoers.d/os-agent-recon <<'RECON_SUDOERS_EOF'
+# OS-Agent Recon fixture; intentionally grants no authorization.
+RECON_SUDOERS_EOF
+cat >/etc/sysusers.d/os-agent-recon.conf <<'RECON_SYSUSERS_EOF'
+# OS-Agent Recon fixture; intentionally creates no account.
+RECON_SYSUSERS_EOF
+cat >/etc/tmpfiles.d/os-agent-recon.conf <<'RECON_TMPFILES_EOF'
+# OS-Agent Recon fixture; intentionally creates no path.
+RECON_TMPFILES_EOF
+cat >/etc/sysctl.d/99-os-agent-recon.conf <<'RECON_SYSCTL_EOF'
+# OS-Agent Recon fixture; intentionally changes no kernel setting.
+RECON_SYSCTL_EOF
+chown root:root \
+  /etc/cron.d/os-agent-recon \
+  /etc/sudoers.d/os-agent-recon \
+  /etc/sysusers.d/os-agent-recon.conf \
+  /etc/tmpfiles.d/os-agent-recon.conf \
+  /etc/sysctl.d/99-os-agent-recon.conf
+chmod 0644 \
+  /etc/cron.d/os-agent-recon \
+  /etc/sysusers.d/os-agent-recon.conf \
+  /etc/tmpfiles.d/os-agent-recon.conf \
+  /etc/sysctl.d/99-os-agent-recon.conf
+chmod 0440 /etc/sudoers.d/os-agent-recon
 
 cat >/etc/nftables.conf <<'NFTABLES_EOF'
 #!/usr/sbin/nft -f
