@@ -339,7 +339,16 @@ TOOL_RESOURCE_REFS: dict[str, frozenset[str]] = {
 HOST_ONLY = frozenset(
     {
         *(name for name, _ in SYSTEMD_PERSISTENCE_ACCOUNT),
+        *(name for name, _ in DOCKER_CONTAINERD_OCI),
         *(name for name, _ in AUDIT_EVIDENCE),
+        # These probes inspect host authorization or host security services.
+        # Installing their CLIs inside C1 would not make the container result
+        # representative of the host, and exposing the Docker socket would
+        # grant the container host-equivalent control.
+        "os_sudo_authorization_probe",
+        "os_polkit_authorization_probe",
+        "os_apparmor_status",
+        "os_docker_network_attachment_status",
         "os_nftables_policy_status",
     }
 )

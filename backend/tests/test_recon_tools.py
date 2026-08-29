@@ -186,6 +186,33 @@ def test_recon_catalog_has_all_113_planned_tools_without_verifier_or_resetter() 
     assert all(not hasattr(item, "resetter") for item in definitions)
 
 
+def test_host_dependent_recon_is_not_advertised_to_container_executor() -> None:
+    host_only_names = {
+        *(name for name, _ in recon_tools.SYSTEMD_PERSISTENCE_ACCOUNT),
+        *(name for name, _ in recon_tools.DOCKER_CONTAINERD_OCI),
+        *(name for name, _ in recon_tools.AUDIT_EVIDENCE),
+        "os_sudo_authorization_probe",
+        "os_polkit_authorization_probe",
+        "os_apparmor_status",
+        "os_docker_network_attachment_status",
+        "os_nftables_policy_status",
+    }
+
+    assert recon_tools.HOST_ONLY == frozenset(host_only_names)
+    assert len(host_only_names) == 43
+    assert sum(
+        "container" in definition.allowed_executors
+        for definition in recon_tools.RECON_TOOL_CATALOG
+    ) == 70
+    for name in host_only_names:
+        definition = recon_tools.RECON_TOOL_BY_NAME[name]
+        assert definition.allowed_executors == frozenset({"host"})
+        assert all(
+            recon_tools.TRUST_BOUNDARY_MATRIX[boundary_id][0] == "host"
+            for boundary_id in definition.trust_boundaries
+        )
+
+
 def test_recon_policy_rejects_raw_inputs_and_matrix_mismatch() -> None:
     with pytest.raises(ValueError, match="임의 경로"):
         recon_tools.validate_recon_call(
@@ -379,6 +406,23 @@ def test_container_runtime_dispatch_and_host_only_policy(monkeypatch) -> None:
     assert blocked_result["attempted"] is False
     assert blocked_result["events"][0]["event_type"] == "RECON_TOOL_RECEIVED"
 
+    for tool_name, resource_ref in (
+        ("os_sudo_authorization_probe", "executor-self"),
+        ("os_polkit_authorization_probe", "executor-self"),
+        ("os_apparmor_status", "kernel-policy"),
+        ("os_docker_network_attachment_status", "docker-engine"),
+        ("os_docker_engine_ping", "docker-engine"),
+    ):
+        blocked = recon_tools.execute_recon(
+            tool_name,
+            "observe",
+            resource_ref,
+            {},
+            context(subject_mode="container"),
+        )
+        assert blocked["outcome"] == "POLICY_BLOCKED"
+        assert blocked["attempted"] is False
+
 
 def test_runtime_packaging_includes_recon_module() -> None:
     repository_root = Path(__file__).resolve().parents[2]
@@ -390,6 +434,8 @@ def test_runtime_packaging_includes_recon_module() -> None:
     ).read_text(encoding="utf-8")
 
     assert "runtime_agent/recon_tools.py /app/recon_tools.py" in dockerfile
+    for package in ("acl", "e2fsprogs", "libcap2-bin"):
+        assert package in dockerfile
     assert "runtime_agent/recon_tools.py" in user_data
     assert "/opt/os-agent/bin/recon_tools.py" in user_data
     for fixture in (
