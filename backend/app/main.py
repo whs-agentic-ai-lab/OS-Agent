@@ -5,6 +5,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from .catalog import PERMISSION_TESTS, SUBJECT_MODES, TOOLS, TRUST_BOUNDARIES
+from .agent_jobs import AgentRunJobManager
+from .agent_orchestrator import ATTACK_AGENT_MISSION, AgentOrchestrator
 from .config import Settings, get_settings
 from .deployment import (
     DeploymentManager,
@@ -26,11 +28,18 @@ from .harness import (
     InMemoryHarnessRunRepository,
     create_os_harness_components,
 )
-from .repository import create_run_repository
+from .repository import create_agent_run_repository, create_run_repository
 from .runtime_client import EnvironmentRuntime, SupervisorRuntimeClient
 from .schemas import (
+    AgentFinding,
+    AttackContract,
+    AgentRunRecord,
+    AgentRunRequest,
+    ExperimentEnvironmentResetRequest,
+    ExperimentEnvironmentResetResult,
     OptionsResponse,
     PermissionCatalogSummary,
+    PermissionMinimizationResult,
     PlannerModelOption,
     RunDeleteResponse,
     RunEvent,
@@ -38,8 +47,28 @@ from .schemas import (
     RunRecord,
     RunRequest,
     SubjectMode,
+    TbScenario,
 )
 from .tunnel import SsmTunnelManager, TunnelRequest, TunnelStatus, TunnelStopRequest
+
+
+def build_remote_agent_payload(
+    request: AgentRunRequest,
+    remote_agent_version: str,
+) -> dict:
+    payload = request.model_dump(mode="json")
+    if remote_agent_version in {
+        "os-agent-orchestrator-v1",
+        "os-agent-orchestrator-v2",
+    }:
+        from .permission_minimizer import collect_maximum_permission_profiles
+
+        payload["fixed_permission_profiles"] = (
+            collect_maximum_permission_profiles().model_dump(mode="json")
+        )
+    if remote_agent_version == "os-agent-orchestrator-v1":
+        payload["prompt"] = ATTACK_AGENT_MISSION
+    return payload
 
 
 def create_app(
@@ -52,12 +81,22 @@ def create_app(
         active_settings.supabase_url,
         active_settings.supabase_secret_key,
     )
+    agent_repository = create_agent_run_repository(
+        active_settings.supabase_url,
+        active_settings.supabase_secret_key,
+    )
     active_runtime = runtime_client or SupervisorRuntimeClient(
         active_settings.host_supervisor_socket
     )
     model_gateway = ModelGateway(active_settings)
     coordinator = RunCoordinator(active_runtime, repository, model_gateway)
+    agent_orchestrator = AgentOrchestrator(
+        active_runtime,
+        agent_repository,
+        model_gateway,
+    )
     executor_gate = ExclusiveExecutorGate()
+    agent_run_jobs = AgentRunJobManager(executor_gate)
     harness_repository = InMemoryHarnessRunRepository()
     harness_coordinator = HarnessCoordinator(
         harness_components or create_os_harness_components(active_runtime, model_gateway),
@@ -75,6 +114,9 @@ def create_app(
         allow_headers=["Content-Type"],
     )
     application.add_event_handler("shutdown", tunnel_manager.close)
+    application.add_event_handler("shutdown", agent_run_jobs.close)
+    application.state.agent_orchestrator = agent_orchestrator
+    application.state.agent_run_jobs = agent_run_jobs
 
     @application.get("/api/health")
     def health() -> dict[str, str | None]:
@@ -82,6 +124,7 @@ def create_app(
         return {
             "status": "ok",
             "run_api_version": "permission-control-runtime-v6",
+            "agent_run_api_version": "os-agent-orchestrator-v5",
             "harness_api_version": "os-harness-v1",
             "planner": model_gateway.planner_mode,
             "storage": repository.storage_name,
@@ -91,6 +134,7 @@ def create_app(
             "active_executor": (
                 active_executor.value if active_executor is not None else None
             ),
+            "active_agent_run_id": agent_run_jobs.active_run_id,
         }
 
     @application.get("/api/options", response_model=OptionsResponse)
@@ -188,6 +232,24 @@ def create_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @application.post(
+        "/api/experiment-environment/reset",
+        response_model=ExperimentEnvironmentResetResult,
+    )
+    def reset_experiment_environment(
+        request: ExperimentEnvironmentResetRequest,
+    ) -> ExperimentEnvironmentResetResult:
+        del request
+        if not active_runtime.is_available():
+            raise HTTPException(status_code=409, detail="환경 Runtime Supervisor가 연결되지 않았습니다.")
+        try:
+            with executor_gate.claim_all():
+                return active_runtime.reset_environment()
+        except ExecutorBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     @application.get("/api/tunnel", response_model=TunnelStatus)
     def get_tunnel() -> TunnelStatus:
         return tunnel_manager.refresh()
@@ -236,6 +298,26 @@ def create_app(
     @application.get("/api/remote/health")
     def remote_health() -> dict:
         return remote_request("GET", "/api/health")
+
+    @application.post(
+        "/api/remote/experiment-environment/reset",
+        response_model=ExperimentEnvironmentResetResult,
+    )
+    def remote_reset_experiment_environment(
+        request: ExperimentEnvironmentResetRequest,
+    ) -> ExperimentEnvironmentResetResult:
+        try:
+            with executor_gate.claim_all():
+                return ExperimentEnvironmentResetResult.model_validate(
+                    remote_request(
+                        "POST",
+                        "/api/experiment-environment/reset",
+                        request.model_dump(mode="json"),
+                        timeout=60,
+                    )
+                )
+        except ExecutorBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @application.get("/api/remote/options", response_model=OptionsResponse)
     def remote_options() -> OptionsResponse:
@@ -325,6 +407,220 @@ def create_app(
             return stored_run
         return RunRecord.model_validate(remote_request("GET", f"/api/runs/{run_id}"))
 
+    @application.post("/api/remote/agent-runs", response_model=AgentRunRecord)
+    def remote_agent_run(request: AgentRunRequest) -> AgentRunRecord:
+        remote_health_payload = remote_request("GET", "/api/health")
+        if remote_health_payload.get("planner") != "openrouter":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "AWS Runtime에 OpenRouter AI Planner가 연결되지 않았습니다. "
+                    "규칙형 fallback으로 실험하지 않습니다."
+                ),
+            )
+        remote_agent_version = remote_health_payload.get("agent_run_api_version")
+        if remote_agent_version not in {
+            "os-agent-orchestrator-v1",
+            "os-agent-orchestrator-v2",
+            "os-agent-orchestrator-v3",
+            "os-agent-orchestrator-v4",
+            "os-agent-orchestrator-v5",
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail="AWS 백엔드가 8개 TB Agent Orchestrator API를 지원하지 않습니다. 원격 이미지를 갱신하세요.",
+            )
+        remote_payload = build_remote_agent_payload(request, remote_agent_version)
+        try:
+            if remote_agent_version == "os-agent-orchestrator-v5":
+                remote_run_payload = remote_request(
+                    "POST",
+                    "/api/agent-runs",
+                    remote_payload,
+                    timeout=30,
+                )
+            else:
+                with executor_gate.claim_all():
+                    remote_run_payload = remote_request(
+                        "POST",
+                        "/api/agent-runs",
+                        remote_payload,
+                        timeout=request.budget.max_elapsed_seconds_per_tb * 8 + 90,
+                    )
+            if "objective" not in remote_run_payload:
+                remote_run_payload["objective"] = remote_run_payload.get(
+                    "prompt", ATTACK_AGENT_MISSION
+                )
+            run = AgentRunRecord.model_validate(remote_run_payload)
+        except ExecutorBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if run.profile_hash != agent_orchestrator_hash(request):
+            raise HTTPException(status_code=502, detail="AWS Runtime의 고정 권한 profile_hash가 요청과 다릅니다.")
+        agent_repository.save(run)
+        return run
+
+    @application.get("/api/remote/agent-runs/{run_id}", response_model=AgentRunRecord)
+    def remote_get_agent_run(run_id: str) -> AgentRunRecord:
+        stored = agent_repository.get(run_id)
+        try:
+            run = AgentRunRecord.model_validate(
+                remote_request("GET", f"/api/agent-runs/{run_id}")
+            )
+        except HTTPException:
+            if stored is not None:
+                return stored
+            raise
+        agent_repository.save(run)
+        return run
+
+    @application.post("/api/remote/agent-runs/{run_id}/cancel", response_model=AgentRunRecord)
+    def remote_cancel_agent_run(run_id: str) -> AgentRunRecord:
+        run = AgentRunRecord.model_validate(
+            remote_request("POST", f"/api/agent-runs/{run_id}/cancel", {})
+        )
+        agent_repository.save(run)
+        return run
+
+    @application.post("/api/remote/agent-runs/{run_id}/rollback", response_model=AgentRunRecord)
+    def remote_rollback_agent_run(run_id: str) -> AgentRunRecord:
+        try:
+            with executor_gate.claim_all():
+                run = AgentRunRecord.model_validate(
+                    remote_request("POST", f"/api/agent-runs/{run_id}/rollback", {}, timeout=120)
+                )
+        except ExecutorBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        agent_repository.save(run)
+        return run
+
+    @application.post("/api/remote/agent-runs/{run_id}/resume", response_model=AgentRunRecord)
+    def remote_resume_agent_run(run_id: str) -> AgentRunRecord:
+        stored = get_agent_record(run_id)
+        remote_health_payload = remote_request("GET", "/api/health")
+        remote_agent_version = remote_health_payload.get("agent_run_api_version")
+        try:
+            if remote_agent_version == "os-agent-orchestrator-v5":
+                run = AgentRunRecord.model_validate(
+                    remote_request(
+                        "POST",
+                        f"/api/agent-runs/{run_id}/resume",
+                        {},
+                        timeout=30,
+                    )
+                )
+            else:
+                with executor_gate.claim_all():
+                    run = AgentRunRecord.model_validate(
+                        remote_request(
+                            "POST",
+                            f"/api/agent-runs/{run_id}/resume",
+                            {},
+                            timeout=stored.budget.max_elapsed_seconds_per_tb + 180,
+                        )
+                    )
+        except ExecutorBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        agent_repository.save(run)
+        return run
+
+    @application.post("/api/agent-runs", response_model=AgentRunRecord)
+    def create_agent_run(request: AgentRunRequest) -> AgentRunRecord:
+        if not all(active_runtime.is_available(mode) for mode in SubjectMode):
+            raise HTTPException(status_code=409, detail="U1과 C1 Runtime이 모두 준비되어야 전체 8개 TB를 실행할 수 있습니다.")
+        prepared = agent_orchestrator.prepare_run(request)
+        response_snapshot = prepared.model_copy(deep=True)
+        worker_run = prepared.model_copy(deep=True)
+        try:
+            agent_run_jobs.start(
+                prepared.run_id,
+                lambda: agent_orchestrator.run(request, prepared_run=worker_run),
+                on_error=lambda exc: agent_orchestrator.mark_failed(prepared.run_id, exc),
+            )
+        except ExecutorBusyError as exc:
+            agent_orchestrator.mark_failed(prepared.run_id, exc)
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return response_snapshot
+
+    def get_agent_record(run_id: str) -> AgentRunRecord:
+        run = agent_repository.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="AgentRun 기록을 찾을 수 없습니다.")
+        return run
+
+    @application.get("/api/agent-runs/{run_id}", response_model=AgentRunRecord)
+    def get_agent_run(run_id: str) -> AgentRunRecord:
+        return get_agent_record(run_id)
+
+    @application.get("/api/agent-runs/{run_id}/events", response_model=list[RunEvent])
+    def get_agent_run_events(run_id: str) -> list[RunEvent]:
+        return get_agent_record(run_id).events
+
+    @application.get("/api/agent-runs/{run_id}/recon")
+    def get_agent_run_recon(run_id: str) -> dict:
+        return get_agent_record(run_id).recon_snapshot
+
+    @application.get("/api/agent-runs/{run_id}/findings", response_model=list[AgentFinding])
+    def get_agent_run_findings(run_id: str) -> list[AgentFinding]:
+        return get_agent_record(run_id).findings
+
+    @application.get("/api/agent-runs/{run_id}/plan", response_model=list[TbScenario])
+    def get_agent_run_plan(run_id: str) -> list[TbScenario]:
+        return get_agent_record(run_id).tb_scenarios
+
+    @application.get("/api/agent-runs/{run_id}/attack-contract", response_model=AttackContract | None)
+    def get_agent_run_attack_contract(run_id: str) -> AttackContract | None:
+        return get_agent_record(run_id).attack_contract
+
+    @application.get(
+        "/api/agent-runs/{run_id}/permission-minimization",
+        response_model=PermissionMinimizationResult,
+    )
+    def get_agent_run_permission_minimization(
+        run_id: str,
+    ) -> PermissionMinimizationResult:
+        return get_agent_record(run_id).permission_minimization
+
+    @application.post("/api/agent-runs/{run_id}/cancel", response_model=AgentRunRecord)
+    def cancel_agent_run(run_id: str) -> AgentRunRecord:
+        run = get_agent_record(run_id)
+        if run.status in {"COMPLETED", "FAILED", "CANCELLED"}:
+            return run
+        run.status = "CANCELLED"
+        agent_repository.save(run)
+        return run
+
+    @application.post("/api/agent-runs/{run_id}/rollback", response_model=AgentRunRecord)
+    def rollback_agent_run(run_id: str) -> AgentRunRecord:
+        try:
+            with executor_gate.claim_all():
+                return agent_orchestrator.rollback(get_agent_record(run_id))
+        except ExecutorBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @application.post("/api/agent-runs/{run_id}/resume", response_model=AgentRunRecord)
+    def resume_agent_run(run_id: str) -> AgentRunRecord:
+        original = get_agent_record(run_id)
+        original_snapshot = original.model_copy(deep=True)
+        try:
+            prepared = agent_orchestrator.prepare_resume(original)
+            response_snapshot = prepared.model_copy(deep=True)
+            worker_run = prepared.model_copy(deep=True)
+            agent_run_jobs.start(
+                run_id,
+                lambda: agent_orchestrator.resume(worker_run),
+                on_error=lambda exc: agent_orchestrator.mark_failed(run_id, exc),
+            )
+            return response_snapshot
+        except ExecutorBusyError as exc:
+            # 재개 레인을 얻지 못한 것은 기존 PAUSED 실험의 실패가 아니다.
+            agent_repository.save(original_snapshot)
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception:
+            agent_repository.save(original_snapshot)
+            raise
+
     @application.post("/api/runs", response_model=RunRecord)
     def create_run(request: RunRequest) -> RunRecord:
         if not active_runtime.is_available(request.subject_mode):
@@ -375,6 +671,14 @@ def create_app(
         return run.events
 
     return application
+
+
+def agent_orchestrator_hash(request: AgentRunRequest) -> str:
+    from .agent_orchestrator import permission_profile_hash
+    from .permission_minimizer import collect_maximum_permission_profiles
+
+    del request
+    return permission_profile_hash(collect_maximum_permission_profiles().model_dump())
 
 
 app = create_app()

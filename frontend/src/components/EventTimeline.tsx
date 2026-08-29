@@ -12,7 +12,19 @@ const sourceLabels: Record<RunEvent["source"], string> = {
   runtime_agent: "Runtime Agent",
   supervisor: "Supervisor",
   verifier: "Verifier",
+  orchestrator: "Orchestrator",
+  recon: "Recon",
+  analyzer: "Analyzer",
+  planner: "Planner",
+  policy: "Policy Gate",
+  rollback: "Rollback",
 };
+
+const eventTimeFormatter = new Intl.DateTimeFormat("ko-KR", {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+});
 
 export function EventTimeline({ events }: EventTimelineProps) {
   return (
@@ -36,11 +48,7 @@ export function EventTimeline({ events }: EventTimelineProps) {
                 <div>
                   <span className="source-label">{sourceLabels[event.source]}</span>
                   <time dateTime={event.created_at}>
-                    {new Intl.DateTimeFormat("ko-KR", {
-                      hour: "2-digit",
-                      minute: "2-digit",
-                      second: "2-digit",
-                    }).format(new Date(event.created_at))}
+                    {eventTimeFormatter.format(new Date(event.created_at))}
                   </time>
                 </div>
                 <strong>{event.event_type}</strong>

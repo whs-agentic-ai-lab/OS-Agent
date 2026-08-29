@@ -17,6 +17,8 @@ services:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
     volumes:
       - /run/os-agent:/run/os-agent:rw
+    env_file:
+      - /etc/os-agent/secrets/runtime.env
     environment:
       HOST_SUPERVISOR_SOCKET: /run/os-agent/host-supervisor.sock
       OS_AGENT_TOPOLOGY_REVISION: ${topology_revision}

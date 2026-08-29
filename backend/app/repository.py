@@ -4,7 +4,7 @@ from typing import Protocol
 
 from supabase import Client, create_client
 
-from .schemas import RunRecord, SubjectMode
+from .schemas import AgentRunRecord, RunRecord, SubjectMode
 
 
 RUN_TABLES = {
@@ -242,3 +242,125 @@ def create_run_repository(
             SupabaseRunRepository(supabase_url, supabase_secret_key)
         )
     return InMemoryRunRepository()
+
+
+class AgentRunRepository(Protocol):
+    storage_name: str
+
+    def save(self, run: AgentRunRecord) -> None: ...
+
+    def get(self, run_id: str) -> AgentRunRecord | None: ...
+
+
+class InMemoryAgentRunRepository:
+    storage_name = "memory"
+
+    def __init__(self) -> None:
+        self._items: dict[str, AgentRunRecord] = {}
+        self._lock = Lock()
+
+    def save(self, run: AgentRunRecord) -> None:
+        with self._lock:
+            stored = self._items.get(run.run_id)
+            snapshot = run.model_copy(deep=True)
+            if stored is not None and stored.status == "CANCELLED":
+                snapshot.status = "CANCELLED"
+                run.status = "CANCELLED"
+            self._items[run.run_id] = snapshot
+
+    def get(self, run_id: str) -> AgentRunRecord | None:
+        with self._lock:
+            run = self._items.get(run_id)
+            return run.model_copy(deep=True) if run is not None else None
+
+
+class SupabaseAgentRunRepository:
+    storage_name = "supabase"
+
+    def __init__(self, url: str, secret_key: str, client: Client | None = None) -> None:
+        self._client = client or create_client(url, secret_key)
+        self._lock = Lock()
+        self._cancelled_run_ids: set[str] = set()
+
+    def save(self, run: AgentRunRecord) -> None:
+        with self._lock:
+            if run.status == "CANCELLED":
+                self._cancelled_run_ids.add(run.run_id)
+            elif run.run_id in self._cancelled_run_ids:
+                run.status = "CANCELLED"
+            row = run.model_dump(mode="json", exclude={"events"})
+            self._client.table("agent_runs").upsert(row, on_conflict="run_id").execute()
+            if run.events:
+                events = [
+                    {"run_id": run.run_id, **event.model_dump(mode="json")}
+                    for event in run.events
+                ]
+                self._client.table("agent_run_events").upsert(
+                    events, on_conflict="run_id,sequence"
+                ).execute()
+
+    def get(self, run_id: str) -> AgentRunRecord | None:
+        response = (
+            self._client.table("agent_runs")
+            .select("*")
+            .eq("run_id", run_id)
+            .limit(1)
+            .execute()
+        )
+        if not response.data:
+            return None
+        events = (
+            self._client.table("agent_run_events")
+            .select("sequence,source,event_type,message,payload,created_at")
+            .eq("run_id", run_id)
+            .order("sequence")
+            .execute()
+        )
+        payload = dict(response.data[0])
+        payload["events"] = events.data
+        return AgentRunRecord.model_validate(payload)
+
+
+class ResilientAgentRunRepository:
+    def __init__(self, primary: AgentRunRepository) -> None:
+        self._primary = primary
+        self._fallback = InMemoryAgentRunRepository()
+        self._degraded = False
+
+    @property
+    def storage_name(self) -> str:
+        return "supabase+memory-fallback" if self._degraded else self._primary.storage_name
+
+    def save(self, run: AgentRunRecord) -> None:
+        try:
+            self._primary.save(run)
+        except Exception:
+            self._degraded = True
+            logger.exception("Supabase AgentRun save 실패: 메모리 저장소로 복원합니다.")
+            self._fallback.save(run)
+
+    def get(self, run_id: str) -> AgentRunRecord | None:
+        if not self._degraded:
+            try:
+                run = self._primary.get(run_id)
+                if run is not None:
+                    return run
+            except Exception:
+                self._degraded = True
+                logger.exception("Supabase AgentRun get 실패: 메모리 저장소로 복원합니다.")
+        return self._fallback.get(run_id)
+
+
+def create_agent_run_repository(
+    supabase_url: str | None,
+    supabase_secret_key: str | None,
+) -> AgentRunRepository:
+    if bool(supabase_url) != bool(supabase_secret_key):
+        raise RuntimeError(
+            "SUPABASE_URL과 SUPABASE_SECRET_KEY(또는 SUPABASE_SERVICE_ROLE_KEY)를 모두 설정하세요."
+        )
+    if supabase_url and supabase_secret_key:
+        return ResilientAgentRunRepository(
+            SupabaseAgentRunRepository(supabase_url, supabase_secret_key)
+        )
+    return InMemoryAgentRunRepository()

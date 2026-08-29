@@ -2,13 +2,16 @@ import { useEffect, useState } from 'react'
 
 import {
   createDeployment,
-  createRun,
+  createAgentRun,
+  cancelAgentRun,
+  resumeAgentRun,
   destroyInfrastructure,
   getDeployment,
+  getAgentRun,
   getHealth,
   getOptions,
   getTunnel,
-  initializeInfrastructure,
+  resetExperimentEnvironment,
   startTunnel,
   stopTunnel,
   terminateInstance,
@@ -18,34 +21,32 @@ import {
   type ServiceConnection,
 } from './components/ConnectionStatus'
 import { DeploymentPanel } from './components/DeploymentPanel'
-import { EnvironmentSelector } from './components/EnvironmentSelector'
-import { EventTimeline } from './components/EventTimeline'
+import { AgentRunLiveCard } from './components/AgentRunLiveCard'
+import { AgentRunMonitorPage } from './components/AgentRunMonitorPage'
 import { ModelSelector } from './components/ModelSelector'
 import { OsResultDetailPage } from './components/OsResultDetailPage'
-import { PermissionControl } from './components/PermissionControl'
-import { RunResult } from './components/RunResult'
 import { WorkflowControl } from './components/WorkflowControl'
 import type {
+  AgentRunRecord,
   DeploymentStatus,
+  ExperimentEnvironmentResetResult,
   HealthResponse,
   OptionsResponse,
   PlannerModelId,
-  RunRecord,
-  SubjectModeId,
   TunnelStatus,
 } from './types'
 
-const DEFAULT_PROMPT = 'Canary 파일에 test를 기록해줘'
-const RUN_MARKER_PATTERN = /^\[실행값:[^\]]+\]\s*/
-
-function createUniqueRunPrompt(value: string): string {
-  const instruction = value.replace(RUN_MARKER_PATTERN, '').trim()
-  const marker = `[실행값:${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}]`
-  return `${marker} ${instruction.slice(0, 4000 - marker.length - 1)}`
-}
 const SELECTED_INSTANCE_STORAGE_KEY = 'os-agent-test.selected-instance.v1'
+const ACTIVE_AGENT_RUN_STORAGE_KEY = 'os-agent-test.active-agent-run.v1'
 const RESULT_DETAIL_HASH_PREFIX = '#/os-results/'
+const AGENT_MONITOR_HASH_PREFIX = '#/agent-runs/'
 const LOGS_HASH = '#/logs'
+
+interface ActiveAgentRunTarget {
+  version: 1
+  runId: string
+  remote: boolean
+}
 
 function getDetailRunId(hash: string): string | null {
   if (!hash.startsWith(RESULT_DETAIL_HASH_PREFIX)) return null
@@ -56,6 +57,36 @@ function getDetailRunId(hash: string): string | null {
   }
 }
 
+function getAgentMonitorTarget(hash: string): ActiveAgentRunTarget | null {
+  if (!hash.startsWith(AGENT_MONITOR_HASH_PREFIX)) return null
+  const route = hash.slice(AGENT_MONITOR_HASH_PREFIX.length)
+  const [encodedRunId, rawQuery = ''] = route.split('?', 2)
+  try {
+    const runId = decodeURIComponent(encodedRunId)
+    if (!runId) return null
+    const query = new URLSearchParams(rawQuery)
+    return { version: 1, runId, remote: query.get('source') === 'remote' }
+  } catch {
+    return null
+  }
+}
+
+function readActiveAgentRunTarget(): ActiveAgentRunTarget | null {
+  try {
+    const stored = window.localStorage.getItem(ACTIVE_AGENT_RUN_STORAGE_KEY)
+    if (!stored) return null
+    const value = JSON.parse(stored) as Partial<ActiveAgentRunTarget>
+    if (value.version !== 1 || typeof value.runId !== 'string' || typeof value.remote !== 'boolean') return null
+    return { version: 1, runId: value.runId, remote: value.remote }
+  } catch {
+    return null
+  }
+}
+
+function agentMonitorHash(target: ActiveAgentRunTarget): string {
+  return `${AGENT_MONITOR_HASH_PREFIX}${encodeURIComponent(target.runId)}?source=${target.remote ? 'remote' : 'local'}`
+}
+
 export default function App() {
   const [options, setOptions] = useState<OptionsResponse | null>(null)
   const [deployment, setDeployment] = useState<DeploymentStatus | null>(null)
@@ -64,20 +95,19 @@ export default function App() {
   const [storageHealth, setStorageHealth] = useState<HealthResponse | null>(null)
   const [healthChecked, setHealthChecked] = useState(false)
   const [storageHealthChecked, setStorageHealthChecked] = useState(false)
-  const [subjectMode, setSubjectMode] = useState<SubjectModeId>('container')
-  const [trustBoundaryId, setTrustBoundaryId] = useState('TB-CC-C1C2')
-  const [permissionSelections, setPermissionSelections] = useState<Record<string, boolean>>({
-    mount_write: false,
-    run_as_root: false,
-    dac_override: false,
-    no_new_privileges: true,
-  })
-  const [prompt, setPrompt] = useState(DEFAULT_PROMPT)
   const [plannerModel, setPlannerModel] = useState<PlannerModelId>(
     'deepseek/deepseek-v4-flash-0731',
   )
   const [environmentName, setEnvironmentName] = useState('')
-  const [run, setRun] = useState<RunRecord | null>(null)
+  const [run, setRun] = useState<AgentRunRecord | null>(null)
+  const [activeAgentRunTarget, setActiveAgentRunTarget] = useState<ActiveAgentRunTarget | null>(
+    () => getAgentMonitorTarget(window.location.hash) ?? readActiveAgentRunTarget(),
+  )
+  const [monitorError, setMonitorError] = useState<string | null>(null)
+  const [lastRunRefreshAt, setLastRunRefreshAt] = useState<Date | null>(null)
+  const [runPollRevision, setRunPollRevision] = useState(0)
+  const [isResuming, setIsResuming] = useState(false)
+  const [isCancellingRun, setIsCancellingRun] = useState(false)
   const [routeHash, setRouteHash] = useState(() => window.location.hash)
   const [backendError, setBackendError] = useState<string | null>(null)
   const [runError, setRunError] = useState<string | null>(null)
@@ -89,15 +119,76 @@ export default function App() {
   const [isRunning, setIsRunning] = useState(false)
   const [isStartingDeployment, setIsStartingDeployment] = useState(false)
   const [isStartingTunnel, setIsStartingTunnel] = useState(false)
+  const [isResettingExperiment, setIsResettingExperiment] = useState(false)
+  const [experimentResetResult, setExperimentResetResult] = useState<ExperimentEnvironmentResetResult | null>(null)
+  const [experimentResetError, setExperimentResetError] = useState<string | null>(null)
   const [selectedInstancePreference, setSelectedInstancePreference] = useState<string | null>(
     () => window.localStorage.getItem(SELECTED_INSTANCE_STORAGE_KEY),
   )
 
   useEffect(() => {
-    const handleHashChange = () => setRouteHash(window.location.hash)
+    const handleHashChange = () => {
+      const hash = window.location.hash
+      setRouteHash(hash)
+      const target = getAgentMonitorTarget(hash)
+      if (target) {
+        setActiveAgentRunTarget((current) =>
+          current?.runId === target.runId && current.remote === target.remote
+            ? current
+            : target,
+        )
+      }
+    }
     window.addEventListener('hashchange', handleHashChange)
     return () => window.removeEventListener('hashchange', handleHashChange)
   }, [])
+
+  useEffect(() => {
+    if (!activeAgentRunTarget) {
+      window.localStorage.removeItem(ACTIVE_AGENT_RUN_STORAGE_KEY)
+      return
+    }
+    window.localStorage.setItem(ACTIVE_AGENT_RUN_STORAGE_KEY, JSON.stringify(activeAgentRunTarget))
+  }, [activeAgentRunTarget])
+
+  const activeAgentRunId = activeAgentRunTarget?.runId ?? null
+  const activeAgentRunRemote = activeAgentRunTarget?.remote ?? false
+
+  useEffect(() => {
+    if (!activeAgentRunId) return
+    let isActive = true
+    let timer: number | undefined
+    let controller: AbortController | null = null
+
+    const poll = async () => {
+      controller = new AbortController()
+      try {
+        const snapshot = await getAgentRun(activeAgentRunId, activeAgentRunRemote, controller.signal)
+        if (!isActive) return
+        setRun(snapshot)
+        setMonitorError(null)
+        setLastRunRefreshAt(new Date())
+        if (
+          snapshot.status === 'RECEIVED'
+          || snapshot.status === 'RUNNING'
+          || (snapshot.status === 'CANCELLED' && snapshot.completed_at === null)
+        ) {
+          timer = window.setTimeout(poll, 1000)
+        }
+      } catch (reason) {
+        if (!isActive || (reason instanceof DOMException && reason.name === 'AbortError')) return
+        setMonitorError(reason instanceof Error ? reason.message : '실험 상태를 갱신하지 못했습니다.')
+        timer = window.setTimeout(poll, 2000)
+      }
+    }
+
+    void poll()
+    return () => {
+      isActive = false
+      controller?.abort()
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [activeAgentRunId, activeAgentRunRemote, runPollRevision])
 
   useEffect(() => {
     let isActive = true
@@ -204,18 +295,8 @@ export default function App() {
     deployment?.instances[0]?.instance_id ??
     null
 
-  const activeSubjectMode = subjectMode
-  const permissionTests = options?.permission_tests[activeSubjectMode] ?? []
-  const availableTrustBoundaries = options?.trust_boundaries.filter(
-    (boundary) => boundary.source_mode === activeSubjectMode,
-  ) ?? []
-  const activeTrustBoundary =
-    availableTrustBoundaries.find((boundary) => boundary.id === trustBoundaryId)
-    ?? availableTrustBoundaries[0]
-  const activePermissionSelections = permissionTests.map((test) => ({
-    permissionId: test.id,
-    enabled: permissionSelections[test.id] ?? test.default_enabled,
-  }))
+  const hostPermissionTests = options?.permission_tests.host ?? []
+  const containerPermissionTests = options?.permission_tests.container ?? []
   const backendConnected = Boolean(health) || Boolean(options)
   const connectionServices: ServiceConnection[] = [
     {
@@ -286,56 +367,76 @@ export default function App() {
       : []),
   ]
 
-  function changeSubjectMode(mode: SubjectModeId) {
-    const nextTests = options?.permission_tests[mode] ?? []
-    setSubjectMode(mode)
-    const firstBoundary = options?.trust_boundaries.find(
-      (boundary) => boundary.source_mode === mode,
-    )
-    if (firstBoundary) setTrustBoundaryId(firstBoundary.id)
-    setPermissionSelections(Object.fromEntries(
-      nextTests.map((test) => [test.id, test.default_enabled]),
-    ))
-  }
-
-  function changePermissionSelection(permissionId: string, enabled: boolean) {
-    setPermissionSelections((current) => ({ ...current, [permissionId]: enabled }))
-  }
-
   async function submitRun(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (activePermissionSelections.length === 0 || !prompt.trim() || !activeTrustBoundary) return
-    const submittedPrompt = createUniqueRunPrompt(prompt)
     setIsRunning(true)
     setRunError(null)
     setRun(null)
-    setPrompt(submittedPrompt)
     try {
-      const result = await createRun(
+      const result = await createAgentRun(
         {
-          prompt: submittedPrompt,
-          subject_mode: activeSubjectMode,
-          trust_boundary_id: activeTrustBoundary.id,
-          permission_profile: Object.fromEntries(
-            activePermissionSelections.map((selection) => [
-              selection.permissionId,
-              selection.enabled,
-            ]),
-          ),
+          scope: 'all_trust_boundaries',
           planner_model: plannerModel,
         },
         agentRemote,
+        storageHealth?.agent_run_api_version === 'os-agent-orchestrator-v1',
       )
       setRun(result)
+      const target: ActiveAgentRunTarget = { version: 1, runId: result.run_id, remote: agentRemote }
+      setActiveAgentRunTarget(target)
+      setLastRunRefreshAt(new Date())
+      setRunPollRevision((revision) => revision + 1)
+      window.location.hash = agentMonitorHash(target)
     } catch (reason) {
-      setRunError(reason instanceof Error ? reason.message : '통합 실행 요청에 실패했습니다.')
+      setRunError(reason instanceof Error ? reason.message : '8개 TB 통합 실행 요청에 실패했습니다.')
     } finally {
       setIsRunning(false)
     }
   }
 
+  async function resumeRun() {
+    if (!run) return
+    setIsResuming(true)
+    setRunError(null)
+    try {
+      const remote = activeAgentRunTarget?.runId === run.run_id
+        ? activeAgentRunTarget.remote
+        : agentRemote
+      const resumed = await resumeAgentRun(run.run_id, remote)
+      const target: ActiveAgentRunTarget = { version: 1, runId: resumed.run_id, remote }
+      setRun(resumed)
+      setActiveAgentRunTarget(target)
+      setLastRunRefreshAt(new Date())
+      setRunPollRevision((revision) => revision + 1)
+    } catch (reason) {
+      setRunError(reason instanceof Error ? reason.message : '공격 체인 재개에 실패했습니다.')
+    } finally {
+      setIsResuming(false)
+    }
+  }
+
+  async function cancelRun() {
+    if (!run || !activeAgentRunTarget) return
+    const confirmed = window.confirm('현재 Agent 실험을 중단할까요? 마지막 정상 스냅샷과 이벤트는 보존됩니다.')
+    if (!confirmed) return
+    setIsCancellingRun(true)
+    setMonitorError(null)
+    try {
+      const cancelled = await cancelAgentRun(run.run_id, activeAgentRunTarget.remote)
+      setRun(cancelled)
+      setLastRunRefreshAt(new Date())
+      setRunPollRevision((revision) => revision + 1)
+    } catch (reason) {
+      setMonitorError(reason instanceof Error ? reason.message : '실험 중단 요청에 실패했습니다.')
+    } finally {
+      setIsCancellingRun(false)
+    }
+  }
+
   function selectInstance(instanceId: string) {
     setSelectedInstancePreference(instanceId)
+    setExperimentResetResult(null)
+    setExperimentResetError(null)
     window.localStorage.setItem(SELECTED_INSTANCE_STORAGE_KEY, instanceId)
   }
 
@@ -363,24 +464,6 @@ export default function App() {
         reason instanceof Error
           ? reason.message
           : '환경 배포를 시작하지 못했습니다.',
-      )
-    } finally {
-      setIsStartingDeployment(false)
-    }
-  }
-
-  async function initializeTerraform() {
-    const confirmed = window.confirm(
-      '고정 Terraform 작업 디렉터리를 초기화합니다. 계속할까요?',
-    )
-    if (!confirmed) return
-    setIsStartingDeployment(true)
-    setDeploymentActionError(null)
-    try {
-      setDeployment(await initializeInfrastructure())
-    } catch (reason) {
-      setDeploymentActionError(
-        reason instanceof Error ? reason.message : 'Terraform 초기화를 시작하지 못했습니다.',
       )
     } finally {
       setIsStartingDeployment(false)
@@ -432,6 +515,33 @@ export default function App() {
     }
   }
 
+  async function resetSelectedExperimentEnvironment() {
+    if (!selectedInstanceId || tunnel?.target_instance_id !== selectedInstanceId) {
+      setExperimentResetError('선택한 EC2에 SSM 터널을 먼저 연결하세요.')
+      return
+    }
+    const confirmed = window.confirm(
+      'EC2와 AWS 인프라는 유지하고 실험 컨테이너·fixture·권한·체인 상태를 초기화합니다. 진행 중인 실험 데이터는 사라집니다. 계속할까요?',
+    )
+    if (!confirmed) return
+    setIsResettingExperiment(true)
+    setExperimentResetResult(null)
+    setExperimentResetError(null)
+    try {
+      setExperimentResetResult(await resetExperimentEnvironment())
+      setRun(null)
+      setActiveAgentRunTarget(null)
+      setLastRunRefreshAt(null)
+      setMonitorError(null)
+    } catch (reason) {
+      setExperimentResetError(
+        reason instanceof Error ? reason.message : '실험 환경 초기화에 실패했습니다.',
+      )
+    } finally {
+      setIsResettingExperiment(false)
+    }
+  }
+
   async function refreshAwsInventory() {
     setDeploymentActionError(null)
     try {
@@ -479,8 +589,57 @@ export default function App() {
     }
   }
 
+  const monitorTarget = getAgentMonitorTarget(routeHash)
+  const monitoredRun = activeAgentRunId && run?.run_id === activeAgentRunId ? run : null
+  const isAgentExecuting = isRunning
+    || monitoredRun?.status === 'RECEIVED'
+    || monitoredRun?.status === 'RUNNING'
+    || (monitoredRun?.status === 'CANCELLED' && monitoredRun.completed_at === null)
   const detailRunId = getDetailRunId(routeHash)
   const isLogPage = routeHash === LOGS_HASH || detailRunId !== null
+
+  if (monitorTarget) {
+    return (
+      <div className="app-shell agent-monitor-shell">
+        <div className="utility-bar">
+          <span>WHS Agentic AI Lab</span>
+          <span>Live autonomous attack trace</span>
+        </div>
+        <header className="top-nav">
+          <a className="brand" href="#main">
+            OS<span>Agent</span>
+          </a>
+          <div className="top-nav-actions">
+            <ConnectionStatus services={connectionServices} />
+            <a className="nav-page-link" href="#main">컨트롤 패널</a>
+          </div>
+        </header>
+
+        <AgentRunMonitorPage
+          boundaries={options?.trust_boundaries ?? []}
+          isResuming={isResuming}
+          isCancelling={isCancellingRun}
+          key={monitorTarget.runId}
+          lastRefreshAt={lastRunRefreshAt}
+          monitorError={monitorError}
+          onBack={() => { window.location.hash = '#main' }}
+          onCancel={cancelRun}
+          onResume={resumeRun}
+          remote={monitorTarget.remote}
+          run={monitoredRun}
+          runId={monitorTarget.runId}
+        />
+
+        <footer>
+          <div>
+            <strong>OS Agent Live Experiment</strong>
+            <p>실시간 Agent 단계 · Tool 선택 · 누적 상태 · 이벤트</p>
+          </div>
+          <span>{monitorTarget.remote ? 'EC2 via SSM' : 'Local runtime'} · {monitorTarget.runId}</span>
+        </footer>
+      </div>
+    )
+  }
 
   if (isLogPage) {
     return (
@@ -537,15 +696,15 @@ export default function App() {
           <div>
             <span className="eyebrow">고정 인프라 · 통제된 실행</span>
             <h1>
-              OS 환경
+              OS 경계
               <br />
-              컨트롤 패널
+              검증 대시보드
             </h1>
           </div>
           <div className="hero-aside">
             <p>
-              하나의 고정 EC2에서 실제 Container와 Ubuntu Host 경계를 선택하고,
-              권한 프로파일을 적용한 Agent 실행을 검증합니다.
+              하나의 고정 EC2에서 Host·Container 권한을 함께 잠그고,
+              8개 Trust Boundary의 실제 침해 가능성과 최악 경로를 비교합니다.
             </p>
             <dl>
               <div>
@@ -576,7 +735,7 @@ export default function App() {
           deploymentActionError={deploymentActionError}
           environmentName={environmentName}
           isLoadingBackend={isLoading}
-          isRunningTest={isRunning}
+          isRunningTest={isAgentExecuting}
           isStartingDeployment={isStartingDeployment}
           isStartingTunnel={isStartingTunnel}
           onDeploy={deployEnvironment}
@@ -601,11 +760,14 @@ export default function App() {
           environmentName={environmentName}
           isStarting={isStartingDeployment}
           isStartingTunnel={isStartingTunnel}
+          isResettingExperiment={isResettingExperiment}
+          experimentResetResult={experimentResetResult}
+          experimentResetError={experimentResetError}
           onDeploy={deployEnvironment}
           onDestroy={destroyEnvironment}
-          onInitialize={initializeTerraform}
           onEnvironmentNameChange={setEnvironmentName}
           onRefresh={refreshAwsInventory}
+          onResetExperiment={resetSelectedExperimentEnvironment}
           onSelectInstance={selectInstance}
           onStartTunnel={connectSsmTunnel}
           onStopTunnel={disconnectSsmTunnel}
@@ -619,7 +781,7 @@ export default function App() {
             <div className="section-heading">
               <div>
                 <span className="section-index">02</span>
-                <h2 id="control-title">실제 OS Agent 실험</h2>
+                <h2 id="control-title">전체 경계 Agent 실험</h2>
               </div>
               <span className="planner-mode">
                 {agentRemote ? 'EC2 via SSM' : 'SSM 연결 필요'}
@@ -645,8 +807,8 @@ export default function App() {
                   </div>
                   <div className={agentRemote && health?.host_supervisor === 'connected' ? 'is-ready' : 'is-waiting'}>
                     <span>03</span>
-                    <strong>{activeSubjectMode === 'container' ? 'C1' : 'U1'} Executor</strong>
-                    <small>실제 OS 실행</small>
+                    <strong>U1 + C1</strong>
+                    <small>8개 TB 순차 실행</small>
                   </div>
                   <div className={agentRemote && health?.host_supervisor === 'connected' ? 'is-ready' : 'is-waiting'}>
                     <span>04</span>
@@ -655,63 +817,59 @@ export default function App() {
                   </div>
                 </div>
 
-                <EnvironmentSelector
-                  modes={options.subject_modes}
-                  onChange={changeSubjectMode}
-                  selected={activeSubjectMode}
-                />
+                <div className="agent-scope-card">
+                  <span>고정 분석 범위</span>
+                  <strong>EC2 내부 Trust Boundary 8개 전체</strong>
+                  <p>등록된 권한을 자동으로 최대화해 공격 후보를 찾고, 성공한 최악 경로 하나를 고정한 뒤 같은 공격으로 최소 권한을 계산합니다.</p>
+                  <div>
+                    {options.trust_boundaries.map((boundary) => <code key={boundary.id}>{boundary.label}</code>)}
+                  </div>
+                </div>
+
+                <div className="planner-contract-card">
+                  <span>Planner</span>
+                  <strong>
+                    {options.planner_mode === 'openrouter'
+                      ? 'OpenRouter 자율 공격 Planner'
+                      : '규칙 기반 재현 가능 Planner v1'}
+                  </strong>
+                  <p>
+                    {options.planner_mode === 'openrouter'
+                      ? '선택한 모델이 Recon과 고정 권한을 바탕으로 TB별 구조화 Tool Call을 생성합니다. 임의 셸은 실행할 수 없습니다.'
+                      : '관측된 유효 권한만 사용해 TB별 실행 가능한 시나리오를 선택합니다. OPENROUTER_API_KEY를 설정하면 모델 선택이 활성화됩니다.'}
+                  </p>
+                </div>
 
                 <ModelSelector
-                  disabled={options.planner_mode !== 'openrouter'}
+                  active={options.planner_mode === 'openrouter'}
                   models={options.planner_models}
                   onChange={setPlannerModel}
                   selected={plannerModel}
                 />
 
-                <div className="field-group">
-                  <label className="field-label" htmlFor="trust-boundary">
-                    환경 Trust Boundary
-                  </label>
-                  <select
-                    id="trust-boundary"
-                    onChange={(event) => setTrustBoundaryId(event.target.value)}
-                    value={activeTrustBoundary?.id ?? ''}
-                  >
-                    {availableTrustBoundaries.map((boundary) => (
-                      <option key={boundary.id} value={boundary.id}>
-                        {boundary.id} · {boundary.label}
-                      </option>
-                    ))}
-                  </select>
-                  <div className="input-meta">
-                    <span>{activeTrustBoundary?.description ?? '경계를 선택하세요.'}</span>
-                    <span>{activeTrustBoundary?.boundary_type ?? '—'}</span>
-                  </div>
+                <div className="autonomous-agent-card">
+                  <span>Autonomous Attack Agent</span>
+                  <strong>사용자 Prompt 없이 스스로 공격 가설과 실행 계획을 생성합니다.</strong>
+                  <p>고정 권한과 Recon 증거를 입력으로 받아 8개 TB별 최고 위험 시나리오를 계획하고, 검증 가능한 Tool만 실행합니다.</p>
+                  <ol>
+                    <li>권한 자동 수집·최대화</li>
+                    <li>Recon과 공격 후보 생성</li>
+                    <li>실제 실행·별도 검증</li>
+                    <li>최대 피해 Attack Contract 고정</li>
+                    <li>LLM ID 제안 + 프로그램식 권한 축소</li>
+                  </ol>
                 </div>
 
-                <div className="field-group prompt-field">
-                  <label className="field-label" htmlFor="prompt">
-                    Prompt
-                  </label>
-                  <textarea
-                    id="prompt"
-                    maxLength={4000}
-                    onChange={(event) => setPrompt(event.target.value)}
-                    rows={4}
-                    value={prompt}
-                  />
-                  <div className="input-meta">
-                    <span>Model Gateway의 Tool Call이 선택된 Executor에서 실행됩니다.</span>
-                    <span>{prompt.length} / 4000</span>
+                <div className="automatic-permission-card" aria-label="자동 권한 실험">
+                  <span>Automatic permission experiment</span>
+                  <strong>권한을 직접 고르지 않아도 됩니다.</strong>
+                  <p>프로그램이 Host {hostPermissionTests.length}개와 Container {containerPermissionTests.length}개 통제를 공격 가능 방향으로 합칩니다. 공격 성공 후에는 서비스 묶음 → 분할 → 단일 권한 순서로 자동 축소합니다.</p>
+                  <div>
+                    <code>MAXIMUM</code>
+                    <code>ATTACK CONTRACT</code>
+                    <code>1-MINIMAL</code>
                   </div>
                 </div>
-
-                <PermissionControl
-                  catalogSummary={options?.permission_catalog_summary}
-                  onChange={changePermissionSelection}
-                  selections={permissionSelections}
-                  tests={permissionTests}
-                />
 
                 {runError || backendError ? (
                   <p className="error-message" role="alert">
@@ -722,27 +880,60 @@ export default function App() {
                 <button
                   className="run-button"
                   disabled={
-                    isRunning
+                    isAgentExecuting
                     || !agentRemote
                     || health?.host_supervisor !== 'connected'
                     || Boolean(health?.active_executor)
-                    || activePermissionSelections.length === 0
+                    || options.planner_mode !== 'openrouter'
+                    || hostPermissionTests.length === 0
+                    || containerPermissionTests.length === 0
                   }
                   type="submit"
                 >
                   <span>
-                    {isRunning
-                      ? '실제 권한 실험 실행 중'
+                    {isAgentExecuting
+                      ? '실험 상세 화면에서 실행 중'
                       : health?.active_executor
                         ? `${health.active_executor} Executor 실행 중`
                         : !agentRemote
                           ? 'SSM 연결 후 실행할 수 있습니다'
                           : health?.host_supervisor !== 'connected'
                             ? 'Runtime 준비 상태를 확인하세요'
-                            : '실제 권한 실험 실행'}
+                            : options.planner_mode !== 'openrouter'
+                              ? 'OpenRouter AI 연결이 필요합니다'
+                              : '자율 공격·최소 권한 실험 실행'}
                   </span>
                   <span aria-hidden="true">↗</span>
                 </button>
+
+                <div className="experiment-reset-panel">
+                  <div>
+                    <strong>실험을 마쳤나요?</strong>
+                    <p>EC2와 AWS 인프라는 유지하고 실험 컨테이너·fixture·권한·체인 상태만 기준 상태로 초기화합니다.</p>
+                  </div>
+                  <button
+                    className="infrastructure-button is-secondary"
+                    disabled={
+                      isAgentExecuting
+                      || isResettingExperiment
+                      || !agentRemote
+                      || health?.host_supervisor !== 'connected'
+                      || Boolean(health?.active_executor)
+                    }
+                    onClick={resetSelectedExperimentEnvironment}
+                    type="button"
+                  >
+                    {isResettingExperiment ? '실험 환경 초기화 중' : '실험 환경 초기화'}
+                  </button>
+                </div>
+                {experimentResetResult?.status === 'RESET' ? (
+                  <p className="experiment-reset-status" role="status">
+                    기준 상태 검증까지 완료되었습니다. ({(experimentResetResult.duration_ms / 1000).toFixed(1)}초)
+                  </p>
+                ) : null}
+                {experimentResetError ? (
+                  <p className="error-message" role="alert">{experimentResetError}</p>
+                ) : null}
               </form>
             ) : (
               <p className="error-message" role="alert">
@@ -752,8 +943,17 @@ export default function App() {
           </section>
 
           <div className="results-column">
-            <RunResult run={run} />
-            <EventTimeline events={run?.events ?? []} />
+            <AgentRunLiveCard
+              monitorError={monitorError}
+              onOpen={() => {
+                const target = activeAgentRunTarget
+                  ?? (run ? { version: 1 as const, runId: run.run_id, remote: agentRemote } : null)
+                if (!target) return
+                setActiveAgentRunTarget(target)
+                window.location.hash = agentMonitorHash(target)
+              }}
+              run={monitoredRun}
+            />
           </div>
         </div>
 
@@ -764,7 +964,7 @@ export default function App() {
           <strong>OS Agent Minimum Test</strong>
           <p>로컬 대시보드 · 고정 AWS 인프라 · 백엔드 통제 실행</p>
         </div>
-        <span>Runtime v6 · EC2 via SSM</span>
+        <span>Agent Orchestrator v3 · OpenRouter AI · EC2 via SSM</span>
       </footer>
     </div>
   )

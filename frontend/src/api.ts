@@ -1,4 +1,4 @@
-import type { DeploymentStatus, HealthResponse, OptionsResponse, RunDeleteResponse, RunListResponse, RunRecord, RunRequest, SubjectModeId, TunnelStatus } from "./types";
+import type { AgentRunRecord, AgentRunRequest, DeploymentStatus, ExperimentEnvironmentResetResult, HealthResponse, OptionsResponse, RunDeleteResponse, RunListResponse, RunRecord, RunRequest, SubjectModeId, TunnelStatus } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
@@ -34,6 +34,44 @@ export function createRun(payload: RunRequest, remote = false): Promise<RunRecor
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+}
+
+const LEGACY_AUTONOMOUS_MISSION = "고정 권한과 Recon 증거로 8개 Trust Boundary의 공격 가설과 실행 계획을 자율 생성한다.";
+
+export function createAgentRun(
+  payload: AgentRunRequest,
+  remote = false,
+  legacyPromptContract = false,
+): Promise<AgentRunRecord> {
+  const requestPayload = legacyPromptContract
+    ? { ...payload, prompt: LEGACY_AUTONOMOUS_MISSION }
+    : payload;
+  return request<AgentRunRecord>(agentPath("/api/agent-runs", remote), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(requestPayload),
+  });
+}
+
+export function getAgentRun(runId: string, remote = false, signal?: AbortSignal): Promise<AgentRunRecord> {
+  return request<AgentRunRecord>(
+    agentPath(`/api/agent-runs/${encodeURIComponent(runId)}`, remote),
+    { signal },
+  );
+}
+
+export function resumeAgentRun(runId: string, remote = false): Promise<AgentRunRecord> {
+  return request<AgentRunRecord>(
+    agentPath(`/api/agent-runs/${encodeURIComponent(runId)}/resume`, remote),
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+  );
+}
+
+export function cancelAgentRun(runId: string, remote = false): Promise<AgentRunRecord> {
+  return request<AgentRunRecord>(
+    agentPath(`/api/agent-runs/${encodeURIComponent(runId)}/cancel`, remote),
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+  );
 }
 
 export function getRun(runId: string, remote = false): Promise<RunRecord> {
@@ -97,6 +135,14 @@ export function terminateInstance(instanceId: string): Promise<DeploymentStatus>
       confirmation: "TERMINATE_OS_AGENT_INSTANCE",
       instance_id: instanceId,
     }),
+  });
+}
+
+export function resetExperimentEnvironment(): Promise<ExperimentEnvironmentResetResult> {
+  return request<ExperimentEnvironmentResetResult>("/api/remote/experiment-environment/reset", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirmation: "RESET_EXPERIMENT_ENVIRONMENT" }),
   });
 }
 

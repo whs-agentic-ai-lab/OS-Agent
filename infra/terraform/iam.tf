@@ -74,3 +74,22 @@ resource "aws_iam_role_policy" "collector_token" {
   role   = aws_iam_role.trial_ec2.id
   policy = data.aws_iam_policy_document.collector_token[0].json
 }
+
+data "aws_iam_policy_document" "openrouter_api_key" {
+  count = var.openrouter_api_key_parameter_name == "" ? 0 : 1
+
+  statement {
+    actions = ["ssm:GetParameter"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.openrouter_api_key_parameter_name}",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "openrouter_api_key" {
+  count = var.openrouter_api_key_parameter_name == "" ? 0 : 1
+
+  name   = "${local.resource_prefix}-openrouter-key-read"
+  role   = aws_iam_role.trial_ec2.id
+  policy = data.aws_iam_policy_document.openrouter_api_key[0].json
+}

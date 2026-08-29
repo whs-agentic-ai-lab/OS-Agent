@@ -200,3 +200,14 @@ variable "collector_token_kms_key_arn" {
     error_message = "collector_token_kms_key_arn은 KMS key ARN이어야 합니다."
   }
 }
+
+variable "openrouter_api_key_parameter_name" {
+  description = "OpenRouter API key를 담은 SSM SecureString 이름. 비밀값 자체는 Terraform에 넣지 않는다."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.openrouter_api_key_parameter_name == "" || can(regex("^/[A-Za-z0-9_.\\-/]+$", var.openrouter_api_key_parameter_name))
+    error_message = "openrouter_api_key_parameter_name은 /로 시작하는 SSM parameter 경로여야 합니다."
+  }
+}

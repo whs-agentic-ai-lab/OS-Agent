@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 
-import type { DeploymentStatus, RunRecord, TunnelStatus, WorkflowNode, WorkflowNodeStatus } from "../types";
+import type { AgentRunRecord, DeploymentStatus, RunRecord, TunnelStatus, WorkflowNode, WorkflowNodeStatus } from "../types";
 
 interface WorkflowControlProps {
   deployment: DeploymentStatus | null;
@@ -14,7 +14,7 @@ interface WorkflowControlProps {
   isStartingDeployment: boolean;
   optionsReady: boolean;
   backendError: string | null;
-  run: RunRecord | null;
+  run: RunRecord | AgentRunRecord | null;
   runError: string | null;
   onDeploy: (environmentName: string) => void;
   onEnvironmentNameChange: (environmentName: string) => void;

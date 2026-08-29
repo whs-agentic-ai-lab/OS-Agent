@@ -14,7 +14,7 @@
 - Before/After state capture script
 - Vector collector와 로컬 disk buffer
 
-FastAPI, Model Gateway, OpenRouter, Supabase schema는 이 Terraform 범위 밖이다.
+FastAPI와 Model Gateway는 runtime digest 이미지로 배포한다. OpenRouter key 값은 Terraform 범위 밖에서 SSM SecureString으로 생성하며, Terraform은 파라미터 이름과 EC2의 단일 `ssm:GetParameter` 권한만 관리한다. Supabase schema는 이 Terraform 범위 밖이다.
 
 고정 배포 조건은 다음과 같다.
 
@@ -37,7 +37,7 @@ Linux 계정명은 `user1`, `user2`다. `os-agent`는 서비스와 디렉터리 
 실험 중에는 다음을 지킨다.
 
 - 한 테스트 묶음이 진행되는 동안 `terraform apply`를 다시 실행하지 않는다.
-- OpenRouter 및 Supabase secret을 `tfvars`, state, `user_data` 원문에 넣지 않는다.
+- OpenRouter 및 Supabase secret 값을 `tfvars`, state, `user_data` 원문에 넣지 않는다. OpenRouter key는 환경별 SSM SecureString에서 부팅 시 읽는다.
 - 최초 `terraform init` 후 생성되는 `.terraform.lock.hcl`을 고정한다.
 
 ## 이미지 계약

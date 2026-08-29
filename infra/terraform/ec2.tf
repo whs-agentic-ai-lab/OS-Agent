@@ -75,6 +75,7 @@ locals {
     vector_archive_sha256       = var.vector_archive_sha256
     enable_remote_evidence_sink = var.enable_remote_evidence_sink
     collector_parameter_name    = var.collector_token_parameter_name
+    openrouter_parameter_name   = var.openrouter_api_key_parameter_name
     bootstrap_bundle_b64        = local.bootstrap_bundle_b64
   })
 
@@ -152,6 +153,11 @@ resource "aws_instance" "trial" {
     }
 
     precondition {
+      condition     = var.openrouter_api_key_parameter_name != ""
+      error_message = "AI 공격 Agent 실행을 위해 OpenRouter SSM SecureString parameter 이름이 필요합니다."
+    }
+
+    precondition {
       condition = (
         !var.enable_remote_evidence_sink ||
         (var.evidence_api_url != "" && var.collector_token_parameter_name != "")
@@ -170,6 +176,7 @@ resource "aws_instance" "trial" {
     aws_iam_role_policy_attachment.ssm_core,
     aws_iam_role_policy.ecr_pull,
     aws_iam_role_policy.collector_token,
+    aws_iam_role_policy.openrouter_api_key,
     data.aws_ecr_image.pinned,
     data.aws_ami.selected,
   ]
