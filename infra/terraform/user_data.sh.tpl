@@ -261,10 +261,11 @@ verify_image_contract os-agent-target-source '${target_image_uri}' target-servic
 docker create --name os-agent-runtime-source '${runtime_image_uri}' >/dev/null
 docker cp os-agent-runtime-source:/app/host_runtime/host_supervisor.py /opt/os-agent/bin/host-supervisor.py
 docker cp os-agent-runtime-source:/app/runtime_agent/runtime.py /opt/os-agent/bin/runtime-agent.py
+docker cp os-agent-runtime-source:/app/runtime_agent/recon_tools.py /opt/os-agent/bin/recon_tools.py
 docker rm os-agent-runtime-source >/dev/null
 rm -rf -- "$runtime_tmp"
-chown root:root /opt/os-agent/bin/host-supervisor.py /opt/os-agent/bin/runtime-agent.py
-chmod 0755 /opt/os-agent/bin/host-supervisor.py /opt/os-agent/bin/runtime-agent.py
+chown root:root /opt/os-agent/bin/host-supervisor.py /opt/os-agent/bin/runtime-agent.py /opt/os-agent/bin/recon_tools.py
+chmod 0755 /opt/os-agent/bin/host-supervisor.py /opt/os-agent/bin/runtime-agent.py /opt/os-agent/bin/recon_tools.py
 
 # 원격 sink token은 SSM에서 boot 시 읽는다. 값은 Terraform state/user-data에 없다.
 if [[ '${enable_remote_evidence_sink}' == 'true' ]]; then
