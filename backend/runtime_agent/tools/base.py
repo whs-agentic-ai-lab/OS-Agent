@@ -1,7 +1,8 @@
 """OStool 5절 Agent Attack Tool의 공통 계약.
 
-각 Tool 모듈(identity_capability.py 등)은 이 파일의 ToolOutcome / ToolContext /
-register / attempt / dispatch만 사용해 Action 함수를 만든다.
+신규 action은 이 파일의 ToolDefinition / ToolResult / VerificationResult /
+ResetResult 계약을 사용한다. legacy register/attempt/probe/dispatch는 family별
+전환이 끝날 때까지만 호환용으로 유지하며 구현 완료 수에 포함하지 않는다.
 
 핵심 원칙 (OStool 정리.md 3.1·7·9절):
   - Tool은 절대 스스로 "성공/실패"를 판정하지 않는다. OS·커널이 반환한
@@ -62,6 +63,14 @@ class ToolInputError(ValueError):
 
 class ToolPolicyBlocked(Exception):
     """실험 범위를 벗어난 Target이나 금지된 인자. Executor가 호출 자체를 막는다."""
+
+
+class ToolContractError(RuntimeError):
+    """ToolDefinition 또는 action 반환 계약이 올바르지 않다."""
+
+
+class ToolRollbackFailed(RuntimeError):
+    """resetter가 실행 전 상태 복구를 검증하지 못해 Run을 중단해야 한다."""
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +135,22 @@ class ToolOutcome:
 
 
 @dataclass
+class RunGuard:
+    """rollback 실패 후 같은 Run의 후속 action 실행을 차단하는 공유 상태."""
+
+    aborted: bool = False
+    reason: str | None = None
+
+    def abort(self, reason: str) -> None:
+        self.aborted = True
+        self.reason = reason
+
+
+EvidenceWriter = Callable[[str, str, str, dict[str, Any]], str]
+AbortHandler = Callable[[str, str], None]
+
+
+@dataclass
 class ToolContext:
     """Executor가 채워서 넘기는 공통 문맥. Tool 함수는 이 값을 읽기만 한다."""
 
@@ -140,10 +165,19 @@ class ToolContext:
     allowed_targets: frozenset[str] = field(default_factory=frozenset)
     # 등록된 resource_ref -> 실제 경로/PID/Container/service 매핑. Executor(Harness)가
     # Run 시작 시 채운다. Agent는 raw 경로를 직접 넘기지 못하고 이 매핑만 참조한다(5.11).
-    resource_paths: dict[str, str] = field(default_factory=dict)
+    resource_paths: dict[str, str | int] = field(default_factory=dict)
     # 파괴적·종료성 Tool(destructive)은 Harness가 전용 Fixture·제한 Target을 준비하고
     # 이 플래그를 True로 켰을 때에만 실행된다. 기본 False → 파괴적 Tool은 POLICY_BLOCKED.
     destructive_enabled: bool = False
+    # 같은 Run의 모든 action context가 동일한 guard를 공유해야 한다. reset 실패 시
+    # aborted=True가 되어 다음 ToolDefinition 실행이 정책 단계에서 차단된다.
+    run_guard: RunGuard = field(default_factory=RunGuard, repr=False)
+    # Collector/Evidence Store 연결은 Harness가 주입한다. base.py는 Evidence를
+    # 만들어내거나 성공을 꾸미지 않고 run_id/action_id와 payload만 전달한다.
+    evidence_writer: EvidenceWriter | None = field(default=None, repr=False)
+    # rollback 실패 시 Harness Reset을 요청하는 callback. 실제 Reset 구현은
+    # 신뢰 영역인 Harness 책임이며 Agent Tool이 직접 환경을 재구성하지 않는다.
+    abort_handler: AbortHandler | None = field(default=None, repr=False)
 
     def resolve_target(self, resource_ref: str) -> str:
         """OStool 5.11: 모든 경로·PID·Container·service는 등록된 Target reference로 해석한다."""
@@ -161,7 +195,42 @@ class ToolContext:
         path = self.resource_paths.get(resource_ref)
         if path is None:
             raise ToolPolicyBlocked(f"resource_ref에 매핑된 경로가 없습니다: {resource_ref}")
+        if not isinstance(path, str):
+            raise ToolPolicyBlocked(f"resource_ref가 경로를 가리키지 않습니다: {resource_ref}")
         return path
+
+    def resolve_resource(self, resource_ref: str) -> str | int:
+        """path/PID/FD/container/service 공통 Target reference 해석."""
+        self.resolve_target(resource_ref)
+        resource = self.resource_paths.get(resource_ref)
+        if resource is None:
+            raise ToolPolicyBlocked(f"resource_ref 매핑이 없습니다: {resource_ref}")
+        return resource
+
+    def ensure_run_active(self) -> None:
+        if self.run_guard.aborted:
+            raise ToolPolicyBlocked(
+                f"rollback 실패로 Run이 중단되었습니다: {self.run_guard.reason or 'unknown'}"
+            )
+
+    def record_evidence(self, kind: str, payload: dict[str, Any]) -> str:
+        """동일 run_id/action_id로 Collector Evidence를 저장하고 참조를 받는다."""
+        if self.evidence_writer is None:
+            raise ToolContractError("ToolDefinition 실행에는 evidence_writer가 필요합니다.")
+        reference = self.evidence_writer(self.run_id, self.action_id, kind, payload)
+        if not isinstance(reference, str) or not reference:
+            raise ToolContractError("evidence_writer가 유효한 Evidence reference를 반환하지 않았습니다.")
+        return reference
+
+    def abort_for_rollback(self, reason: str) -> None:
+        self.run_guard.abort(reason)
+        if self.abort_handler is not None:
+            try:
+                self.abort_handler(self.run_id, reason)
+            except Exception:
+                # RunGuard는 이미 중단 상태다. callback 오류 때문에 복구 결과
+                # 반환까지 잃지 않고 상위 Harness가 상태를 확인하게 한다.
+                pass
 
 
 ToolFunc = Callable[[str, dict[str, Any], ToolContext], ToolOutcome]
@@ -180,14 +249,16 @@ _STANDARD_ARGS: dict[str, frozenset[str]] = {
     "path": frozenset({"resource_ref"}),
     "container": frozenset({"resource_ref"}),
     "service": frozenset({"resource_ref"}),
-    "pid": frozenset({"pid"}),
-    "fd": frozenset({"fd"}),
+    # pid/fd 직접 값은 legacy family가 전환될 때까지만 허용한다. 새
+    # ToolDefinition 실행 경로는 아래 execute_definition에서 resource_ref를
+    # 강제하고 resolve_resource()로 실제 값을 얻는다.
+    "pid": frozenset({"resource_ref", "pid"}),
+    "fd": frozenset({"resource_ref", "fd"}),
     "self": frozenset(),
     "none": frozenset(),
 }
 _REQUIRED_STANDARD: dict[str, str] = {
     "path": "resource_ref", "container": "resource_ref", "service": "resource_ref",
-    "pid": "pid", "fd": "fd",
 }
 
 
@@ -201,15 +272,299 @@ class ToolSpec:
     destructive: bool = False                                    # 되돌릴 수 없는 파괴·종료성
     reversible: bool = False                                     # probe로 즉시 원복
     timeout_s: float = 10.0
+    resource_limits: dict[str, int] = field(default_factory=dict)
+    emergency_stop_conditions: frozenset[str] = frozenset()
 
     def allowed_keys(self) -> frozenset[str]:
         return _STANDARD_ARGS.get(self.resource_kind, frozenset()) | frozenset(self.arg_schema)
+
+
+# ---------------------------------------------------------------------------
+# 새 action 수직 계약. family 파일은 action 하나마다 ToolDefinition 하나를
+# 만들고 그 안에 handler/verifier/resetter를 함께 둔다. legacy @register
+# 레지스트리는 family별 전환이 끝날 때까지만 호환용으로 유지한다.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ToolDecision:
+    tool: str
+    action: str
+    resource_ref: str | None
+    arguments: dict[str, Any]
+
+
+@dataclass
+class ToolResult:
+    """handler가 반환하는 OS/API 시도 사실과 실행 전·도달 상태."""
+
+    run_id: str
+    action_id: str
+    tool: str
+    action: str
+    attempted: bool
+    outcome: Outcome
+    errno: str | None = None
+    exit_code: int | None = None
+    output: str = ""
+    identity_before: dict[str, Any] = field(default_factory=dict)
+    identity_reached: dict[str, Any] = field(default_factory=dict)
+    identity_after: dict[str, Any] = field(default_factory=dict)
+    state_before: dict[str, Any] = field(default_factory=dict)
+    state_reached: dict[str, Any] = field(default_factory=dict)
+    state_after: dict[str, Any] = field(default_factory=dict)
+    changed: bool = False
+    temporary_changed: bool = False
+    escalation_possible: bool = False
+    rollback_status: str | None = None
+    evidence_refs: list[str] = field(default_factory=list)
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "action_id": self.action_id,
+            "tool": self.tool,
+            "action": self.action,
+            "attempted": self.attempted,
+            "outcome": self.outcome,
+            "errno": self.errno,
+            "exit_code": self.exit_code,
+            "output": self.output,
+            "identity_before": self.identity_before,
+            "identity_reached": self.identity_reached,
+            "identity_after": self.identity_after,
+            "state_before": self.state_before,
+            "state_reached": self.state_reached,
+            "state_after": self.state_after,
+            "changed": self.changed,
+            "temporary_changed": self.temporary_changed,
+            "escalation_possible": self.escalation_possible,
+            "rollback_status": self.rollback_status,
+            "evidence_refs": list(self.evidence_refs),
+            "data": dict(self.data),
+        }
+
+
+@dataclass
+class VerificationResult:
+    """Verifier가 실제 OS/API를 독립 재조회한 결과."""
+
+    verifier: str
+    status: str  # VERIFIED | VERIFIED_NO_CHANGE | REJECTED | NOT_RUN
+    checks: dict[str, bool] = field(default_factory=dict)
+    observed: dict[str, Any] = field(default_factory=dict)
+    evidence_refs: list[str] = field(default_factory=list)
+
+    @property
+    def accepted(self) -> bool:
+        return self.status in {"VERIFIED", "VERIFIED_NO_CHANGE"}
+
+
+@dataclass
+class ResetResult:
+    """resetter가 실제 복구 후 상태를 다시 조회한 결과."""
+
+    resetter: str
+    status: str  # VERIFIED | VERIFIED_NO_CHANGE | NOT_REQUIRED | FAILED
+    identity_after: dict[str, Any] = field(default_factory=dict)
+    state_after: dict[str, Any] = field(default_factory=dict)
+    checks: dict[str, bool] = field(default_factory=dict)
+    evidence_refs: list[str] = field(default_factory=list)
+    output: str = ""
+
+    @property
+    def restored(self) -> bool:
+        return self.status in {"VERIFIED", "VERIFIED_NO_CHANGE", "NOT_REQUIRED"}
+
+
+DefinitionState = dict[str, Any]
+DefinitionHandler = Callable[[DefinitionState, ToolDecision, ToolContext], ToolResult]
+DefinitionVerifier = Callable[
+    [DefinitionState, ToolDecision, ToolResult, ToolContext], VerificationResult
+]
+DefinitionResetter = Callable[
+    [DefinitionState, ToolDecision, ToolResult, ToolContext], ResetResult
+]
+
+
+@dataclass(frozen=True)
+class ToolDefinition:
+    """action 하나에 필요한 실행·독립 검증·복구 계약 전체."""
+
+    name: str
+    tool: str
+    action: str
+    handler: DefinitionHandler
+    verifier: DefinitionVerifier
+    resetter: DefinitionResetter
+    spec: ToolSpec
+
+
+@dataclass
+class ToolExecution:
+    """handler → verifier → resetter 실행의 전체 결과."""
+
+    definition: str
+    result: ToolResult
+    verification: VerificationResult
+    reset: ResetResult
+
+    @property
+    def rollback_verified(self) -> bool:
+        return self.reset.restored
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self.result.to_dict(),
+            "verification": {
+                "verifier": self.verification.verifier,
+                "status": self.verification.status,
+                "checks": dict(self.verification.checks),
+                "observed": dict(self.verification.observed),
+                "evidence_refs": list(self.verification.evidence_refs),
+            },
+            "reset": {
+                "resetter": self.reset.resetter,
+                "status": self.reset.status,
+                "checks": dict(self.reset.checks),
+                "identity_after": self.reset.identity_after,
+                "state_after": self.reset.state_after,
+                "evidence_refs": list(self.reset.evidence_refs),
+                "output": self.reset.output,
+            },
+        }
 
 
 _REGISTRY: dict[str, dict[str, ToolFunc]] = {}
 _SPECS: dict[tuple[str, str], ToolSpec] = {}
 _VERIFIERS: dict[tuple[str, str], Callable[[ToolOutcome], bool]] = {}
 _RESETS: dict[tuple[str, str], Callable[[ToolOutcome, ToolContext], None]] = {}
+_DEFINITIONS: dict[tuple[str, str], ToolDefinition] = {}
+
+
+def register_definition(definition: ToolDefinition) -> ToolDefinition:
+    """완전한 action 계약만 새 레지스트리에 등록한다."""
+    key = (definition.tool, definition.action)
+    expected_name = f"{definition.tool}.{definition.action}"
+    if definition.name != expected_name:
+        raise ToolContractError(
+            f"ToolDefinition name은 {expected_name!r}이어야 합니다: {definition.name!r}"
+        )
+    if not all(callable(item) for item in (
+        definition.handler, definition.verifier, definition.resetter,
+    )):
+        raise ToolContractError(f"{definition.name}의 handler/verifier/resetter가 모두 필요합니다.")
+    if not isinstance(definition.spec, ToolSpec):
+        raise ToolContractError(f"{definition.name}에 ToolSpec이 필요합니다.")
+    if definition.spec.resource_kind not in _STANDARD_ARGS:
+        raise ToolContractError(
+            f"{definition.name}의 resource_kind가 올바르지 않습니다: "
+            f"{definition.spec.resource_kind!r}"
+        )
+    if not definition.spec.allowed_executors:
+        raise ToolContractError(f"{definition.name}의 allowed_executors가 비어 있습니다.")
+    if definition.spec.timeout_s <= 0:
+        raise ToolContractError(f"{definition.name}의 timeout_s는 양수여야 합니다.")
+    if definition.spec.destructive and not definition.spec.resource_limits:
+        raise ToolContractError(
+            f"{definition.name} 파괴적 action에 resource_limits가 필요합니다."
+        )
+    if definition.spec.destructive and not definition.spec.emergency_stop_conditions:
+        raise ToolContractError(
+            f"{definition.name} 파괴적 action에 emergency_stop_conditions가 필요합니다."
+        )
+    if key in _DEFINITIONS:
+        raise ToolContractError(f"중복 ToolDefinition입니다: {definition.name}")
+    _DEFINITIONS[key] = definition
+    return definition
+
+
+def known_definitions() -> dict[str, list[str]]:
+    definitions: dict[str, list[str]] = {}
+    for tool_id, action in _DEFINITIONS:
+        definitions.setdefault(tool_id, []).append(action)
+    return {tool_id: sorted(actions) for tool_id, actions in definitions.items()}
+
+
+def get_definition(tool_id: str, action: str) -> ToolDefinition | None:
+    """Runtime/Harness가 action 계약과 ToolSpec을 조회하는 공개 read-only API."""
+    return _DEFINITIONS.get((tool_id, action))
+
+
+def definition_manifest() -> list[dict[str, Any]]:
+    """백엔드 조립용 JSON-safe ToolDefinition 카탈로그를 반환한다.
+
+    이 값은 action의 코드 존재와 실행 계약만 나타낸다. EC2/환경 인증 완료 여부나
+    ``implemented_actions`` 등록 여부는 백엔드의 별도 인증 카탈로그가 결정한다.
+    """
+
+    def schema_name(expected: Any) -> str | list[str]:
+        if isinstance(expected, tuple):
+            return [schema_name(item) for item in expected]  # type: ignore[list-item]
+        if isinstance(expected, type):
+            return expected.__name__
+        return repr(expected)
+
+    manifest: list[dict[str, Any]] = []
+    for (tool_id, action), definition in sorted(_DEFINITIONS.items()):
+        spec = definition.spec
+        manifest.append({
+            "name": definition.name,
+            "tool": tool_id,
+            "action": action,
+            "allowed_executors": sorted(spec.allowed_executors),
+            "allowed_tbs": sorted(spec.allowed_tbs),
+            "resource_kind": spec.resource_kind,
+            "argument_schema": {
+                key: schema_name(value)
+                for key, value in sorted(spec.arg_schema.items())
+            },
+            "required_arguments": sorted(spec.required_args),
+            "destructive": spec.destructive,
+            "reversible": spec.reversible,
+            "timeout_seconds": spec.timeout_s,
+            "resource_limits": dict(sorted(spec.resource_limits.items())),
+            "emergency_stop_conditions": sorted(spec.emergency_stop_conditions),
+            "handler_registered": callable(definition.handler),
+            "verifier_registered": callable(definition.verifier),
+            "resetter_registered": callable(definition.resetter),
+            "certification_status": "NOT_ASSERTED_BY_TOOL_PACKAGE",
+        })
+    return manifest
+
+
+def definition_coverage() -> dict[str, int]:
+    """legacy decorator가 아니라 완전 전환된 ToolDefinition 수만 센다."""
+    return {
+        "tools": len({tool_id for tool_id, _ in _DEFINITIONS}),
+        "actions": len(_DEFINITIONS),
+    }
+
+
+def validate_definition_registry(
+    expected: dict[str, list[str]] | None = None,
+) -> None:
+    """누락·초과·불완전 definition을 시작 시 오류로 만든다."""
+    for definition in _DEFINITIONS.values():
+        if not isinstance(definition.spec, ToolSpec):
+            raise ToolContractError(f"{definition.name}에 ToolSpec이 없습니다.")
+        if not definition.spec.allowed_executors:
+            raise ToolContractError(f"{definition.name}의 allowed_executors가 비어 있습니다.")
+    if expected is None:
+        return
+    expected_keys = {
+        (tool_id, action)
+        for tool_id, actions in expected.items()
+        for action in actions
+    }
+    actual_keys = set(_DEFINITIONS)
+    if expected_keys != actual_keys:
+        missing = sorted(expected_keys - actual_keys)
+        extra = sorted(actual_keys - expected_keys)
+        raise ToolContractError(
+            f"ToolDefinition 카탈로그 불일치: missing={missing}, extra={extra}"
+        )
 
 
 def register(
@@ -245,6 +600,85 @@ def register_verifier(tool_id: str, action: str, func: Callable[[ToolOutcome], b
 
 def register_reset(tool_id: str, action: str, func: Callable[[ToolOutcome, ToolContext], None]) -> None:
     _RESETS[(tool_id, action)] = func
+
+
+def action_verifier(tool_id: str, action: str) -> Callable[[ToolOutcome], bool]:
+    """DEPRECATED: legacy decorator 호환용 결과 비교기.
+
+    실제 OS/API를 재조회하지 않으므로 ToolDefinition Verifier로 인정하지 않으며
+    definition_coverage()에도 포함되지 않는다. family 전환 시 제거한다.
+    """
+
+    def _verify(outcome: ToolOutcome) -> bool:
+        if outcome.tool != tool_id or outcome.action != action:
+            return False
+        if not outcome.attempted or outcome.outcome not in {"ALLOWED", "OS_DENIED"}:
+            return False
+        if outcome.rollback_status == "FAILED":
+            return False
+        if (
+            outcome.identity_before
+            and outcome.identity_after
+            and outcome.identity_before != outcome.identity_after
+        ):
+            return False
+        if outcome.outcome == "OS_DENIED":
+            return not outcome.changed and (
+                not (outcome.state_before or outcome.state_after)
+                or outcome.state_before == outcome.state_after
+            )
+        if outcome.exit_code not in {0, None}:
+            return False
+        spec = _SPECS.get((tool_id, action))
+        if spec is not None and spec.reversible and outcome.rollback_status != "VERIFIED":
+            return False
+        if outcome.rollback_status == "VERIFIED":
+            return (
+                outcome.identity_before == outcome.identity_after
+                and outcome.state_before == outcome.state_after
+            )
+        # 생성/설치처럼 resetter가 뒤에서 복구하는 action은 verifier 시점에
+        # state_after가 state_before와 다른 것이 정상이다. 실제 복구 책임은
+        # action에 직접 연결된 resetter가 지며, 공통 resetter는 불일치 시 실패한다.
+        return True
+
+    safe_tool = "".join(ch if ch.isalnum() else "_" for ch in tool_id)
+    safe_action = "".join(ch if ch.isalnum() else "_" for ch in action)
+    _verify.__name__ = f"{safe_tool}_{safe_action}_verifier"
+    return _verify
+
+
+def action_resetter(tool_id: str, action: str) -> Callable[[ToolOutcome, ToolContext], None]:
+    """DEPRECATED: legacy decorator 호환용 잔여 상태 검사기.
+
+    실제 복구를 수행하지 않으므로 ToolDefinition Resetter로 인정하지 않으며
+    definition_coverage()에도 포함되지 않는다. family 전환 시 제거한다.
+    """
+
+    def _reset(outcome: ToolOutcome, context: ToolContext) -> None:
+        del context
+        if outcome.tool != tool_id or outcome.action != action:
+            raise OSError(errno_module.EINVAL, "reset target mismatch")
+        if outcome.rollback_status == "FAILED" or outcome.changed:
+            raise OSError(errno_module.EIO, "action left an unverified state change")
+        if (
+            outcome.identity_before
+            and outcome.identity_after
+            and outcome.identity_before != outcome.identity_after
+        ):
+            raise OSError(errno_module.EIO, "identity was not restored")
+        if (outcome.state_before or outcome.state_after) and outcome.state_before != outcome.state_after:
+            raise OSError(errno_module.EIO, "resource state was not restored")
+        spec = _SPECS.get((tool_id, action))
+        if spec is not None and spec.reversible and outcome.rollback_status != "VERIFIED":
+            raise OSError(errno_module.EIO, "reversible action has no verified rollback")
+        if spec is not None and spec.destructive and outcome.rollback_status == "NOT_POSSIBLE":
+            raise OSError(errno_module.EIO, "destructive action requires a dedicated fixture reset")
+
+    safe_tool = "".join(ch if ch.isalnum() else "_" for ch in tool_id)
+    safe_action = "".join(ch if ch.isalnum() else "_" for ch in action)
+    _reset.__name__ = f"{safe_tool}_{safe_action}_resetter"
+    return _reset
 
 
 def _blocked(tool_id: str, action: str, message: str) -> ToolOutcome:
@@ -290,8 +724,355 @@ def _enforce_spec(tool_id: str, action: str, spec: ToolSpec, arguments: dict[str
         )
 
 
+def _validate_tool_result(
+    definition: ToolDefinition,
+    result: ToolResult,
+    context: ToolContext,
+) -> None:
+    expected = {
+        "run_id": context.run_id,
+        "action_id": context.action_id,
+        "tool": definition.tool,
+        "action": definition.action,
+    }
+    actual = {
+        "run_id": result.run_id,
+        "action_id": result.action_id,
+        "tool": result.tool,
+        "action": result.action,
+    }
+    if actual != expected:
+        raise ToolContractError(
+            f"{definition.name} handler 반환 식별자가 scope와 다릅니다: "
+            f"expected={expected}, actual={actual}"
+        )
+    if result.outcome not in {"ALLOWED", "OS_DENIED", "POLICY_BLOCKED", "ERROR"}:
+        raise ToolContractError(
+            f"{definition.name} handler의 outcome이 올바르지 않습니다: {result.outcome!r}"
+        )
+    if result.attempted and not result.identity_before:
+        raise ToolContractError(f"{definition.name} handler에 identity_before가 없습니다.")
+    if result.attempted and not result.identity_reached:
+        raise ToolContractError(f"{definition.name} handler에 identity_reached가 없습니다.")
+    if (
+        result.outcome == "ALLOWED"
+        and (definition.spec.reversible or definition.spec.destructive)
+        and not result.state_before
+        and result.identity_before == result.identity_reached
+    ):
+        raise ToolContractError(
+            f"{definition.name} 상태 변경 handler에 state_before 또는 identity 변화가 없습니다."
+        )
+
+
+def _validate_verification_result(
+    definition: ToolDefinition,
+    verification: VerificationResult,
+) -> None:
+    if verification.status not in {
+        "VERIFIED", "VERIFIED_NO_CHANGE", "REJECTED", "NOT_RUN",
+    }:
+        raise ToolContractError(
+            f"{definition.name} verifier status가 올바르지 않습니다: "
+            f"{verification.status!r}"
+        )
+    if verification.status != "NOT_RUN" and not verification.checks:
+        raise ToolContractError(f"{definition.name} verifier에 독립 checks가 없습니다.")
+    if any(not isinstance(value, bool) for value in verification.checks.values()):
+        raise ToolContractError(f"{definition.name} verifier checks는 bool이어야 합니다.")
+    if verification.status in {"VERIFIED", "VERIFIED_NO_CHANGE"} and not all(
+        verification.checks.values()
+    ):
+        raise ToolContractError(
+            f"{definition.name} verifier가 실패 check를 VERIFIED로 표시했습니다."
+        )
+
+
+def _validate_reset_result(
+    definition: ToolDefinition,
+    reset_result: ResetResult,
+) -> None:
+    if reset_result.status not in {
+        "VERIFIED", "VERIFIED_NO_CHANGE", "NOT_REQUIRED", "FAILED",
+    }:
+        raise ToolContractError(
+            f"{definition.name} reset status가 올바르지 않습니다: "
+            f"{reset_result.status!r}"
+        )
+    if not reset_result.checks:
+        raise ToolContractError(f"{definition.name} resetter에 복구 checks가 없습니다.")
+    if any(not isinstance(value, bool) for value in reset_result.checks.values()):
+        raise ToolContractError(f"{definition.name} resetter checks는 bool이어야 합니다.")
+    if reset_result.status != "FAILED" and not all(reset_result.checks.values()):
+        raise ToolContractError(
+            f"{definition.name} resetter가 실패 check를 복구 완료로 표시했습니다."
+        )
+    if not reset_result.identity_after:
+        raise ToolContractError(f"{definition.name} resetter에 identity_after가 없습니다.")
+
+
+def _definition_policy_result(
+    definition: ToolDefinition,
+    context: ToolContext,
+    message: str,
+) -> ToolExecution:
+    identity = identity_snapshot()
+    result = ToolResult(
+        run_id=context.run_id,
+        action_id=context.action_id,
+        tool=definition.tool,
+        action=definition.action,
+        attempted=False,
+        outcome="POLICY_BLOCKED",
+        errno=None,
+        exit_code=126,
+        output=message,
+        identity_before=identity,
+        identity_reached=identity,
+        identity_after=identity,
+        rollback_status="NOT_REQUIRED",
+    )
+    verification = VerificationResult(
+        verifier=f"{definition.name}.verifier",
+        status="NOT_RUN",
+        checks={"policy_allowed": False},
+    )
+    reset_result = ResetResult(
+        resetter=f"{definition.name}.resetter",
+        status="NOT_REQUIRED",
+        identity_after=identity,
+        checks={"handler_attempted": False},
+    )
+    return ToolExecution(definition.name, result, verification, reset_result)
+
+
+def execute_definition(
+    tool_id: str,
+    action: str,
+    arguments: dict[str, Any],
+    context: ToolContext,
+    *,
+    state: DefinitionState | None = None,
+) -> ToolExecution:
+    """완전한 action 계약을 정책→실행→독립 검증→복구 순서로 실행한다.
+
+    Verifier가 REJECTED여도 resetter는 반드시 실행한다. resetter가 FAILED이거나
+    상태 변경 action이 복구를 증명하지 못하면 RunGuard를 abort하여 다음 action을
+    차단하고 Harness abort_handler를 호출한다.
+    """
+    definition = _DEFINITIONS.get((tool_id, action))
+    if definition is None:
+        raise ToolContractError(
+            f"완전한 ToolDefinition으로 전환되지 않은 action입니다: {tool_id}.{action}"
+        )
+    context.ensure_run_active()
+    args = dict(arguments)
+    try:
+        _enforce_spec(tool_id, action, definition.spec, args, context)
+    except (ToolPolicyBlocked, ToolInputError) as exc:
+        return _definition_policy_result(definition, context, str(exc))
+
+    resource_ref = args.get("resource_ref")
+    if definition.spec.resource_kind not in {"none", "self"}:
+        if not isinstance(resource_ref, str) or not resource_ref:
+            return _definition_policy_result(
+                definition,
+                context,
+                f"{definition.name}에는 등록된 resource_ref가 필요합니다.",
+            )
+        try:
+            context.resolve_resource(resource_ref)
+        except ToolPolicyBlocked as exc:
+            return _definition_policy_result(definition, context, str(exc))
+    decision = ToolDecision(
+        tool=tool_id,
+        action=action,
+        resource_ref=resource_ref if isinstance(resource_ref, str) else None,
+        arguments=args,
+    )
+    execution_state = state if state is not None else {}
+    identity_before_handler = identity_snapshot()
+
+    try:
+        with _time_limit(definition.spec.timeout_s):
+            result = definition.handler(execution_state, decision, context)
+    except (ToolPolicyBlocked, ToolInputError) as exc:
+        identity_reached = identity_snapshot()
+        result = ToolResult(
+            run_id=context.run_id,
+            action_id=context.action_id,
+            tool=tool_id,
+            action=action,
+            attempted=False,
+            outcome="POLICY_BLOCKED",
+            errno=None,
+            exit_code=126,
+            output=str(exc),
+            identity_before=identity_before_handler,
+            identity_reached=identity_reached,
+        )
+    except TimeoutError:
+        identity_reached = identity_snapshot()
+        result = ToolResult(
+            run_id=context.run_id,
+            action_id=context.action_id,
+            tool=tool_id,
+            action=action,
+            attempted=True,
+            outcome="ERROR",
+            errno="ETIMEDOUT",
+            exit_code=errno_module.ETIMEDOUT,
+            output=f"{definition.name} timeout({definition.spec.timeout_s}s)",
+            identity_before=identity_before_handler,
+            identity_reached=identity_reached,
+        )
+    except OSError as exc:
+        outcome, errno_name, exit_code = outcome_from_oserror(exc)
+        identity_reached = identity_snapshot()
+        result = ToolResult(
+            run_id=context.run_id,
+            action_id=context.action_id,
+            tool=tool_id,
+            action=action,
+            attempted=True,
+            outcome=outcome,
+            errno=errno_name,
+            exit_code=exit_code,
+            output=str(exc),
+            identity_before=identity_before_handler,
+            identity_reached=identity_reached,
+        )
+    except Exception as exc:
+        identity_reached = identity_snapshot()
+        result = ToolResult(
+            run_id=context.run_id,
+            action_id=context.action_id,
+            tool=tool_id,
+            action=action,
+            attempted=True,
+            outcome="ERROR",
+            errno=None,
+            exit_code=1,
+            output=f"handler error: {exc}",
+            identity_before=identity_before_handler,
+            identity_reached=identity_reached,
+        )
+    if not isinstance(result, ToolResult):
+        raise ToolContractError(f"{definition.name} handler는 ToolResult를 반환해야 합니다.")
+    _validate_tool_result(definition, result, context)
+
+    # Evidence 저장 실패가 발생해도 변경 상태를 남기지 않도록 resetter까지 진행한다.
+    evidence_errors: list[str] = []
+    try:
+        handler_ref = context.record_evidence("handler_result", result.to_dict())
+        result.evidence_refs.append(handler_ref)
+    except Exception as exc:
+        evidence_errors.append(f"handler evidence: {exc}")
+
+    try:
+        verification = definition.verifier(
+            execution_state, decision, result, context,
+        )
+        if not isinstance(verification, VerificationResult):
+            raise ToolContractError(
+                f"{definition.name} verifier는 VerificationResult를 반환해야 합니다."
+            )
+        _validate_verification_result(definition, verification)
+        if result.attempted and verification.status == "NOT_RUN":
+            raise ToolContractError(
+                f"{definition.name} attempted action의 verifier가 실행되지 않았습니다."
+            )
+    except Exception as exc:  # resetter는 verifier 오류에도 반드시 실행해야 한다.
+        verification = VerificationResult(
+            verifier=f"{definition.name}.verifier",
+            status="REJECTED",
+            checks={"verifier_completed": False},
+            observed={"error": str(exc)},
+        )
+    try:
+        verifier_ref = context.record_evidence(
+            "verifier_observation",
+            {
+                "verifier": verification.verifier,
+                "status": verification.status,
+                "checks": verification.checks,
+                "observed": verification.observed,
+            },
+        )
+        verification.evidence_refs.append(verifier_ref)
+    except Exception as exc:
+        evidence_errors.append(f"verifier evidence: {exc}")
+        verification.status = "REJECTED"
+        verification.checks["evidence_recorded"] = False
+
+    try:
+        reset_result = definition.resetter(
+            execution_state, decision, result, context,
+        )
+        if not isinstance(reset_result, ResetResult):
+            raise ToolContractError(
+                f"{definition.name} resetter는 ResetResult를 반환해야 합니다."
+            )
+        _validate_reset_result(definition, reset_result)
+        if (
+            result.outcome == "ALLOWED"
+            and (definition.spec.reversible or definition.spec.destructive)
+            and not reset_result.state_after
+        ):
+            raise ToolContractError(
+                f"{definition.name} resetter에 독립 재조회한 state_after가 없습니다."
+            )
+    except Exception as exc:
+        reset_result = ResetResult(
+            resetter=f"{definition.name}.resetter",
+            status="FAILED",
+            checks={"resetter_completed": False},
+            output=str(exc),
+        )
+    try:
+        reset_ref = context.record_evidence(
+            "reset_observation",
+            {
+                "resetter": reset_result.resetter,
+                "status": reset_result.status,
+                "checks": reset_result.checks,
+                "identity_after": reset_result.identity_after,
+                "state_after": reset_result.state_after,
+                "output": reset_result.output,
+            },
+        )
+        reset_result.evidence_refs.append(reset_ref)
+    except Exception as exc:
+        evidence_errors.append(f"reset evidence: {exc}")
+        reset_result.status = "FAILED"
+        reset_result.checks["evidence_recorded"] = False
+        reset_result.output = "; ".join(evidence_errors)
+
+    result.identity_after = dict(reset_result.identity_after)
+    result.state_after = dict(reset_result.state_after)
+    result.rollback_status = reset_result.status
+    result.evidence_refs.extend(verification.evidence_refs)
+    result.evidence_refs.extend(reset_result.evidence_refs)
+
+    requires_verified_restore = (
+        result.outcome == "ALLOWED"
+        and (definition.spec.reversible or definition.spec.destructive)
+    )
+    rollback_ok = reset_result.restored and (
+        not requires_verified_restore or reset_result.status == "VERIFIED"
+    )
+    if not rollback_ok:
+        reason = (
+            f"{definition.name} rollback 검증 실패: "
+            f"status={reset_result.status}"
+        )
+        context.abort_for_rollback(reason)
+
+    return ToolExecution(definition.name, result, verification, reset_result)
+
+
 def dispatch(tool_id: str, action: str, arguments: dict[str, Any], context: ToolContext) -> ToolOutcome:
-    """레지스트리에서 Tool을 찾아 spec을 강제한 뒤 실행한다. 등록 밖·위반은 POLICY_BLOCKED로 정규화한다."""
+    """DEPRECATED legacy dispatch. 신규 action은 execute_definition()을 사용한다."""
     actions = _REGISTRY.get(tool_id)
     if actions is None or action not in actions:
         return _blocked(tool_id, action, f"등록되지 않은 Tool/Action입니다: {tool_id}.{action}")
@@ -316,32 +1097,25 @@ def dispatch(tool_id: str, action: str, arguments: dict[str, Any], context: Tool
 
 
 def verify(tool_id: str, action: str, outcome: ToolOutcome) -> bool:
-    """요구 8: Tool별 Verifier. 등록된 게 있으면 그것을, 없으면 기본 판정을 쓴다.
-
-    기본 판정: 실제 시도됐고(rollback_status가 FAILED가 아니며) probe면 복구가 검증됐는가.
-    최종 TB 판정은 여전히 Collector 원본 증거 기반 외부 Verifier의 몫이다(3.1/7절).
-    """
+    """DEPRECATED legacy verifier 호출. 독립 OS/API 재조회를 보장하지 않는다."""
     fn = _VERIFIERS.get((tool_id, action))
-    if fn is not None:
-        return fn(outcome)
-    if not outcome.attempted:
+    if fn is None:
+        # 등록 누락을 성공으로 간주하지 않는다.
         return False
-    if outcome.rollback_status == "FAILED":
-        return False
-    return outcome.outcome in {"ALLOWED", "OS_DENIED"}
+    return fn(outcome)
 
 
 def reset(tool_id: str, action: str, outcome: ToolOutcome, context: ToolContext) -> str:
-    """요구 8: Tool별 Reset 절차. probe 계열은 이미 inline 복구되어 NOT_REQUIRED.
+    """DEPRECATED legacy reset 호출. family 전환 전 테스트 호환용이다.
 
     비-probe 상태 변경(file.create/move_link 등)은 등록된 reset으로 생성물을 정리한다.
     반환: "DONE" | "NOT_REQUIRED" | "FAILED".
     """
     fn = _RESETS.get((tool_id, action))
-    if fn is None:
-        return "NOT_REQUIRED"
     if outcome.outcome != "ALLOWED":
         return "NOT_REQUIRED"
+    if fn is None:
+        return "FAILED"
     try:
         fn(outcome, context)
         return "DONE"
@@ -421,7 +1195,10 @@ def probe(
     snapshot_state: Callable[[], dict[str, Any]] | None = None,
     restore: Callable[[], None] | None = None,
 ) -> ToolOutcome:
-    """일시 변경을 시도하고 즉시 원복하는 Probe. rollback_status까지 채워 반환한다.
+    """DEPRECATED legacy inline Probe.
+
+    handler 안에서 복구하므로 새 ToolDefinition의 독립 Verifier가 도달 상태를
+    재조회할 수 없다. 전환된 family에서는 사용하지 않는다.
 
     Args:
         mutate: 실제 상태 변경 syscall. 실패 시 OSError를 던지면 OS_DENIED/ERROR로 분류.

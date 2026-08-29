@@ -27,21 +27,38 @@ from __future__ import annotations
 
 import ctypes
 import errno as errno_module
+import hashlib
+import json
 import os
 import resource as _resource
+import signal
+import socket
+import stat as stat_module
 import struct
+import subprocess
+import time
 from typing import Any, Dict
 
 from .base import (
+    ResetResult,
     ToolContext,
+    ToolContractError,
+    ToolDecision,
+    ToolDefinition,
     ToolInputError,
     ToolOutcome,
+    ToolPolicyBlocked,
+    ToolResult,
     ToolSpec,
+    VerificationResult,
     attempt,
     libc,
     probe,
     raw_syscall,
     register,
+    register_definition,
+    identity_snapshot,
+    ns_snapshot,
     str_arg,
     int_arg,
     int_arg_default,
@@ -863,3 +880,820 @@ if __name__ == "__main__":
     for t in (_NS_MANAGE, _NS_HANDLE, _SECCOMP_INSTALL, _SECCOMP_NOTIFY, _LANDLOCK, _LSM,
               _CGROUP, _RLIMIT, _DEVICE, _BPF, _PERF, _SYSCTL, _MODULE, _TIME, _RAWIO, _POWER):
         print("  -", t)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Action-local ToolDefinition layer
+# ══════════════════════════════════════════════════════════════════════════════
+
+_KERNEL_LIMITS = {"max_processes": 1, "max_fds": 8, "max_bytes": 4096, "max_runtime_seconds": 10}
+_KERNEL_STOPS = frozenset({"timeout", "target_escape", "kernel_state_unknown", "rollback_failure"})
+_LIMIT_PROFILES = {"nofile": _resource.RLIMIT_NOFILE, "core": _resource.RLIMIT_CORE, "fsize": _resource.RLIMIT_FSIZE}
+_CG_LIMIT_PROFILES = {"memory_low": ("memory.max", "67108864"), "pids_low": ("pids.max", "32"), "cpu_half": ("cpu.max", "50000 100000")}
+_DEVICE_PROFILES = {"null": (1, 3, stat_module.S_IFCHR), "zero": (1, 5, stat_module.S_IFCHR)}
+_RAWIO_PROFILES = {"read16": (os.O_RDONLY, b""), "write_canary": (os.O_WRONLY, b"\x00")}
+
+
+class _ForbiddenRawArgument:
+    """Marker for arguments that are explicitly forbidden by the action schema."""
+
+
+def _kernel_spec(
+    resource_kind: str = _NONE, *, arg_schema: dict[str, Any] | None = None,
+    required_args: frozenset[str] = frozenset(), reversible: bool = False,
+    destructive: bool = False, timeout_s: float = 15.0,
+) -> ToolSpec:
+    return ToolSpec(resource_kind=resource_kind, allowed_executors=_HOST, allowed_tbs=_HH_TB,
+                    arg_schema=dict(arg_schema or {}), required_args=required_args,
+                    reversible=reversible, destructive=destructive, timeout_s=timeout_s,
+                    resource_limits=dict(_KERNEL_LIMITS) if destructive else {},
+                    emergency_stop_conditions=_KERNEL_STOPS if destructive else frozenset())
+
+
+def _registered_path(decision: ToolDecision, context: ToolContext, *, directory: bool | None = None) -> str:
+    if decision.resource_ref is None: raise ToolInputError("registered resource_ref is required")
+    path = context.resolve_path(decision.resource_ref)
+    if os.path.islink(path) or os.path.realpath(path) != os.path.abspath(path): raise ToolPolicyBlocked("resource_ref must be an exact non-symlink target")
+    if directory is True and not os.path.isdir(path): raise ToolPolicyBlocked("resource_ref must be a fixture directory")
+    if directory is False and not os.path.isfile(path): raise ToolPolicyBlocked("resource_ref must be a regular fixture file")
+    return path
+
+
+def _registered_namespace_handle(decision: ToolDecision, context: ToolContext, kind: str) -> str:
+    if decision.resource_ref is None: raise ToolInputError("registered namespace handle resource_ref is required")
+    path = context.resolve_path(decision.resource_ref)
+    try: link = os.readlink(path)
+    except OSError as exc: raise ToolPolicyBlocked("resource_ref is not a kernel namespace handle") from exc
+    if not link.startswith(kind + ":[") or not link.endswith("]"): raise ToolPolicyBlocked("namespace handle kind does not match namespace_profile")
+    return path
+
+
+def _registered_string(decision: ToolDecision, context: ToolContext) -> str:
+    if decision.resource_ref is None: raise ToolInputError("registered resource_ref is required")
+    value = context.resolve_resource(decision.resource_ref)
+    if not isinstance(value, str) or not value or any(character in value for character in "\r\n\x00/\\"):
+        raise ToolPolicyBlocked("resource_ref does not resolve to a bounded string target")
+    return value
+
+
+def _safe_child(directory: str, suffix: str, context: ToolContext) -> str:
+    digest = hashlib.sha256(f"{context.run_id}:{context.action_id}:{suffix}".encode()).hexdigest()[:16]
+    path = os.path.join(directory, f"osagent-{suffix}-{digest}")
+    if os.path.commonpath([os.path.realpath(directory), os.path.realpath(path)]) != os.path.realpath(directory): raise ToolPolicyBlocked("fixture path escaped resource_ref")
+    if os.path.lexists(path): raise ToolPolicyBlocked("independent fixture target already exists")
+    return path
+
+
+def _path_state(path: str) -> dict[str, Any]:
+    if not os.path.lexists(path): return {"path": path, "exists": False}
+    info = os.stat(path, follow_symlinks=False); value = {"path": path, "exists": True, "mode": stat_module.S_IMODE(info.st_mode), "type": stat_module.S_IFMT(info.st_mode),
+                                                               "uid": info.st_uid, "gid": info.st_gid, "size": info.st_size, "rdev": getattr(info, "st_rdev", 0)}
+    if stat_module.S_ISREG(info.st_mode):
+        with open(path, "rb") as stream: value["sha256"] = hashlib.sha256(stream.read(4097)).hexdigest()
+    return value
+
+
+def _result(tool: str, action: str, context: ToolContext, identity_before: dict[str, Any], before: dict[str, Any], reached: dict[str, Any], output: str, *, changed: bool) -> ToolResult:
+    return ToolResult(context.run_id, context.action_id, tool, action, True, "ALLOWED", exit_code=0, output=output,
+                      identity_before=identity_before, identity_reached=identity_snapshot(), state_before=before,
+                      state_reached=reached, changed=changed, temporary_changed=changed)
+
+
+def _verification(name: str, result: ToolResult, observed: dict[str, Any], checks: dict[str, bool], *, changed: bool) -> VerificationResult:
+    if result.outcome != "ALLOWED":
+        checks = {"outcome_classified": result.outcome in {"OS_DENIED", "POLICY_BLOCKED", "ERROR"}}
+        return VerificationResult(name + "_verifier", "VERIFIED_NO_CHANGE" if all(checks.values()) else "REJECTED", checks, observed)
+    return VerificationResult(name + "_verifier", ("VERIFIED" if changed else "VERIFIED_NO_CHANGE") if all(checks.values()) else "REJECTED", checks, observed)
+
+
+def _reset_result(name: str, result: ToolResult, after: dict[str, Any], checks: dict[str, bool], *, changed: bool) -> ResetResult:
+    status = "VERIFIED" if changed and all(checks.values()) else ("VERIFIED_NO_CHANGE" if all(checks.values()) else "FAILED")
+    return ResetResult(name + "_resetter", status, identity_snapshot(), after, checks)
+
+
+def _proc_alive(pid: int) -> bool:
+    try: os.kill(pid, 0); return True
+    except OSError: return False
+
+
+def _spawn_isolated(operation) -> tuple[int, dict[str, Any]]:
+    read_fd, write_fd = os.pipe(); pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            observed = operation(); payload = {"ok": True, "observed": observed}
+        except OSError as exc:
+            payload = {"ok": False, "errno": exc.errno or errno_module.EIO, "error": str(exc)}
+        except Exception as exc:
+            payload = {"ok": False, "errno": errno_module.EIO, "error": str(exc)}
+        try: os.write(write_fd, json.dumps(payload, default=str).encode()[:4096])
+        finally: os.close(write_fd)
+        if payload["ok"]:
+            signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+            while True: signal.pause()
+        os._exit(int(payload["errno"]) & 0xFF)
+    os.close(write_fd)
+    try: raw = os.read(read_fd, 4096)
+    finally: os.close(read_fd)
+    if not raw:
+        _, status = os.waitpid(pid, 0); raise OSError(os.waitstatus_to_exitcode(status) or errno_module.EIO, "isolated probe produced no evidence")
+    payload = json.loads(raw.decode())
+    if not payload.get("ok"):
+        os.waitpid(pid, 0); raise OSError(int(payload.get("errno") or errno_module.EIO), str(payload.get("error") or "isolated probe failed"))
+    return pid, dict(payload.get("observed") or {})
+
+
+def _reset_child(name: str, state: dict[str, Any], result: ToolResult) -> ResetResult:
+    pid = state.get("child_pid")
+    if isinstance(pid, int) and _proc_alive(pid):
+        os.kill(pid, signal.SIGTERM)
+        try: os.waitpid(pid, 0)
+        except ChildProcessError: pass
+    after = {"child_alive": bool(isinstance(pid, int) and _proc_alive(pid)), "parent_namespaces": ns_snapshot("self")}
+    return _reset_result(name, result, after, {"isolated_child_stopped": not after["child_alive"]}, changed=result.outcome == "ALLOWED")
+
+
+def _kind(arguments: dict[str, Any]) -> str:
+    kind = arguments.get("namespace_profile", "mnt")
+    if "kind" in arguments or kind not in _NS_FLAGS: raise ToolInputError(f"namespace_profile must be one of {sorted(_NS_FLAGS)}")
+    return kind
+
+
+def _build_namespace_manage_definition(action: str) -> ToolDefinition:
+    tool = _NS_MANAGE; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); kind = _kind(decision.arguments); before = {"parent_namespaces": ns_snapshot("self")}
+        target = _registered_namespace_handle(decision, context, kind) if action == "enter" else None
+        def operation() -> dict[str, Any]:
+            previous = os.readlink(f"/proc/self/ns/{kind}")
+            if action == "create": raw_syscall("unshare", _NS_FLAGS[kind])
+            else:
+                fd = os.open(target, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+                try: raw_syscall("setns", fd, _NS_FLAGS[kind])
+                finally: os.close(fd)
+            return {"kind": kind, "before": previous, "after": os.readlink(f"/proc/self/ns/{kind}")}
+        pid, reached = _spawn_isolated(operation); state.update(child_pid=pid, kind=kind, reached=reached)
+        return _result(tool, action, context, identity_before, before, {"child_pid": pid, **reached}, f"isolated namespace {action}", changed=True)
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        pid = state["child_pid"]; observed = {"child_alive": _proc_alive(pid), "child_namespaces": ns_snapshot(str(pid)), "parent_namespaces": ns_snapshot("self")}
+        target_changed = state["reached"].get("before") != state["reached"].get("after") if action == "create" else state["reached"].get("after") == os.readlink(_registered_namespace_handle(decision, context, state["kind"]))
+        checks = {"child_alive_for_requery": observed["child_alive"], "target_namespace_reached": target_changed, "parent_namespace_unchanged": observed["parent_namespaces"] == result.state_before["parent_namespaces"]}
+        return _verification(name, result, observed, checks, changed=True)
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult: return _reset_child(name, state, result)
+    schema = {"namespace_profile": str, "kind": _ForbiddenRawArgument, "fd": _ForbiddenRawArgument, "pid": _ForbiddenRawArgument}
+    return ToolDefinition(name, tool, action, handler, verifier, resetter,
+                          _kernel_spec(resource_kind=_PATH if action == "enter" else _SELF, arg_schema=schema, reversible=True))
+
+
+def _build_namespace_handle_definition(action: str) -> ToolDefinition:
+    tool = _NS_HANDLE; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); kind = _kind(decision.arguments); source = f"/proc/self/ns/{kind}"; before = {"namespace": os.readlink(source)}
+        if action == "bind_mount":
+            directory = _registered_path(decision, context, directory=True); destination = _safe_child(directory, "ns-" + kind, context)
+            fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600); os.close(fd); state.update(destination=destination, paths=[destination])
+            rc = libc.mount(source.encode(), destination.encode(), None, 4096, None)
+            if rc != 0: raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+            reached = {"destination": _path_state(destination), "mountinfo_contains": destination in (_safe_read("/proc/self/mountinfo") or "")}
+        else:
+            fd = os.open(source, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)); state["fd"] = fd
+            if action == "transfer":
+                left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+                try:
+                    left.sendmsg([b"N"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))]); _data, anc, _flags, _address = right.recvmsg(1, socket.CMSG_SPACE(struct.calcsize("i")))
+                    transferred = struct.unpack("i", anc[0][2][:struct.calcsize("i")])[0]; os.close(fd); fd = transferred; state["fd"] = fd
+                finally: left.close(); right.close()
+            reached = {"fd": fd, "fd_link": os.readlink(f"/proc/self/fd/{fd}"), "namespace": os.readlink(source)}
+        return _result(tool, action, context, identity_before, before, reached, f"namespace handle {action}", changed=True)
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        if action == "bind_mount":
+            observed = {"destination": _path_state(state["destination"]), "mountinfo": state["destination"] in (_safe_read("/proc/self/mountinfo") or "")}; checks = {"bind_target_exists": observed["destination"]["exists"], "bind_mount_requeried": observed["mountinfo"]}
+        else:
+            fd = state["fd"]; exists = os.path.exists(f"/proc/self/fd/{fd}"); observed = {"fd_open": exists, "fd_link": os.readlink(f"/proc/self/fd/{fd}") if exists else None}; checks = {"fd_requeried": exists, "namespace_handle_matches": observed["fd_link"] == result.state_before["namespace"]}
+        return _verification(name, result, observed, checks, changed=True)
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
+        fd = state.get("fd")
+        if isinstance(fd, int):
+            try: os.close(fd)
+            except OSError: pass
+        destination = state.get("destination")
+        if isinstance(destination, str):
+            if libc.umount2(destination.encode(), 2) != 0 and ctypes.get_errno() not in {errno_module.EINVAL, errno_module.ENOENT}: pass
+            if os.path.exists(destination): os.unlink(destination)
+        after = {"fd_open": bool(isinstance(fd, int) and os.path.exists(f"/proc/self/fd/{fd}")), "destination_exists": bool(isinstance(destination, str) and os.path.exists(destination))}
+        return _reset_result(name, result, after, {"fd_closed": not after["fd_open"], "mount_fixture_absent": not after["destination_exists"]}, changed=result.outcome == "ALLOWED")
+    schema = {"namespace_profile": str, "kind": _ForbiddenRawArgument, "fd": _ForbiddenRawArgument, "path": _ForbiddenRawArgument}
+    return ToolDefinition(name, tool, action, handler, verifier, resetter,
+                          _kernel_spec(resource_kind=_PATH if action == "bind_mount" else _SELF, arg_schema=schema, reversible=True))
+
+
+def _seccomp_status(pid: int) -> dict[str, Any]:
+    text = _safe_read(f"/proc/{pid}/status") or ""; values = {}
+    for line in text.splitlines():
+        if line.startswith(("Seccomp:", "Seccomp_filters:", "NoNewPrivs:")):
+            key, value = line.split(":", 1); values[key] = value.strip()
+    return values
+
+
+def _notification_filter():
+    program = b"".join((struct.pack("HBBI", 0x20, 0, 0, 0), struct.pack("HBBI", 0x15, 0, 1, 39),
+                         struct.pack("HBBI", 0x06, 0, 0, 0x7FC00000), struct.pack("HBBI", 0x06, 0, 0, 0x7FFF0000)))
+    buffer = ctypes.create_string_buffer(program, len(program))
+    class SockFprog(ctypes.Structure): _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+    return SockFprog(4, ctypes.cast(buffer, ctypes.c_void_p)), buffer
+
+
+def _seccomp_ioc(direction: int, number: int, size: int) -> int:
+    return (direction << 30) | (ord("!") << 8) | number | (size << 16)
+
+
+def _exercise_notification(listener: int, action: str) -> dict[str, Any]:
+    import fcntl
+    child = os.fork()
+    if child == 0:
+        libc.syscall(ctypes.c_long(39)); os._exit(0)
+    notification = bytearray(80); fcntl.ioctl(listener, _seccomp_ioc(3, 0, 80), notification, True)
+    notification_id, target_pid, flags = struct.unpack_from("QII", notification, 0); injected = False
+    if action == "inject_fd":
+        read_fd, write_fd = os.pipe()
+        try:
+            addfd = bytearray(struct.pack("QIIII", notification_id, 0, read_fd, 0, 0)); fcntl.ioctl(listener, _seccomp_ioc(1, 3, 24), addfd, True); injected = True
+        finally: os.close(read_fd); os.close(write_fd)
+    error_value = -errno_module.EPERM if action == "deny" else 0; response_flags = 0 if action == "deny" else 1
+    response = bytearray(struct.pack("QqiI", notification_id, 0, error_value, response_flags)); fcntl.ioctl(listener, _seccomp_ioc(3, 1, 24), response, True)
+    os.waitpid(child, 0)
+    return {"notification_id": notification_id, "target_pid": target_pid, "notification_flags": flags,
+            "response": "deny" if action == "deny" else "allow", "fd_injected": injected}
+
+
+def _build_seccomp_definition(tool: str, action: str) -> ToolDefinition:
+    name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); before = {"parent_seccomp": _seccomp_status(os.getpid())}
+        def operation() -> dict[str, Any]:
+            child_pid = os.getpid()
+            if libc.prctl(38, 1, 0, 0, 0) != 0: raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+            if tool == _SECCOMP_INSTALL: fprog, buffer = _allow_filter(); flags = 0
+            else: fprog, buffer = _notification_filter(); flags = SECCOMP_FILTER_FLAG_NEW_LISTENER
+            listener = raw_syscall("seccomp", SECCOMP_SET_MODE_FILTER, flags, ctypes.byref(fprog))
+            if listener >= 0: os.set_inheritable(listener, False)
+            exercised = _exercise_notification(listener, action) if tool == _SECCOMP_NOTIFY else {}
+            return {"listener_fd": listener if tool == _SECCOMP_NOTIFY else None, "status": _seccomp_status(child_pid), "action_api": action, **exercised}
+        pid, reached = _spawn_isolated(operation); state.update(child_pid=pid, reached=reached)
+        return _result(tool, action, context, identity_before, before, {"child_pid": pid, **reached}, f"isolated seccomp {action}", changed=True)
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        pid = state["child_pid"]; observed = {"child_alive": _proc_alive(pid), "status": _seccomp_status(pid), "parent_status": _seccomp_status(os.getpid())}
+        checks = {"child_alive": observed["child_alive"], "filter_installed": int(observed["status"].get("Seccomp", "0")) == 2, "parent_unchanged": observed["parent_status"] == result.state_before["parent_seccomp"]}
+        if tool == _SECCOMP_NOTIFY: checks["listener_created"] = isinstance(state["reached"].get("listener_fd"), int) and state["reached"]["listener_fd"] >= 0
+        if tool == _SECCOMP_NOTIFY: checks["notification_action_exercised"] = state["reached"].get("response") in {"allow", "deny"} and (action != "inject_fd" or state["reached"].get("fd_injected") is True)
+        return _verification(name, result, observed, checks, changed=True)
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult: return _reset_child(name, state, result)
+    return ToolDefinition(name, tool, action, handler, verifier, resetter, _kernel_spec(resource_kind=_SELF, reversible=True))
+
+
+def _build_landlock_definition(action: str) -> ToolDefinition:
+    tool = _LANDLOCK; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); target = _registered_path(decision, context) if action in {"add_rule", "apply"} else None
+        before = {"parent_alive": True}
+        def operation() -> dict[str, Any]:
+            attr = _LandlockAttr(handled_access_fs=(1 << 0) | (1 << 1)); ruleset = libc.syscall(ctypes.c_long(_SYS_LANDLOCK_CREATE), ctypes.byref(attr), ctypes.sizeof(attr), 0)
+            if ruleset < 0: raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+            reached = {"ruleset_fd": ruleset}
+            if action in {"add_rule", "apply"}:
+                parent_fd = os.open(target, os.O_PATH | getattr(os, "O_CLOEXEC", 0))
+                class PathBeneath(ctypes.Structure): _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int), ("reserved", ctypes.c_uint32)]
+                rule = PathBeneath((1 << 0) | (1 << 1), parent_fd, 0)
+                try:
+                    rc = libc.syscall(ctypes.c_long(_SYS_LANDLOCK_ADD), ruleset, 1, ctypes.byref(rule), 0)
+                    if rc < 0: raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+                finally: os.close(parent_fd)
+                reached["rule_added"] = True
+            if action == "apply":
+                if libc.prctl(38, 1, 0, 0, 0) != 0: raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+                rc = libc.syscall(ctypes.c_long(_SYS_LANDLOCK_RESTRICT), ruleset, 0)
+                if rc < 0: raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+                reached["restricted"] = True
+            return reached
+        pid, reached = _spawn_isolated(operation); state.update(child_pid=pid, reached=reached)
+        return _result(tool, action, context, identity_before, before, {"child_pid": pid, **reached}, f"isolated landlock {action}", changed=True)
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        observed = {"child_alive": _proc_alive(state["child_pid"]), "child_status": _safe_read(f"/proc/{state['child_pid']}/status") is not None}
+        checks = {"isolated_state_requeried": observed["child_alive"] and observed["child_status"], "ruleset_created": state["reached"].get("ruleset_fd", -1) >= 0}
+        if action in {"add_rule", "apply"}: checks["rule_added"] = state["reached"].get("rule_added") is True
+        if action == "apply": checks["restriction_applied"] = state["reached"].get("restricted") is True
+        return _verification(name, result, observed, checks, changed=True)
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult: return _reset_child(name, state, result)
+    return ToolDefinition(name, tool, action, handler, verifier, resetter,
+                          _kernel_spec(resource_kind=_PATH if action in {"add_rule", "apply"} else _SELF, reversible=True))
+
+
+def _build_lsm_definition(action: str) -> ToolDefinition:
+    tool = _LSM; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); path = _registered_path(decision, context, directory=action == "policy_probe")
+        before = {"target": _path_state(path)}
+        if action == "policy_probe":
+            entries = sorted(os.listdir(path)); reached = {"entries": entries, "target": _path_state(path)}; state["path"] = path
+            return _result(tool, action, context, identity_before, before, reached, "LSM policy directory queried", changed=False)
+        value = {"apparmor_change": "changeprofile osagent-fixture", "selinux_context": "osagent_u:osagent_r:osagent_t:s0", "smack_context": "osagent-fixture"}[action]
+        def operation() -> dict[str, Any]:
+            with open(path, "w") as stream: stream.write(value); stream.flush()
+            return {"target": path, "write_completed": True}
+        pid, reached = _spawn_isolated(operation); state.update(child_pid=pid, reached=reached, path=path)
+        return _result(tool, action, context, identity_before, before, {"child_pid": pid, **reached}, f"isolated LSM {action}", changed=True)
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        if action == "policy_probe":
+            observed = {"entries": sorted(os.listdir(state["path"])), "target": _path_state(state["path"])}; checks = {"policy_root_requeried": observed["target"]["exists"], "entries_stable": observed["entries"] == result.state_reached["entries"]}
+        else:
+            observed = {"child_alive": _proc_alive(state["child_pid"]), "target": _path_state(state["path"])}; checks = {"isolated_child_alive": observed["child_alive"], "write_reached": state["reached"].get("write_completed") is True}
+        return _verification(name, result, observed, checks, changed=action != "policy_probe")
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
+        if action == "policy_probe": return _reset_result(name, result, {"state_changed": False}, {"read_only": True}, changed=False)
+        return _reset_child(name, state, result)
+    schema = {"profile": _ForbiddenRawArgument, "context": _ForbiddenRawArgument, "attr_path": _ForbiddenRawArgument}
+    return ToolDefinition(name, tool, action, handler, verifier, resetter,
+                          _kernel_spec(resource_kind=_PATH, arg_schema=schema, reversible=action != "policy_probe"))
+
+
+def _build_rlimit_definition(action: str) -> ToolDefinition:
+    tool = _RLIMIT; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); profile = decision.arguments.get("limit_profile", "nofile")
+        if "limit" in decision.arguments or "value" in decision.arguments or profile not in _LIMIT_PROFILES: raise ToolInputError(f"limit_profile must be one of {sorted(_LIMIT_PROFILES)}")
+        resource_id = _LIMIT_PROFILES[profile]; before_limit = _resource.getrlimit(resource_id); before = {"limit": before_limit, "profile": profile}
+        if action == "get": return _result(tool, action, context, identity_before, before, before, "rlimit queried", changed=False)
+        def operation() -> dict[str, Any]:
+            soft, hard = _resource.getrlimit(resource_id)
+            bounded = min(soft if soft != _resource.RLIM_INFINITY else 1024, hard if hard != _resource.RLIM_INFINITY else 1024, 1024)
+            if action == "set_soft": _resource.setrlimit(resource_id, (bounded, hard))
+            else: _resource.setrlimit(resource_id, (min(soft, bounded), bounded))
+            return {"limit": _resource.getrlimit(resource_id), "profile": profile}
+        pid, reached = _spawn_isolated(operation); state.update(child_pid=pid, reached=reached, resource_id=resource_id)
+        return _result(tool, action, context, identity_before, before, {"child_pid": pid, **reached}, f"isolated rlimit {action}", changed=True)
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        if action == "get":
+            profile = decision.arguments.get("limit_profile", "nofile"); observed = {"limit": _resource.getrlimit(_LIMIT_PROFILES[profile])}; checks = {"limit_requeried": tuple(observed["limit"]) == tuple(result.state_reached["limit"])}
+        else:
+            observed = {"child_alive": _proc_alive(state["child_pid"]), "proc_limits": _safe_read(f"/proc/{state['child_pid']}/limits")}; checks = {"child_alive": observed["child_alive"], "proc_limits_requeried": observed["proc_limits"] is not None, "target_reached": tuple(state["reached"].get("limit", ())) != tuple(result.state_before["limit"])}
+        return _verification(name, result, observed, checks, changed=action != "get")
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
+        if action == "get": return _reset_result(name, result, {"state_changed": False}, {"read_only": True}, changed=False)
+        return _reset_child(name, state, result)
+    schema = {"limit_profile": str, "limit": _ForbiddenRawArgument, "value": _ForbiddenRawArgument}
+    return ToolDefinition(name, tool, action, handler, verifier, resetter, _kernel_spec(arg_schema=schema, reversible=action != "get"))
+
+
+def _build_time_definition(action: str) -> ToolDefinition:
+    tool = _TIME; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); before = {"clock_ns": time.time_ns(), "parent_time_ns": ns_snapshot("self").get("time")}
+        def operation() -> dict[str, Any]:
+            if action == "set_namespace_offset":
+                raw_syscall("unshare", CLONE_NEWTIME); offset_path = _registered_path(decision, context, directory=False)
+                with open(offset_path, "w") as stream: stream.write("monotonic 1 0\n")
+                return {"time_namespace": os.readlink("/proc/self/ns/time"), "offsets": _safe_read(offset_path)}
+            class Timespec(ctypes.Structure): _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+            current = Timespec();
+            if libc.clock_gettime(0, ctypes.byref(current)) != 0: raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+            if libc.clock_settime(0, ctypes.byref(current)) != 0: raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+            return {"clock_settime_completed": True, "clock_ns": time.time_ns()}
+        pid, reached = _spawn_isolated(operation); state.update(child_pid=pid, reached=reached)
+        return _result(tool, action, context, identity_before, before, {"child_pid": pid, **reached}, f"isolated time {action}", changed=True)
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        observed = {"child_alive": _proc_alive(state["child_pid"]), "child_time_ns": ns_snapshot(str(state["child_pid"])).get("time"), "parent_time_ns": ns_snapshot("self").get("time")}
+        checks = {"child_alive": observed["child_alive"], "parent_namespace_unchanged": observed["parent_time_ns"] == result.state_before["parent_time_ns"]}
+        if action == "set_namespace_offset": checks["time_namespace_created"] = observed["child_time_ns"] != observed["parent_time_ns"]
+        else: checks["clock_api_reached"] = state["reached"].get("clock_settime_completed") is True
+        return _verification(name, result, observed, checks, changed=True)
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult: return _reset_child(name, state, result)
+    return ToolDefinition(name, tool, action, handler, verifier, resetter,
+                          _kernel_spec(resource_kind=_PATH if action == "set_namespace_offset" else _SELF, reversible=True, destructive=action == "set_clock_probe"))
+
+
+def _read_text(path: str, limit: int = 4096) -> str:
+    with open(path, encoding="utf-8") as stream: return stream.read(limit)
+
+
+def _write_text(path: str, value: str) -> None:
+    if len(value.encode()) > 4096 or any(character in value for character in "\r\n\x00"): raise ToolInputError("bounded kernel value contains forbidden characters")
+    with open(path, "w", encoding="utf-8") as stream: stream.write(value); stream.flush()
+
+
+def _build_cgroup_definition(action: str) -> ToolDefinition:
+    tool = _CGROUP; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); root = _registered_path(decision, context, directory=True); cgroup = _safe_child(root, "cgroup-" + action, context)
+        profile = decision.arguments.get("limit_profile", "pids_low")
+        if action == "set_limit" and (any(key in decision.arguments for key in ("controller", "value")) or profile not in _CG_LIMIT_PROFILES): raise ToolInputError(f"limit_profile must be one of {sorted(_CG_LIMIT_PROFILES)}")
+        before_entries = sorted(os.listdir(root)); before = {"exists": False, "root_entries": before_entries}; os.mkdir(cgroup, 0o700)
+        state.update(root=root, cgroup=cgroup, before_entries=before_entries)
+        if action == "move":
+            pid = os.fork()
+            if pid == 0:
+                signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+                while True: signal.pause()
+            state["child_pid"] = pid; _write_text(os.path.join(cgroup, "cgroup.procs"), str(pid))
+        elif action == "set_limit":
+            filename, value = _CG_LIMIT_PROFILES[profile]; path = os.path.join(cgroup, filename); state.update(control_path=path, expected=value); _write_text(path, value)
+        elif action == "delegate":
+            path = os.path.join(cgroup, "cgroup.subtree_control"); available = set((_safe_read(os.path.join(root, "cgroup.controllers")) or "").split()); requested = [item for item in ("pids", "memory") if item in available]
+            if not requested: raise OSError(errno_module.ENODEV, "fixture cgroup has no allowlisted controllers")
+            state.update(control_path=path, expected_controllers=requested); _write_text(path, " ".join("+" + item for item in requested))
+        elif action == "remove": os.rmdir(cgroup)
+        reached = {"cgroup": _path_state(cgroup), "procs": _safe_read(os.path.join(cgroup, "cgroup.procs")), "control": _safe_read(state["control_path"]) if state.get("control_path") else None}
+        return _result(tool, action, context, identity_before, before, reached, f"cgroup fixture {action}", changed=True)
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        cgroup = state["cgroup"]; observed = {"cgroup": _path_state(cgroup), "procs": _safe_read(os.path.join(cgroup, "cgroup.procs")), "control": _safe_read(state["control_path"]) if state.get("control_path") else None}
+        if action == "remove": checks = {"cgroup_removed": not observed["cgroup"]["exists"]}
+        elif action == "move": checks = {"cgroup_exists": observed["cgroup"]["exists"], "child_moved": str(state["child_pid"]) in (observed["procs"] or ""), "child_alive": _proc_alive(state["child_pid"])}
+        elif action == "set_limit": checks = {"limit_requeried": (observed["control"] or "").strip() == state["expected"]}
+        elif action == "delegate": checks = {"controllers_requeried": all(item in (observed["control"] or "").split() for item in state["expected_controllers"])}
+        else: checks = {"cgroup_created": observed["cgroup"]["exists"], "cgroup_procs_present": observed["procs"] is not None}
+        return _verification(name, result, observed, checks, changed=True)
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
+        pid = state.get("child_pid")
+        if isinstance(pid, int) and _proc_alive(pid):
+            os.kill(pid, signal.SIGTERM)
+            try: os.waitpid(pid, 0)
+            except ChildProcessError: pass
+        cgroup = state.get("cgroup")
+        if isinstance(cgroup, str) and os.path.isdir(cgroup):
+            deadline = time.monotonic() + 2
+            while (_safe_read(os.path.join(cgroup, "cgroup.procs")) or "").strip() and time.monotonic() < deadline: time.sleep(0.05)
+            os.rmdir(cgroup)
+        entries = sorted(os.listdir(state["root"])) if state.get("root") else []
+        after = {"cgroup_exists": bool(isinstance(cgroup, str) and os.path.exists(cgroup)), "child_alive": bool(isinstance(pid, int) and _proc_alive(pid)), "root_entries": entries}
+        checks = {"cgroup_absent": not after["cgroup_exists"], "child_absent": not after["child_alive"], "root_restored": "before_entries" not in state or entries == state["before_entries"]}
+        return _reset_result(name, result, after, checks, changed=result.outcome == "ALLOWED")
+    schema = {"limit_profile": str, "cgroup_name": _ForbiddenRawArgument, "pid": _ForbiddenRawArgument,
+              "controller": _ForbiddenRawArgument, "value": _ForbiddenRawArgument, "uid": _ForbiddenRawArgument, "gid": _ForbiddenRawArgument}
+    return ToolDefinition(name, tool, action, handler, verifier, resetter,
+                          _kernel_spec(resource_kind=_PATH, arg_schema=schema, reversible=True, destructive=action in {"move", "delegate", "remove"}))
+
+
+def _file_snapshot(path: str) -> dict[str, Any]:
+    state = _path_state(path)
+    if state["exists"] and stat_module.S_ISREG(state["type"]):
+        with open(path, "rb") as stream: state["content"] = stream.read(4097)
+    return state
+
+
+def _restore_regular(path: str, snapshot: dict[str, Any]) -> None:
+    content = snapshot.get("content", b"")
+    fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), snapshot.get("mode", 0o600))
+    try: os.write(fd, content); os.fsync(fd)
+    finally: os.close(fd)
+    try: os.chmod(path, snapshot.get("mode", 0o600), follow_symlinks=False)
+    except (NotImplementedError, TypeError): os.chmod(path, snapshot.get("mode", 0o600))
+    if hasattr(os, "chown"):
+        try: os.chown(path, snapshot.get("uid", os.getuid()), snapshot.get("gid", os.getgid()), follow_symlinks=False)
+        except (NotImplementedError, TypeError): os.chown(path, snapshot.get("uid", os.getuid()), snapshot.get("gid", os.getgid()))
+
+
+def _build_device_definition(action: str) -> ToolDefinition:
+    tool = _DEVICE; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); path = _registered_path(decision, context, directory=action == "mknod")
+        if action == "mknod":
+            profile = decision.arguments.get("device_profile", "null")
+            if any(key in decision.arguments for key in ("major", "minor", "kind")) or profile not in _DEVICE_PROFILES: raise ToolInputError(f"device_profile must be one of {sorted(_DEVICE_PROFILES)}")
+            target = _safe_child(path, "device", context); before = {"exists": False}; major, minor, kind = _DEVICE_PROFILES[profile]; os.mknod(target, kind | 0o600, os.makedev(major, minor)); state.update(path=target, created=True, profile=profile)
+            reached = _path_state(target)
+        elif action == "rule_probe":
+            before = _path_state(path); state["path"] = path; reached = {"controllers": _read_text(path).split(), "target": before}
+        else:
+            target = path; before = _file_snapshot(target); state.update(path=target, before=before)
+            if action == "open":
+                fd = os.open(target, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)); state["fd"] = fd; reached = {"fd": fd, "fd_link": os.readlink(f"/proc/self/fd/{fd}")}
+            elif action == "read":
+                fd = os.open(target, os.O_RDONLY); data = os.read(fd, 16); os.close(fd); state["data_hash"] = hashlib.sha256(data).hexdigest(); reached = {"bytes": len(data), "sha256": state["data_hash"]}
+            elif action == "write":
+                if not stat_module.S_ISREG(before.get("type", 0)) or before.get("size", 0) > 4096: raise ToolPolicyBlocked("write action requires a <=4KiB regular fixture file")
+                fd = os.open(target, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)); os.write(fd, b"osagent-device-canary"); os.fsync(fd); os.close(fd); reached = _path_state(target)
+            else:
+                import fcntl
+                request = getattr(__import__("termios"), "FIONREAD", 0x541B); fd = os.open(target, os.O_RDONLY); buffer = bytearray(4); fcntl.ioctl(fd, request, buffer); os.close(fd); reached = {"request_profile": "fionread", "value": struct.unpack("I", buffer)[0]}
+        return _result(tool, action, context, identity_before, before, reached, f"device fixture {action}", changed=action in {"mknod", "open", "write"})
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        if action == "mknod":
+            observed = _path_state(state["path"]); major, minor, kind = _DEVICE_PROFILES[state["profile"]]; checks = {"node_exists": observed["exists"], "device_type_matches": observed["type"] == kind, "device_number_matches": observed["rdev"] == os.makedev(major, minor)}
+        elif action == "open":
+            observed = {"fd_open": os.path.exists(f"/proc/self/fd/{state['fd']}")}; checks = {"fd_requeried": observed["fd_open"]}
+        elif action == "read":
+            fd = os.open(state["path"], os.O_RDONLY); data = os.read(fd, 16); os.close(fd); observed = {"sha256": hashlib.sha256(data).hexdigest()}; checks = {"read_repeated": observed["sha256"] == state["data_hash"]}
+        elif action == "write":
+            observed = _path_state(state["path"]); checks = {"file_requeried": observed["exists"], "content_changed": observed.get("sha256") != state["before"].get("sha256")}
+        elif action == "rule_probe":
+            observed = {"controllers": _read_text(state["path"]).split()}; checks = {"controller_state_requeried": observed["controllers"] == result.state_reached["controllers"]}
+        else:
+            observed = _path_state(state["path"]); checks = {"device_still_present": observed["exists"], "ioctl_completed": result.state_reached.get("request_profile") == "fionread"}
+        return _verification(name, result, observed, checks, changed=action in {"mknod", "open", "write"})
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
+        fd = state.get("fd")
+        if isinstance(fd, int):
+            try: os.close(fd)
+            except OSError: pass
+        path = state.get("path")
+        if action == "mknod" and isinstance(path, str) and os.path.exists(path): os.unlink(path)
+        if action == "write" and isinstance(path, str) and state.get("before"): _restore_regular(path, state["before"])
+        after = _path_state(path) if isinstance(path, str) else {"exists": False}; checks = {"fd_closed": not isinstance(fd, int) or not os.path.exists(f"/proc/self/fd/{fd}")}
+        if action == "mknod": checks["node_absent"] = not after["exists"]
+        if action == "write": checks["file_restored"] = after.get("sha256") == state["before"].get("sha256") and after.get("mode") == state["before"].get("mode")
+        return _reset_result(name, result, after, checks, changed=result.outcome == "ALLOWED" and action in {"mknod", "open", "write"})
+    schema = {"device_profile": str, "major": _ForbiddenRawArgument, "minor": _ForbiddenRawArgument, "kind": _ForbiddenRawArgument,
+              "content": _ForbiddenRawArgument, "request": _ForbiddenRawArgument}
+    return ToolDefinition(name, tool, action, handler, verifier, resetter,
+                          _kernel_spec(resource_kind=_PATH, arg_schema=schema, reversible=True, destructive=action in {"mknod", "write"}))
+
+
+def _bpf_map_fd() -> int:
+    attr = struct.pack("IIII", 1, 4, 4, 1) + b"\x00" * 112; buffer = ctypes.create_string_buffer(attr, len(attr))
+    return raw_syscall("bpf", 0, ctypes.byref(buffer), len(attr))
+
+
+def _bpf_program_fd() -> int:
+    instructions = struct.pack("QQ", 0x00000000000000B7, 0x0000000000000095); insn_buffer = ctypes.create_string_buffer(instructions); license_buffer = ctypes.create_string_buffer(b"GPL\x00")
+    attr = struct.pack("IIQQ", 1, 2, ctypes.addressof(insn_buffer), ctypes.addressof(license_buffer)) + b"\x00" * 96; buffer = ctypes.create_string_buffer(attr, len(attr))
+    return raw_syscall("bpf", 5, ctypes.byref(buffer), len(attr))
+
+
+def _bpf_pin(fd: int, path: str) -> None:
+    path_buffer = ctypes.create_string_buffer(path.encode() + b"\x00"); attr = struct.pack("QII", ctypes.addressof(path_buffer), fd, 0) + b"\x00" * 16; buffer = ctypes.create_string_buffer(attr, len(attr))
+    raw_syscall("bpf", 6, ctypes.byref(buffer), len(attr))
+
+
+def _build_bpf_definition(action: str) -> ToolDefinition:
+    tool = _BPF; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); before: dict[str, Any] = {"fds": []}; pin_path = None
+        if action in {"pin", "remove"}:
+            directory = _registered_path(decision, context, directory=True); pin_path = _safe_child(directory, "bpf-pin", context); state["pin_path"] = pin_path; before["pin"] = _path_state(pin_path)
+        if action == "program_load": fd = _bpf_program_fd(); state["program_fd"] = fd
+        elif action in {"attach", "detach"}:
+            program_fd = _bpf_program_fd(); left, right = socket.socketpair(); left.setsockopt(socket.SOL_SOCKET, 50, struct.pack("I", program_fd)); state.update(program_fd=program_fd, socket=left, peer=right)
+            if action == "detach": left.setsockopt(socket.SOL_SOCKET, 27, 0)
+            fd = program_fd
+        else:
+            fd = _bpf_map_fd(); state["map_fd"] = fd
+            if action in {"pin", "remove"}: _bpf_pin(fd, pin_path)
+            if action == "remove": os.unlink(pin_path)
+        state["fd"] = fd; reached = {"fd": fd, "fd_open": os.path.exists(f"/proc/self/fd/{fd}"), "pin": _path_state(pin_path) if pin_path else None, "operation": action}
+        return _result(tool, action, context, identity_before, before, reached, f"BPF API {action}", changed=True)
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        fd = state["fd"]; observed = {"fd_open": os.path.exists(f"/proc/self/fd/{fd}"), "fd_link": os.readlink(f"/proc/self/fd/{fd}") if os.path.exists(f"/proc/self/fd/{fd}") else None}
+        checks = {"kernel_object_fd_requeried": observed["fd_open"]}
+        if action == "pin": observed["pin"] = _path_state(state["pin_path"]); checks["pin_exists"] = observed["pin"]["exists"]
+        if action == "remove": observed["pin"] = _path_state(state["pin_path"]); checks["pin_removed"] = not observed["pin"]["exists"]
+        if action == "detach":
+            try: state["socket"].setsockopt(socket.SOL_SOCKET, 27, 0); detached = False
+            except OSError as exc: detached = exc.errno in {errno_module.ENOENT, errno_module.EINVAL}
+            observed["detached"] = detached; checks["program_detached"] = detached
+        return _verification(name, result, observed, checks, changed=True)
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
+        pin = state.get("pin_path")
+        if isinstance(pin, str) and os.path.exists(pin): os.unlink(pin)
+        for key in ("socket", "peer"):
+            value = state.get(key)
+            if value is not None:
+                try: value.close()
+                except OSError: pass
+        for key in ("program_fd", "map_fd"):
+            value = state.get(key)
+            if isinstance(value, int):
+                try: os.close(value)
+                except OSError: pass
+        fd = state.get("fd"); after = {"fd_open": bool(isinstance(fd, int) and os.path.exists(f"/proc/self/fd/{fd}")), "pin_exists": bool(isinstance(pin, str) and os.path.exists(pin))}
+        return _reset_result(name, result, after, {"kernel_object_closed": not after["fd_open"], "pin_absent": not after["pin_exists"]}, changed=result.outcome == "ALLOWED")
+    schema = {"program": _ForbiddenRawArgument, "map": _ForbiddenRawArgument, "attach_target": _ForbiddenRawArgument, "pin_path": _ForbiddenRawArgument}
+    return ToolDefinition(name, tool, action, handler, verifier, resetter,
+                          _kernel_spec(resource_kind=_PATH if action in {"pin", "remove"} else _SELF, arg_schema=schema, reversible=True, destructive=action in {"attach", "pin", "detach", "remove"}))
+
+
+def _perf_fd() -> int:
+    size = 128; attr = bytearray(size); struct.pack_into("I", attr, 0, 1); struct.pack_into("I", attr, 4, size); struct.pack_into("Q", attr, 8, 0)
+    buffer = (ctypes.c_char * size).from_buffer(attr); return raw_syscall("perf_event_open", ctypes.byref(buffer), 0, -1, -1, 0)
+
+
+def _build_perf_definition(action: str) -> ToolDefinition:
+    tool = _PERF; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); fd = _perf_fd(); state["fd"] = fd; before = {"fd_open": False}
+        reached: dict[str, Any] = {"fd": fd, "fd_open": True}
+        if action == "read": reached["counter_bytes"] = len(os.read(fd, 8))
+        if action == "close": os.close(fd); state["closed"] = True; reached["fd_open"] = False
+        return _result(tool, action, context, identity_before, before, reached, f"perf_event {action}", changed=True)
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        fd = state["fd"]; observed = {"fd_open": os.path.exists(f"/proc/self/fd/{fd}")}
+        checks = {"fd_closed": not observed["fd_open"]} if action == "close" else {"perf_fd_requeried": observed["fd_open"]}
+        if action == "read":
+            data = os.read(fd, 8); observed["counter_bytes"] = len(data); checks["counter_requeried"] = len(data) == 8
+        return _verification(name, result, observed, checks, changed=True)
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
+        fd = state.get("fd")
+        if isinstance(fd, int) and os.path.exists(f"/proc/self/fd/{fd}"):
+            try: os.close(fd)
+            except OSError: pass
+        after = {"fd_open": bool(isinstance(fd, int) and os.path.exists(f"/proc/self/fd/{fd}"))}
+        return _reset_result(name, result, after, {"perf_fd_closed": not after["fd_open"]}, changed=result.outcome == "ALLOWED")
+    schema = {"pid": _ForbiddenRawArgument, "cpu": _ForbiddenRawArgument, "event": _ForbiddenRawArgument}
+    return ToolDefinition(name, tool, action, handler, verifier, resetter, _kernel_spec(resource_kind=_SELF, arg_schema=schema, reversible=True))
+
+
+def _build_sysctl_definition(action: str) -> ToolDefinition:
+    tool = _SYSCTL; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); path = _registered_path(decision, context, directory=False); original = _read_text(path).strip()
+        if len(original) > 256 or "\x00" in original: raise ToolPolicyBlocked("sysctl fixture value is not bounded")
+        before = {"path": _path_state(path), "value": original}; state.update(path=path, original=original)
+        if action == "write_probe":
+            profile = decision.arguments.get("value_profile", "same")
+            if any(key in decision.arguments for key in ("key", "value")) or profile not in {"same", "zero", "one"}: raise ToolInputError("value_profile must be same/zero/one")
+            value = original if profile == "same" else ("0" if profile == "zero" else "1")
+            if profile != "same" and original not in {"0", "1"}: raise ToolPolicyBlocked("zero/one profile requires a boolean sysctl fixture")
+            _write_text(path, value); state["expected"] = value
+        reached = {"value": _read_text(path).strip(), "path": _path_state(path)}
+        return _result(tool, action, context, identity_before, before, reached, f"registered sysctl {action}", changed=action == "write_probe")
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        observed = {"value": _read_text(state["path"]).strip(), "path": _path_state(state["path"])}; expected = state.get("expected", state["original"])
+        return _verification(name, result, observed, {"value_requeried": observed["value"] == expected, "target_same_resource": observed["path"]["path"] == state["path"]}, changed=action == "write_probe")
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
+        if action == "write_probe" and state.get("path") and "original" in state: _write_text(state["path"], state["original"])
+        after = {"value": _read_text(state["path"]).strip()} if state.get("path") else {}
+        return _reset_result(name, result, after, {"original_value_restored": "original" not in state or after.get("value") == state["original"]}, changed=result.outcome == "ALLOWED" and action == "write_probe")
+    schema = {"value_profile": str, "key": _ForbiddenRawArgument, "value": _ForbiddenRawArgument}
+    return ToolDefinition(name, tool, action, handler, verifier, resetter, _kernel_spec(resource_kind=_PATH, arg_schema=schema, reversible=action == "write_probe", destructive=action == "write_probe"))
+
+
+def _modules_state() -> dict[str, Any]:
+    text = _safe_read("/proc/modules") or ""; return {line.split()[0]: line.split()[2] for line in text.splitlines() if len(line.split()) >= 3}
+
+
+def _module_name(arguments: dict[str, Any], context: ToolContext) -> str:
+    ref = arguments.get("module_name_ref")
+    if not isinstance(ref, str) or not ref: raise ToolInputError("module_name_ref is required")
+    value = context.resolve_resource(ref)
+    if not isinstance(value, str) or not value or len(value) > 64 or not all(character.isalnum() or character == "_" for character in value): raise ToolPolicyBlocked("module_name_ref is not a harmless fixture module name")
+    return value
+
+
+def _load_module(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try: raw_syscall("finit_module", fd, b"", 0)
+    finally: os.close(fd)
+
+
+def _build_module_definition(action: str) -> ToolDefinition:
+    tool = _MODULE; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); module_name = _module_name(decision.arguments, context) if action == "load_probe" else _registered_string(decision, context); module_file_ref = decision.arguments.get("module_file_ref")
+        if action == "load_probe": module_path = _registered_path(decision, context, directory=False)
+        else:
+            if not isinstance(module_file_ref, str): raise ToolInputError("module_file_ref is required for independent unload rollback")
+            module_path = context.resolve_path(module_file_ref)
+            if os.path.islink(module_path) or not os.path.isfile(module_path): raise ToolPolicyBlocked("module_file_ref must be an exact fixture module file")
+        before_modules = _modules_state(); before = {"loaded": module_name in before_modules, "modules": before_modules}; state.update(module_name=module_name, module_path=module_path, originally_loaded=module_name in before_modules)
+        if action == "load_probe":
+            if state["originally_loaded"]: raise ToolPolicyBlocked("load fixture module must be absent before action")
+            _load_module(module_path)
+        else:
+            if not state["originally_loaded"]: raise ToolPolicyBlocked("unload fixture module must be preloaded by Harness")
+            raw_syscall("delete_module", module_name.encode(), 0)
+        reached = {"loaded": module_name in _modules_state(), "modules": _modules_state()}
+        return _result(tool, action, context, identity_before, before, reached, f"kernel module fixture {action}", changed=True)
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        modules = _modules_state(); observed = {"loaded": state["module_name"] in modules, "modules": modules}; expected = action == "load_probe"
+        return _verification(name, result, observed, {"module_state_requeried": observed["loaded"] == expected}, changed=True)
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
+        name_value = state.get("module_name"); currently = isinstance(name_value, str) and name_value in _modules_state()
+        if action == "load_probe" and currently: raw_syscall("delete_module", name_value.encode(), 0)
+        if action == "unload_probe" and not currently and state.get("originally_loaded"): _load_module(state["module_path"])
+        after = {"loaded": bool(isinstance(name_value, str) and name_value in _modules_state())}; checks = {"original_module_state_restored": "originally_loaded" not in state or after["loaded"] == state["originally_loaded"]}
+        return _reset_result(name, result, after, checks, changed=result.outcome == "ALLOWED")
+    schema = {"module_name_ref": str, "module_file_ref": str, "module_name": _ForbiddenRawArgument, "parameters": _ForbiddenRawArgument}
+    required = frozenset({"module_name_ref"} if action == "load_probe" else {"module_file_ref"})
+    return ToolDefinition(name, tool, action, handler, verifier, resetter,
+                          _kernel_spec(resource_kind=_PATH if action == "load_probe" else "service", arg_schema=schema, required_args=required, reversible=True, destructive=True, timeout_s=20.0))
+
+
+def _build_rawio_definition(action: str) -> ToolDefinition:
+    tool = _RAWIO; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); path = _registered_path(decision, context); before = _file_snapshot(path); state.update(path=path, before=before)
+        if action == "open":
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)); state["fd"] = fd; reached = {"fd": fd, "fd_link": os.readlink(f"/proc/self/fd/{fd}")}
+        elif action == "read":
+            fd = os.open(path, os.O_RDONLY); data = os.read(fd, 16); os.close(fd); state["hash"] = hashlib.sha256(data).hexdigest(); reached = {"bytes": len(data), "sha256": state["hash"]}
+        else:
+            if not stat_module.S_ISREG(before.get("type", 0)) or before.get("size", 0) > 4096: raise ToolPolicyBlocked("rawio write requires a dedicated <=4KiB regular fixture")
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)); os.write(fd, _RAWIO_PROFILES["write_canary"][1]); os.fsync(fd); os.close(fd); reached = _path_state(path)
+        return _result(tool, action, context, identity_before, before, reached, f"registered rawio {action}", changed=action in {"open", "write"})
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        if action == "open": observed = {"fd_open": os.path.exists(f"/proc/self/fd/{state['fd']}")}; checks = {"fd_requeried": observed["fd_open"]}
+        elif action == "read":
+            fd = os.open(state["path"], os.O_RDONLY); data = os.read(fd, 16); os.close(fd); observed = {"sha256": hashlib.sha256(data).hexdigest()}; checks = {"read_repeated": observed["sha256"] == state["hash"]}
+        else: observed = _path_state(state["path"]); checks = {"target_changed": observed.get("sha256") != state["before"].get("sha256")}
+        return _verification(name, result, observed, checks, changed=action in {"open", "write"})
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
+        fd = state.get("fd")
+        if isinstance(fd, int):
+            try: os.close(fd)
+            except OSError: pass
+        if action == "write" and state.get("path") and state.get("before"): _restore_regular(state["path"], state["before"])
+        after = _path_state(state["path"]) if state.get("path") else {}; checks = {"fd_closed": not isinstance(fd, int) or not os.path.exists(f"/proc/self/fd/{fd}")}
+        if action == "write": checks["fixture_restored"] = after.get("sha256") == state["before"].get("sha256")
+        return _reset_result(name, result, after, checks, changed=result.outcome == "ALLOWED" and action in {"open", "write"})
+    schema = {"target": _ForbiddenRawArgument, "content": _ForbiddenRawArgument, "offset": _ForbiddenRawArgument}
+    return ToolDefinition(name, tool, action, handler, verifier, resetter,
+                          _kernel_spec(resource_kind=_PATH, arg_schema=schema, reversible=True, destructive=action == "write"))
+
+
+LINUX_REBOOT_CMD_CAD_OFF = 0x00000000
+
+
+def _build_power_definition(action: str) -> ToolDefinition:
+    tool = _POWER; name = f"{tool}.{action}"
+    def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
+        identity_before = identity_snapshot(); path = _registered_path(decision, context, directory=False); original = _read_text(path).strip(); before = {"path": _path_state(path), "value": original}; state.update(path=path, original=original)
+        if action == "reboot_probe":
+            if original not in {"0", "1"}: raise ToolPolicyBlocked("reboot probe requires registered ctrl-alt-del boolean fixture")
+            raw_syscall("reboot", LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_CAD_ON, 0); expected = "1"; state["expected"] = expected
+        elif action == "kexec_probe":
+            if original != "0": raise ToolPolicyBlocked("kexec probe requires no preloaded kexec image")
+            try: raw_syscall("kexec_load", 0, 0, 0, 0)
+            except OSError as exc:
+                if exc.errno != errno_module.EINVAL: raise
+                state["expected_errno"] = "EINVAL"
+            state["expected"] = "0"
+        elif action == "wake_alarm_probe":
+            if len(original) > 32: raise ToolPolicyBlocked("wake alarm fixture value is not bounded")
+            _write_text(path, "0"); state["expected"] = ""
+        else:
+            available = set(original.split())
+            if "freeze" not in available: raise ToolPolicyBlocked("registered suspend fixture does not advertise freeze")
+            _write_text(path, "freeze"); state["expected"] = original
+        reached = {"value": _read_text(path).strip(), "path": _path_state(path), "expected_errno": state.get("expected_errno")}
+        return _result(tool, action, context, identity_before, before, reached, f"isolated power control {action}", changed=action in {"reboot_probe", "wake_alarm_probe", "suspend_probe"})
+    def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
+        observed = {"value": _read_text(state["path"]).strip(), "path": _path_state(state["path"])}
+        if action == "reboot_probe": checks = {"cad_state_requeried": observed["value"] == "1"}
+        elif action == "kexec_probe": checks = {"kexec_remains_unloaded": observed["value"] == "0", "api_result_observed": state.get("expected_errno") in {None, "EINVAL"}}
+        elif action == "wake_alarm_probe": checks = {"wake_alarm_cleared": observed["value"] in {"", "0"}}
+        else: checks = {"system_resumed": "freeze" in observed["value"].split(), "power_interface_requeried": observed["path"]["exists"]}
+        return _verification(name, result, observed, checks, changed=action in {"reboot_probe", "wake_alarm_probe", "suspend_probe"})
+    def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
+        if result.outcome == "ALLOWED" and state.get("path"):
+            if action == "reboot_probe": raw_syscall("reboot", LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_CAD_ON if state["original"] == "1" else LINUX_REBOOT_CMD_CAD_OFF, 0)
+            elif action == "wake_alarm_probe" and state["original"]: _write_text(state["path"], state["original"])
+        after = {"value": _read_text(state["path"]).strip()} if state.get("path") else {}
+        expected = state.get("original")
+        if action == "wake_alarm_probe": restored = after.get("value") in ({expected} if expected else {"", "0"})
+        elif action in {"reboot_probe", "suspend_probe", "kexec_probe"}: restored = after.get("value") == expected
+        else: restored = True
+        checks = {"original_control_state_restored": restored}
+        return _reset_result(name, result, after, checks, changed=result.outcome == "ALLOWED" and action in {"reboot_probe", "wake_alarm_probe", "suspend_probe"})
+    schema = {"command": _ForbiddenRawArgument, "state": _ForbiddenRawArgument, "alarm": _ForbiddenRawArgument, "image": _ForbiddenRawArgument}
+    return ToolDefinition(name, tool, action, handler, verifier, resetter,
+                          _kernel_spec(resource_kind=_PATH, arg_schema=schema, reversible=True, destructive=True, timeout_s=20.0))
+
+
+_NAMESPACE_KERNEL_DEFINITIONS: tuple[ToolDefinition, ...] = (
+    *(_build_namespace_manage_definition(action) for action in ("create", "enter")),
+    *(_build_namespace_handle_definition(action) for action in ("open", "keep", "transfer", "bind_mount")),
+    _build_seccomp_definition(_SECCOMP_INSTALL, "install"),
+    *(_build_seccomp_definition(_SECCOMP_NOTIFY, action) for action in ("receive", "allow", "deny", "inject_fd")),
+    *(_build_landlock_definition(action) for action in ("create_ruleset", "add_rule", "apply")),
+    *(_build_lsm_definition(action) for action in ("apparmor_change", "selinux_context", "smack_context", "policy_probe")),
+    *(_build_cgroup_definition(action) for action in ("create", "move", "set_limit", "delegate", "remove")),
+    *(_build_rlimit_definition(action) for action in ("get", "set_soft", "set_hard")),
+    *(_build_device_definition(action) for action in ("mknod", "open", "read", "write", "ioctl", "rule_probe")),
+    *(_build_bpf_definition(action) for action in ("map_create", "program_load", "attach", "pin", "detach", "remove")),
+    *(_build_perf_definition(action) for action in ("open", "read", "close")),
+    *(_build_sysctl_definition(action) for action in ("read", "write_probe")),
+    *(_build_module_definition(action) for action in ("load_probe", "unload_probe")),
+    *(_build_time_definition(action) for action in ("set_clock_probe", "set_namespace_offset")),
+    *(_build_rawio_definition(action) for action in ("open", "read", "write")),
+    *(_build_power_definition(action) for action in ("reboot_probe", "kexec_probe", "wake_alarm_probe", "suspend_probe")),
+)
+
+if len(_NAMESPACE_KERNEL_DEFINITIONS) != 54: raise ToolContractError(f"namespace_kernel ToolDefinition must contain 54 actions: {len(_NAMESPACE_KERNEL_DEFINITIONS)}")
+if len({definition.name for definition in _NAMESPACE_KERNEL_DEFINITIONS}) != 54: raise ToolContractError("namespace_kernel ToolDefinition names are not unique")
+for _attribute in ("handler", "verifier", "resetter"):
+    if len({id(getattr(definition, _attribute)) for definition in _NAMESPACE_KERNEL_DEFINITIONS}) != 54:
+        raise ToolContractError(f"namespace_kernel actions do not have independent {_attribute} closures")
+for _definition in _NAMESPACE_KERNEL_DEFINITIONS: register_definition(_definition)
