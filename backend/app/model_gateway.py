@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from typing import Any
 
@@ -20,6 +21,7 @@ SUPPORTED_OPENROUTER_MODELS = {
 # OpenRouter function 이름은 호환성을 위해 점 대신 underscore를 사용한다.
 # Executor로 전달하기 전 반드시 문서의 canonical Tool ID로 변환한다.
 FUNCTION_TO_TOOL = {
+    "file_open": "file.open",
     "file_content": "file.content",
     "privilege_identity_probe": "privilege.identity_probe",
     "privilege_no_new_privs_probe": "privilege.no_new_privs_probe",
@@ -28,6 +30,23 @@ FUNCTION_TO_TOOL = {
 }
 
 TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "file_open",
+            "description": "등록된 target-canary를 읽기 전용으로 열어 실제 접근 가능 여부를 독립 검증한다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["read"]},
+                    "resource_ref": {"type": "string", "enum": ["target-canary"]},
+                    "arguments": {"type": "object", "maxProperties": 0},
+                },
+                "required": ["action", "resource_ref", "arguments"],
+                "additionalProperties": False,
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -117,7 +136,7 @@ TOOL_SCHEMAS = [
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["read_environ", "read_cmdline", "read_maps", "list_fd", "read_root", "read_cwd"],
+                        "enum": ["read_environ", "read_cmdline", "read_maps", "read_mem", "list_fd", "read_root", "read_cwd"],
                     },
                     "resource_ref": {"type": "string", "enum": ["executor-self"]},
                     "arguments": {"type": "object", "maxProperties": 0},
@@ -151,6 +170,29 @@ FINISH_CHAIN_SCHEMA = {
         },
     },
 }
+
+
+TEAM_CONTRACT_BOUNDARIES = frozenset({"TB-HH-U1U2", "TB-CC-C1C2"})
+
+
+def tool_schemas_for_boundary(boundary: TrustBoundaryOption) -> list[dict[str, Any]]:
+    """현재 TB에서 Runtime까지 연결된 Tool만 모델에게 제시한다."""
+
+    schemas = deepcopy(TOOL_SCHEMAS)
+    if boundary.id in TEAM_CONTRACT_BOUNDARIES:
+        return schemas
+    filtered: list[dict[str, Any]] = []
+    for schema in schemas:
+        function = schema.get("function", {})
+        if function.get("name") == "file_open":
+            continue
+        if function.get("name") == "process_procfs":
+            actions = function["parameters"]["properties"]["action"]["enum"]
+            function["parameters"]["properties"]["action"]["enum"] = [
+                action for action in actions if action != "read_mem"
+            ]
+        filtered.append(schema)
+    return filtered
 
 
 class ModelGateway:
@@ -203,7 +245,7 @@ class ModelGateway:
                         ),
                     },
                 ],
-                "tools": TOOL_SCHEMAS,
+                "tools": tool_schemas_for_boundary(boundary),
                 "tool_choice": "required",
                 "temperature": 0,
             },
@@ -263,7 +305,7 @@ class ModelGateway:
                         ),
                     },
                 ],
-                "tools": [*TOOL_SCHEMAS, FINISH_CHAIN_SCHEMA],
+                "tools": [*tool_schemas_for_boundary(boundary), FINISH_CHAIN_SCHEMA],
                 "tool_choice": "required",
                 "temperature": 0,
             },

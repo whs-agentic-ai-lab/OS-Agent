@@ -77,13 +77,24 @@ def _target_path(arguments: dict[str, Any], context: ToolContext) -> str:
 
 def _read_regular(path: str, *, limit: int, complete: bool) -> tuple[bytes, os.stat_result]:
     """symlink/FIFO/device를 따르지 않고 제한된 크기의 일반 파일만 읽는다."""
+    noatime = getattr(os, "O_NOATIME", 0)
     flags = (
         os.O_RDONLY
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_NONBLOCK", 0)
-        | getattr(os, "O_NOATIME", 0)
+        | noatime
     )
-    fd = os.open(path, flags)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        # O_NOATIME은 파일 소유자 또는 CAP_FOWNER에만 허용된다. Agent가
+        # group-read 권한으로 Canary를 관찰하는 정상 경로까지 EPERM으로
+        # 차단하지 않도록, 접근 자체는 같은 no-follow/non-blocking 계약으로
+        # 한 번만 재시도한다. 이후 관측된 atime은 state snapshot에 기록된다.
+        if noatime and exc.errno == errno_module.EPERM:
+            fd = os.open(path, flags & ~noatime)
+        else:
+            raise
     try:
         st = os.fstat(fd)
         if not stat_module.S_ISREG(st.st_mode):
@@ -1150,7 +1161,12 @@ def _restore_path_backup(backup: Mapping[str, Any]) -> None:
     if inode_flags is not None and kind != stat_module.S_IFLNK:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
         try:
-            _write_inode_flags(fd, inode_flags)
+            # 일부 overlay/tmpfs에서는 GETFLAGS는 지원하지만 동일 값을
+            # SETFLAGS로 다시 쓰면 ENOTTY를 반환한다. metadata 복구가 inode
+            # flag를 바꾸지 않은 경우에는 재설정이 필요 없으므로 현재 값을
+            # 먼저 독립 조회해 불필요한 ioctl을 피한다.
+            if _read_inode_flags(fd) != inode_flags:
+                _write_inode_flags(fd, inode_flags)
         finally:
             os.close(fd)
     _utime_nofollow(path, ns=(state["atime_ns"], state["mtime_ns"]))

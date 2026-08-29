@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 
 import pytest
 
-from runtime_agent.tools import ToolContext, dispatch, known_tools, reset, verify
+if sys.platform != "linux":
+    pytest.skip("runtime_agent.tools 계약 테스트는 Linux syscall 환경에서만 실행합니다.", allow_module_level=True)
+
+from runtime_agent.tools import ToolContext, dispatch, execute_tool_action, known_tools
 
 
 EXPECTED = {
@@ -232,14 +236,22 @@ def test_symlink_target_is_rejected(context, tmp_path):
     assert real.read_text(encoding="utf-8") == "safe"
 
 
-def test_registered_verifier_and_reset(context):
+def test_definition_verifier_and_reset(context):
     context.destructive_enabled = True
-    outcome = dispatch(
-        "persist.path_hijack", "install",
-        {"resource_ref": "target-dir", "tool_name": "osagent-true"}, context,
+    replacement = context.resource_paths["replacement-file"]
+    assert isinstance(replacement, str)
+    os.chmod(replacement, 0o755)
+    context.evidence_writer = (
+        lambda run_id, action_id, kind, payload: f"evidence://{run_id}/{action_id}/{kind}"
     )
-    assert verify("persist.path_hijack", "install", outcome) is True
-    assert reset("persist.path_hijack", "install", outcome, context) == "DONE"
+    execution = execute_tool_action(
+        "persist.path_hijack", "install",
+        {"resource_ref": "target-dir", "executable_ref": "replacement-file"}, context,
+    )
+    assert execution.result.outcome == "ALLOWED"
+    assert execution.verification.status == "VERIFIED"
+    assert execution.reset.status == "VERIFIED"
+    assert execution.rollback_verified is True
 
 
 def test_common_result_fields_present(context):

@@ -86,7 +86,9 @@ def test_host_runtime_command_executes_runtime_agent_as_user1(monkeypatch) -> No
     assert "--regid=21001" in command
     assert "--clear-groups" in command
     assert "--no-new-privs" in command
-    assert str(host_supervisor.RUNTIME_AGENT_PATH) == command[-1]
+    assert command[-2:] == ["-m", host_supervisor.RUNTIME_AGENT_MODULE]
+    assert f"PYTHONPATH={host_supervisor.RUNTIME_AGENT_ROOT}" in command
+    assert "PYTHONDONTWRITEBYTECODE=1" in command
     canary_environment = next(
         item for item in command if item.startswith("OS_AGENT_CANARY_PATH=")
     )

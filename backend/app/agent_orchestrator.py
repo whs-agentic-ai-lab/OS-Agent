@@ -6,6 +6,7 @@ import time
 from collections import Counter
 from uuid import uuid4
 
+from .attack_tools import IMPLEMENTED_ATTACK_TOOLS
 from .catalog import TRUST_BOUNDARIES, build_profile_id
 from .agent_policy import AgentPolicyGate, CommandCompiler
 from .model_gateway import ModelGateway
@@ -403,13 +404,7 @@ class AgentOrchestrator:
                 for boundary in TRUST_BOUNDARIES
             ],
             "registered_resources": ["target-canary", "executor-self", "identity-root"],
-            "implemented_tools": [
-                "file.content",
-                "privilege.identity_probe",
-                "privilege.no_new_privs_probe",
-                "process.procfs",
-                "sudo.run",
-            ],
+            "implemented_tools": sorted(IMPLEMENTED_ATTACK_TOOLS),
         }
         self._event(run, "recon", "INFRASTRUCTURE_COLLECTED", "EC2 내부 8개 Action Path를 정규화했습니다.")
 
@@ -1039,7 +1034,7 @@ class AgentOrchestrator:
     @staticmethod
     def _candidate_decisions(boundary: TrustBoundaryOption) -> list[ToolDecision]:
         marker = f"os-agent-{boundary.id}"
-        return [
+        candidates = [
             ToolDecision(name="process.procfs", action="read_cmdline", resource_ref="executor-self", arguments={}),
             ToolDecision(name="process.procfs", action="read_environ", resource_ref="executor-self", arguments={}),
             ToolDecision(name="process.procfs", action="read_maps", resource_ref="executor-self", arguments={}),
@@ -1061,6 +1056,19 @@ class AgentOrchestrator:
             ToolDecision(name="privilege.identity_probe", action="setgroups", resource_ref="identity-root", arguments={}),
             ToolDecision(name="privilege.no_new_privs_probe", action="enable", resource_ref="executor-self", arguments={}),
         ]
+        # Team ToolDefinition의 첫 수직 연결은 상태를 남기지 않는 observation
+        # action만 선택적으로 연다. 이 두 TB는 path/procfs fixture 계약이 맞는
+        # 실행 환경이며, 다른 경계에서는 후보 자체를 만들지 않는다.
+        if boundary.id in {"TB-HH-U1U2", "TB-CC-C1C2"}:
+            candidates.insert(
+                3,
+                ToolDecision(name="process.procfs", action="read_mem", resource_ref="executor-self", arguments={}),
+            )
+            candidates.insert(
+                8,
+                ToolDecision(name="file.open", action="read", resource_ref="target-canary", arguments={}),
+            )
+        return candidates
 
     @staticmethod
     def _decision_signature(decision: ToolDecision) -> str:
@@ -1187,6 +1195,8 @@ class AgentOrchestrator:
                 return 20
             writable, _ = self._expected_file_write(boundary.source_mode, profile)
             return 82 if writable else 0
+        if decision.name == "file.open":
+            return 20
         if decision.name == "process.procfs":
             return 58
         if decision.name == "privilege.no_new_privs_probe":

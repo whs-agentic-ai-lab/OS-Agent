@@ -6,8 +6,12 @@ probe로만 실행한다. 권한 의존 Action은 "구조화된 outcome이 오�
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
+
+if sys.platform != "linux":
+    pytest.skip("runtime_agent.tools 계약 테스트는 Linux syscall 환경에서만 실행합니다.", allow_module_level=True)
 
 from runtime_agent.tools import ToolContext, dispatch, known_tools, verify
 

@@ -5,16 +5,20 @@
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
+
+if sys.platform != "linux":
+    pytest.skip("runtime_agent.tools 계약 테스트는 Linux syscall 환경에서만 실행합니다.", allow_module_level=True)
 
 from runtime_agent.tools import (
     ToolContext,
     dispatch,
+    execute_tool_action,
     identity_snapshot,
     ns_snapshot,
     reset,
-    verify,
 )
 
 
@@ -133,10 +137,18 @@ def test_move_rename_reset_restores(tmp_path, canary):
 
 # ── 요구 8: Verifier ────────────────────────────────────────────────────────
 
-def test_verify_default_on_reversible_probe(tmp_path, canary):
+def test_definition_verifies_and_resets_reversible_probe(tmp_path, canary):
     ctx = _ctx(tmp_path, canary)
-    out = dispatch("file.metadata", "chmod", {"resource_ref": "target-canary", "mode": 0o640}, ctx)
-    assert verify("file.metadata", "chmod", out) is True
+    ctx.evidence_writer = (
+        lambda run_id, action_id, kind, payload: f"evidence://{run_id}/{action_id}/{kind}"
+    )
+    execution = execute_tool_action(
+        "file.metadata", "chmod", {"resource_ref": "target-canary", "mode": 0o640}, ctx,
+    )
+    assert execution.result.outcome == "ALLOWED"
+    assert execution.verification.status == "VERIFIED"
+    assert execution.reset.status == "VERIFIED"
+    assert execution.rollback_verified is True
 
 
 # ── 요구 5: namespace evidence ──────────────────────────────────────────────

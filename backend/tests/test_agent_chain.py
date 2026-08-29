@@ -254,6 +254,24 @@ def test_tb_chain_uses_observation_for_next_tool_and_resets_once() -> None:
     assert result.rollback_status == "VERIFIED"
 
 
+def test_team_contract_candidates_are_limited_to_matching_boundaries() -> None:
+    allowed = AgentOrchestrator._candidate_decisions(TRUST_BOUNDARIES[0])
+    disallowed = AgentOrchestrator._candidate_decisions(TRUST_BOUNDARIES[1])
+
+    assert ("file.open", "read") in {
+        (item.name, item.action) for item in allowed
+    }
+    assert ("process.procfs", "read_mem") in {
+        (item.name, item.action) for item in allowed
+    }
+    assert ("file.open", "read") not in {
+        (item.name, item.action) for item in disallowed
+    }
+    assert ("process.procfs", "read_mem") not in {
+        (item.name, item.action) for item in disallowed
+    }
+
+
 def test_duplicate_state_and_decision_stops_before_another_dispatch() -> None:
     gateway = RepeatingGateway()
     orchestrator, runtime, run, boundary, scenario = make_chain(

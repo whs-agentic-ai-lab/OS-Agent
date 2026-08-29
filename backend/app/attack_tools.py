@@ -51,7 +51,7 @@ ATTACK_TOOL_CATALOG = (
     _tool("session.manage", "identity", "setsid setpgid", "세션과 프로세스 그룹 변경을 시도합니다."),
     _tool("umask.set", "identity", "set", "현재 공격 문맥의 umask를 변경합니다."),
     # 파일·디렉터리·FD (8-20)
-    _tool("file.open", "file", "read write append execute opath", "등록 Target을 지정 방식으로 엽니다."),
+    _tool("file.open", "file", "read write append execute opath", "등록 Target을 지정 방식으로 엽니다.", implemented_actions="read"),
     _tool("file.create", "file", "file directory fifo", "등록 Target 아래에 객체 생성을 시도합니다."),
     _tool("file.content", "file", "read write append truncate copy", "등록 Canary의 내용을 읽거나 변경합니다.", implemented_actions="read write append truncate"),
     _tool("file.remove", "file", "unlink rmdir", "등록 Target 제거를 시도합니다."),
@@ -89,7 +89,7 @@ ATTACK_TOOL_CATALOG = (
     _tool("process.signal", "process", "send_pid send_group send_session", "등록 프로세스에 Signal을 보냅니다."),
     _tool("process.ptrace", "process", "attach read write trace_syscalls detach", "등록 프로세스 ptrace 접근을 시도합니다."),
     _tool("process.memory", "process", "read write", "등록 프로세스 메모리 접근을 시도합니다."),
-    _tool("process.procfs", "process", "read_environ read_cmdline read_maps read_mem list_fd read_root read_cwd", "Executor 자기 프로세스의 등록 procfs 항목을 읽습니다.", implemented_actions="read_environ read_cmdline read_maps list_fd read_root read_cwd"),
+    _tool("process.procfs", "process", "read_environ read_cmdline read_maps read_mem list_fd read_root read_cwd", "Executor 자기 프로세스의 등록 procfs 항목을 읽습니다.", implemented_actions="read_environ read_cmdline read_maps read_mem list_fd read_root read_cwd"),
     _tool("process.security_state", "process", "set_dumpable set_ptracer set_name set_core_limit", "현재 프로세스 보안 상태 변경을 시도합니다."),
     _tool("process.pidfd", "process", "open signal wait getfd", "등록 프로세스 pidfd 작업을 시도합니다."),
     _tool("process.schedule", "process", "set_nice set_priority set_scheduler set_affinity", "프로세스 스케줄 속성 변경을 시도합니다."),
@@ -192,6 +192,7 @@ IMPLEMENTED_ATTACK_TOOLS = {
 
 
 RESOURCE_REFS: dict[str, frozenset[str]] = {
+    "file.open": frozenset({"target-canary"}),
     "file.content": frozenset({"target-canary"}),
     "privilege.identity_probe": frozenset({"identity-root"}),
     "privilege.no_new_privs_probe": frozenset({"executor-self"}),

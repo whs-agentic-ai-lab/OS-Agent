@@ -13,7 +13,7 @@ from app.attack_tools import (
 )
 from app.catalog import TRUST_BOUNDARIES
 from app.config import Settings
-from app.model_gateway import ModelGateway
+from app.model_gateway import ModelGateway, tool_schemas_for_boundary
 from runtime_agent import runtime
 
 
@@ -55,6 +55,7 @@ def test_catalog_matches_129_family_design_and_marks_vertical_slice() -> None:
     assert len(ATTACK_TOOL_CATALOG) == 129
     assert len(ATTACK_TOOL_BY_ID) == 129
     assert set(IMPLEMENTED_ATTACK_TOOLS) == {
+        "file.open",
         "file.content",
         "privilege.identity_probe",
         "privilege.no_new_privs_probe",
@@ -64,6 +65,8 @@ def test_catalog_matches_129_family_design_and_marks_vertical_slice() -> None:
     assert ATTACK_TOOL_BY_ID["file.content"].implemented_actions == (
         "read", "write", "append", "truncate"
     )
+    assert ATTACK_TOOL_BY_ID["file.open"].implemented_actions == ("read",)
+    assert "read_mem" in ATTACK_TOOL_BY_ID["process.procfs"].implemented_actions
 
 
 def test_tool_policy_rejects_raw_command_and_unimplemented_action() -> None:
@@ -78,6 +81,29 @@ def test_tool_policy_rejects_raw_command_and_unimplemented_action() -> None:
         validate_attack_tool_call(
             "file.content", "copy", "target-canary", {}
         )
+
+
+def test_readonly_team_contract_actions_are_registered_for_runtime() -> None:
+    assert validate_attack_tool_call("file.open", "read", "target-canary", {}) == {}
+    assert validate_attack_tool_call(
+        "process.procfs", "read_mem", "executor-self", {}
+    ) == {}
+
+
+def test_model_only_receives_team_contract_actions_for_matching_boundary() -> None:
+    allowed = tool_schemas_for_boundary(TRUST_BOUNDARIES[0])
+    disallowed = tool_schemas_for_boundary(TRUST_BOUNDARIES[1])
+
+    assert "file_open" in {item["function"]["name"] for item in allowed}
+    assert "file_open" not in {item["function"]["name"] for item in disallowed}
+    allowed_procfs = next(
+        item for item in allowed if item["function"]["name"] == "process_procfs"
+    )
+    disallowed_procfs = next(
+        item for item in disallowed if item["function"]["name"] == "process_procfs"
+    )
+    assert "read_mem" in allowed_procfs["function"]["parameters"]["properties"]["action"]["enum"]
+    assert "read_mem" not in disallowed_procfs["function"]["parameters"]["properties"]["action"]["enum"]
 
 
 def test_local_model_gateway_returns_canonical_structured_call() -> None:

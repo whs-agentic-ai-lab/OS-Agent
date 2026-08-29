@@ -37,7 +37,8 @@ CONTAINER1_EXECUTOR_UID = 22001
 CONTROL_PLANE_UID = 10003
 SOCKET_PATH = Path("/run/os-agent/host-supervisor.sock")
 SCRIPT_PATH = Path("/opt/os-agent/bin/host-supervisor.py")
-RUNTIME_AGENT_PATH = Path("/opt/os-agent/bin/runtime-agent.py")
+RUNTIME_AGENT_ROOT = Path("/opt/os-agent")
+RUNTIME_AGENT_MODULE = "runtime_agent.runtime"
 CANARY_ROOT = Path("/var/lib/os-agent/host-canaries")
 HOST_PROFILE_CANARY = CANARY_ROOT / "profile-canary.txt"
 TARGET_ROOT = Path("/srv/os-agent/targets")
@@ -676,7 +677,7 @@ def _execute_container_runtime(payload: dict[str, Any]) -> dict[str, Any]:
     application_checks = _runtime_profile_checks("container", profile, body)
     _require_applied_profile(application_checks)
     after_sha256 = _hash(canary)
-    if body.get("tool") in {"file.content", "sudo.run"}:
+    if body.get("tool") in {"file.open", "file.content", "sudo.run"}:
         body["before_sha256"] = before_sha256
         body["after_sha256"] = after_sha256
         body["changed"] = before_sha256 != after_sha256
@@ -816,11 +817,13 @@ def _host_runtime_command(
         command.append("--no-new-privs")
     command.extend([
         "/usr/bin/env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        f"PYTHONPATH={RUNTIME_AGENT_ROOT}",
         f"OS_AGENT_CANARY_PATH={canary}",
         f"OS_AGENT_TARGET_NODE={payload['target_environment']}",
         f"OS_AGENT_SUDO_HELPER={SCRIPT_PATH}",
         f"OS_AGENT_SERVICE_URL={service_url}",
-        "/usr/bin/python3", str(RUNTIME_AGENT_PATH),
+        "/usr/bin/python3", "-m", RUNTIME_AGENT_MODULE,
     ])
     return command
 
@@ -867,7 +870,7 @@ def _execute_host_runtime(payload: dict[str, Any]) -> dict[str, Any]:
     application_checks = _runtime_profile_checks("host", profile, body)
     _require_applied_profile(application_checks)
     after_sha256 = _hash(canary)
-    if body.get("tool") in {"file.content", "sudo.run"}:
+    if body.get("tool") in {"file.open", "file.content", "sudo.run"}:
         body["before_sha256"] = before_sha256
         body["after_sha256"] = after_sha256
         body["changed"] = before_sha256 != after_sha256
