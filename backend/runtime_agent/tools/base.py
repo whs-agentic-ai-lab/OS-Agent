@@ -1098,8 +1098,15 @@ def execute_definition(
         result.outcome == "ALLOWED"
         and (definition.spec.reversible or definition.spec.destructive)
     )
+    verified_no_change = (
+        reset_result.status == "VERIFIED_NO_CHANGE"
+        and not result.changed
+        and not result.temporary_changed
+    )
     rollback_ok = reset_result.restored and (
-        not requires_verified_restore or reset_result.status == "VERIFIED"
+        not requires_verified_restore
+        or reset_result.status == "VERIFIED"
+        or verified_no_change
     )
     if not rollback_ok:
         reason = (

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,7 @@ from runtime_agent.tools import (
     known_definitions,
 )
 from runtime_agent.tools import base
+from runtime_agent.tools import systemd_privilege
 
 
 def _evidence_writer(run_id: str, action_id: str, kind: str, payload: dict) -> str:
@@ -77,6 +79,26 @@ def test_definition_catalogue_is_authoritative_over_legacy_dispatch() -> None:
     assert legacy_keys <= definition_keys
 
 
+def test_linger_state_falls_back_to_marker_for_inactive_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    """logind does not expose inactive users unless lingering is already enabled."""
+    monkeypatch.setattr(
+        systemd_privilege,
+        "_run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="Failed to get user: User ID 0 is not logged in or lingering",
+        ),
+    )
+    monkeypatch.setattr(systemd_privilege.Path, "is_file", lambda _path: False)
+
+    state = systemd_privilege._linger_state("root")
+
+    assert state["query_exit"] == 0
+    assert state["linger"] == "no"
+    assert state["source"] == "linger-marker"
+
+
 def test_missing_contract_never_defaults_to_success() -> None:
     with pytest.raises(ToolContractError, match="완전한 ToolDefinition"):
         execute_tool_action("not.registered", "missing", {}, _context())
@@ -97,6 +119,25 @@ def test_read_action_contract_accepts_stable_observation(tmp_path) -> None:
     assert execution.verification.status == "VERIFIED_NO_CHANGE"
     assert execution.reset.status == "VERIFIED_NO_CHANGE"
     assert execution.result.rollback_status == "VERIFIED_NO_CHANGE"
+
+
+def test_reversible_action_accepts_independently_verified_no_change(tmp_path) -> None:
+    target = tmp_path / "ioctl-canary"
+    target.write_bytes(b"canary")
+    context = _context({"target-canary": str(target)})
+
+    execution = execute_tool_action(
+        "device.manage",
+        "ioctl",
+        {"resource_ref": "target-canary"},
+        context,
+    )
+
+    assert execution.result.outcome == "ALLOWED"
+    assert execution.result.changed is False
+    assert execution.result.temporary_changed is False
+    assert execution.reset.status == "VERIFIED_NO_CHANGE"
+    assert context.run_guard.aborted is False
 
 
 def test_agent_chain_can_defer_registered_resetter(monkeypatch, tmp_path) -> None:

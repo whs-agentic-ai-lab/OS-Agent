@@ -722,6 +722,26 @@ class _AuditFileSnapshot:
     xattrs: dict[str, bytes] | None = None
 
 
+def _read_file_noatime(path: Path) -> bytes:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NOATIME", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except PermissionError:
+        fd = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    try:
+        return os.read(fd, _AUDIT_LIMITS["max_bytes"] + 1)
+    finally:
+        os.close(fd)
+
+
 def _capture_file(path: Path) -> _AuditFileSnapshot:
     if path.exists() and (not path.is_file() or path.is_symlink()): raise ToolInputError("fixture must be a regular file")
     if not path.exists(): return _AuditFileSnapshot(False, xattrs={})
@@ -733,13 +753,13 @@ def _capture_file(path: Path) -> _AuditFileSnapshot:
             for name in os.listxattr(path, follow_symlinks=False):
                 xattrs[name] = os.getxattr(path, name, follow_symlinks=False)
         except OSError: xattrs = {}
-    return _AuditFileSnapshot(True, path.read_bytes(), stat_module.S_IMODE(info.st_mode), info.st_uid,
+    return _AuditFileSnapshot(True, _read_file_noatime(path), stat_module.S_IMODE(info.st_mode), info.st_uid,
                               info.st_gid, info.st_atime_ns, info.st_mtime_ns, xattrs)
 
 
 def _file_state(path: Path) -> dict[str, Any]:
     if not path.exists(): return {"path": str(path), "exists": False}
-    info = path.stat(); data = path.read_bytes()
+    info = path.stat(); data = _read_file_noatime(path)
     xattrs: dict[str, str] = {}
     if hasattr(os, "listxattr"):
         try:
@@ -849,7 +869,10 @@ def _build_audit_rule_definition(action: str) -> ToolDefinition:
         path, permission, key = _rule_arguments(decision, context); state.update(path=path, permission=permission, key=key)
         if _matching_rules(before_rules, path, key): raise ToolInputError("dedicated audit fixture rule already exists")
         if action == "change":
-            _audit_rule_command(True, path, "r", key); _audit_rule_command(False, path, "r", key)
+            original_permission = "w" if permission == "r" else "r"
+            _audit_rule_command(True, path, original_permission, key)
+            _audit_rule_command(False, path, original_permission, key)
+            _audit_rule_command(True, path, permission, key)
         elif action == "remove":
             _audit_rule_command(True, path, permission, key); _audit_rule_command(False, path, permission, key)
         else: _audit_rule_command(True, path, permission, key)
@@ -930,6 +953,31 @@ def _journal_query(marker: str) -> dict[str, Any]:
     return {"marker": marker, "matches": len(lines), "sample_hashes": [hashlib.sha256(line.encode()).hexdigest() for line in lines[:5]]}
 
 
+def _audit_log_query(marker: str, max_bytes: int = 1024 * 1024) -> dict[str, Any]:
+    """Requery a bounded tail of the fixed audit log without following links."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(_AUDIT_LOG, flags)
+    try:
+        metadata = os.fstat(fd)
+        if not stat_module.S_ISREG(metadata.st_mode):
+            raise OSError(errno_module.EINVAL, "audit.log is not a regular file")
+        os.lseek(fd, max(0, metadata.st_size - max_bytes), os.SEEK_SET)
+        payload = os.read(fd, max_bytes)
+    finally:
+        os.close(fd)
+    lines = tuple(line for line in payload.decode("utf-8", errors="replace").splitlines() if marker in line)
+    return {
+        "marker": marker,
+        "source": _AUDIT_LOG,
+        "matches": len(lines),
+        "sample_hashes": [hashlib.sha256(line.encode()).hexdigest() for line in lines[:5]],
+    }
+
+
+def _record_query(tool: str, marker: str) -> dict[str, Any]:
+    return _audit_log_query(marker) if tool == "audit.user_record" else _journal_query(marker)
+
+
 def _build_record_write_definition(tool: str, action: str) -> ToolDefinition:
     name = f"{tool}.{action}"
 
@@ -938,7 +986,7 @@ def _build_record_write_definition(tool: str, action: str) -> ToolDefinition:
         if profile not in _MESSAGE_PROFILES: raise ToolInputError("message_profile is not allowlisted")
         marker = f"{_MESSAGE_PROFILES[profile]} run={context.run_id} action={context.action_id}"
         if len(marker) > 240 or re.search(r"[\x00\n\r]", marker): raise ToolInputError("generated audit marker is invalid")
-        state["marker"] = marker; identity_before = identity_snapshot(); before = _journal_query(marker)
+        state["marker"] = marker; identity_before = identity_snapshot(); before = _record_query(tool, marker)
         if tool == "audit.user_record":
             completed = _run(["auditctl", "-m", marker])
             if completed.returncode:
@@ -949,11 +997,11 @@ def _build_record_write_definition(tool: str, action: str) -> ToolDefinition:
                        f"{tool} fixed-profile record submitted", changed=False)
 
     def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
-        observed = _journal_query(state["marker"]); checks = {"record_requeried": observed["matches"] >= 1}
+        observed = _record_query(tool, state["marker"]); checks = {"record_requeried": observed["matches"] >= 1}
         return _verify_result(name, result, observed, checks, changed=False)
 
     def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
-        observed = _journal_query(state.get("marker", "osagent-no-record"))
+        observed = _record_query(tool, state.get("marker", "osagent-no-record"))
         return ResetResult(name + "_resetter", "NOT_REQUIRED", identity_snapshot(), observed,
                            {"evidence_preserved": observed["matches"] >= 0}, output="append-only Evidence is intentionally preserved")
 
@@ -1029,13 +1077,13 @@ def _build_queue_pressure_definition() -> ToolDefinition:
             sent += 1
         if sent != count: raise OSError(errno_module.EIO, f"queue probe stopped at {sent}/{count}")
         return _result(tool, action, context, identity_before, before,
-                       {"audit_status": _audit_status(), "events_sent": sent}, f"bounded queue probe sent {sent}", changed=True)
+                       {"audit_status": _audit_status(), "events_sent": sent}, f"bounded queue probe sent {sent}", changed=False)
 
     def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
         status = _audit_status(); journal = _journal_query(state["marker"]); observed = {"audit_status": status, "journal": journal}
         checks = {"events_requeried": journal["matches"] > 0,
                   "lost_counter_bounded": int(status.get("lost", 0)) >= int(state["before_status"].get("lost", 0))}
-        return _verify_result(name, result, observed, checks, changed=True)
+        return _verify_result(name, result, observed, checks, changed=False)
 
     def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
         after = _audit_status(); before = state.get("before_status", {})

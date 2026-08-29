@@ -29,7 +29,7 @@ def get_settings() -> Settings:
     )
     return Settings(
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY") or None,
-        openrouter_model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+        openrouter_model=os.getenv("OPENROUTER_MODEL", "openai/gpt-5-mini"),
         allowed_origins=tuple(value.strip() for value in origins.split(",") if value.strip()),
         runtime_dir=BACKEND_ROOT / "runtime",
         supabase_url=os.getenv("SUPABASE_URL") or None,

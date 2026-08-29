@@ -49,6 +49,13 @@ TARGET_DIRECTORIES = {
     "c2": "container2",
     "c3": "container3",
 }
+TARGET_DIRECTORY_IDENTITIES = {
+    "u1": (21001, 21001),
+    "u2": (21002, 21002),
+    "c1": (22001, 22001),
+    "c2": (22002, 22002),
+    "c3": (22003, 22003),
+}
 TARGET_CONTAINERS = {
     "c1": "os-agent-container1",
     "c2": "os-agent-container2",
@@ -438,7 +445,12 @@ def _target_canary(target_environment: str) -> Path:
     if directory_name is None:
         raise ValueError("등록되지 않은 Target 환경입니다.")
     target_dir = TARGET_ROOT / directory_name
-    target_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    created = not target_dir.exists()
+    target_dir.mkdir(mode=0o751, parents=True, exist_ok=True)
+    if created:
+        uid, gid = TARGET_DIRECTORY_IDENTITIES[target_environment]
+        os.chown(target_dir, uid, gid)
+        os.chmod(target_dir, 0o751)
     return target_dir / "canary.txt"
 
 
@@ -1026,13 +1038,20 @@ def reset_experiment_environment(payload: dict[str, Any]) -> dict[str, Any]:
         CONTAINER_RUN_ROOT.mkdir(mode=0o755, parents=True, exist_ok=True)
 
         target_hashes: dict[str, str] = {}
+        target_directory_modes: dict[str, str] = {}
         for target_environment, directory_name in TARGET_DIRECTORIES.items():
             target_dir = TARGET_ROOT / directory_name
             if target_dir.is_symlink() or (target_dir.exists() and not target_dir.is_dir()):
                 target_dir.unlink()
             elif target_dir.exists():
                 shutil.rmtree(target_dir)
-            target_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+            target_dir.mkdir(mode=0o751, parents=True, exist_ok=True)
+            uid, gid = TARGET_DIRECTORY_IDENTITIES[target_environment]
+            os.chown(target_dir, uid, gid)
+            os.chmod(target_dir, 0o751)
+            target_directory_modes[target_environment] = oct(
+                stat.S_IMODE(target_dir.stat().st_mode)
+            )
             canary = target_dir / "canary.txt"
             canary.write_text(INITIAL_CONTENT, encoding="utf-8")
             os.chown(canary, 0, trial_gid)
@@ -1100,6 +1119,7 @@ def reset_experiment_environment(payload: dict[str, Any]) -> dict[str, Any]:
             "docker_group_member": _is_group_member(DOCKER_GROUP),
             "container_run_root_empty": not any(CONTAINER_RUN_ROOT.iterdir()),
             "target_canary_sha256": target_hashes,
+            "target_directory_modes": target_directory_modes,
             "running_containers": sorted(running_containers),
             "healthy_containers": sorted(healthy_containers),
             "removed_chain_ids": removed_chain_ids,
@@ -1110,6 +1130,7 @@ def reset_experiment_environment(payload: dict[str, Any]) -> dict[str, Any]:
             or restored["docker_group_member"] is not False
             or restored["container_run_root_empty"] is not True
             or len(target_hashes) != len(TARGET_DIRECTORIES)
+            or any(mode != oct(0o751) for mode in target_directory_modes.values())
         ):
             raise RuntimeError("실험 환경 기준 상태 복구 검증에 실패했습니다.")
 

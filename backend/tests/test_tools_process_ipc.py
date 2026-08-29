@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 if sys.platform != "linux":
     pytest.skip("runtime_agent.tools 계약 테스트는 Linux syscall 환경에서만 실행합니다.", allow_module_level=True)
 
-from runtime_agent.tools import ToolContext, dispatch, known_tools, verify
+from runtime_agent.tools import ToolContext, dispatch, get_definition, known_tools, verify
 
 
 @pytest.fixture
@@ -209,6 +210,26 @@ def test_ptrace_attach_self_child_structured(context):
             os.waitpid(pid, 0)
         except OSError:
             pass
+
+
+def test_ptrace_read_resetter_reports_verified_detach(monkeypatch):
+    from runtime_agent.tools import process_ipc
+
+    monkeypatch.setattr(process_ipc, "_ptrace", lambda *args: 0)
+    monkeypatch.setattr(
+        process_ipc,
+        "_proc_observation",
+        lambda pid: {"pid": pid, "exists": True, "TracerPid": "0"},
+    )
+    definition = get_definition("process.ptrace", "read")
+    state = {"pid": 1234, "attached": True}
+
+    reset_result = definition.resetter(
+        state, None, SimpleNamespace(outcome="ALLOWED"), None,
+    )
+
+    assert reset_result.status == "VERIFIED"
+    assert reset_result.checks == {"detached": True}
 
 
 def test_pidfd_open_self_structured(context):

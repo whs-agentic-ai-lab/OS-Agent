@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+import socket
 import sys
+import threading
 
 import pytest
 
@@ -15,6 +17,7 @@ from runtime_agent.tools import (
     get_definition,
     known_definitions,
 )
+from runtime_agent.tools.exec_privilege import _supervisor_exchange
 
 
 EXPECTED = {
@@ -87,3 +90,63 @@ def test_execution_rejects_raw_command(context):
     )
     assert execution.result.outcome == "POLICY_BLOCKED"
     assert execution.result.attempted is False
+
+
+def test_chroot_policy_block_has_safe_verifier_and_resetter(tmp_path) -> None:
+    target = tmp_path / "not-a-directory"
+    target.write_text("fixture", encoding="utf-8")
+    context = ToolContext(
+        run_id="test-run", action_id="chroot-policy", executor_mode="host",
+        trust_boundary_id="TB-HH-U1U2", source="u1", target="u2",
+        allowed_targets=frozenset({"target"}), resource_paths={"target": str(target)},
+        destructive_enabled=True, evidence_writer=_evidence_writer,
+    )
+
+    execution = execute_tool_action(
+        "chroot.run", "create", {"resource_ref": "target"}, context,
+    )
+
+    assert execution.result.outcome == "POLICY_BLOCKED"
+    assert execution.verification.status == "VERIFIED_NO_CHANGE"
+    assert execution.reset.status == "NOT_REQUIRED"
+    assert context.run_guard is not None
+    assert context.run_guard.aborted is False
+
+
+def test_supervisor_exchange_uses_bounded_http_response(tmp_path) -> None:
+    socket_path = tmp_path / "supervisor.sock"
+    ready = threading.Event()
+
+    def serve() -> None:
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(socket_path))
+        server.listen(1)
+        ready.set()
+        connection, _ = server.accept()
+        try:
+            request = connection.recv(4096)
+            assert request.startswith(b"POST /v2/runs HTTP/1.1\r\n")
+            body = b'{"detail":"fixture"}'
+            connection.sendall(
+                b"HTTP/1.1 422 Unprocessable Entity\r\n"
+                b"Date: ignored-by-verifier\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                + body
+            )
+        finally:
+            connection.close()
+            server.close()
+
+    worker = threading.Thread(target=serve)
+    worker.start()
+    assert ready.wait(timeout=2)
+    observed = _supervisor_exchange(
+        str(socket_path),
+        b"POST /v2/runs HTTP/1.1\r\nHost: host-supervisor\r\n"
+        b"Content-Type: application/json\r\nContent-Length: 2\r\n"
+        b"Connection: close\r\n\r\n{}",
+    )
+    worker.join(timeout=2)
+    assert observed["status"] == 422
+    assert observed["reply_size"] > 0
+    assert len(observed["reply_sha256"]) == 64

@@ -975,8 +975,18 @@ def _build_policy_definition(action: str) -> ToolDefinition:
     def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
         path = state.get("path")
         if action in {"write_ro", "device_nodev"} and isinstance(path, str) and os.path.lexists(path): os.unlink(path)
-        after = {"mount": _mount_for_path(state.get("target", "/")), "probe_exists": os.path.lexists(path) if isinstance(path, str) else False}
-        checks = {"probe_removed": not after["probe_exists"], "agent_identity_unchanged": identity_snapshot() == result.identity_before}
+        probe_exists = os.path.lexists(path) if isinstance(path, str) else False
+        after = {"mount": _mount_for_path(state.get("target", "/")), "probe_exists": probe_exists}
+        if action in {"execute_noexec", "setid_nosuid"}:
+            observed_probe = _path_state(path) if isinstance(path, str) else {"exists": False}
+            after["probe"] = observed_probe
+            probe_checks = {
+                "registered_probe_preserved": probe_exists,
+                "probe_hash_unchanged": observed_probe.get("sha256") == result.state_reached.get("probe", {}).get("sha256"),
+            }
+        else:
+            probe_checks = {"temporary_probe_removed": not probe_exists}
+        checks = {**probe_checks, "agent_identity_unchanged": identity_snapshot() == result.identity_before}
         return _non_mount_reset(name, result, after, checks, changed=result.outcome == "ALLOWED" and result.changed)
     schema = {"probe_ref": str} if action in {"execute_noexec", "setid_nosuid"} else {}
     required = frozenset({"probe_ref"}) if schema else frozenset()

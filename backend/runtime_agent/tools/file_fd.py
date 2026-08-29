@@ -52,7 +52,7 @@ from .base import (
 
 # ── ioctl 상수 (FS inode flags) ─────────────────────────────────────────────
 FS_IOC_GETFLAGS = 0x80086601
-FS_IOC_SETFLAGS = 0x40086601
+FS_IOC_SETFLAGS = 0x40086602
 FS_IMMUTABLE_FL = 0x00000010
 FS_APPEND_FL = 0x00000020
 FS_NODUMP_FL = 0x00000040
@@ -643,13 +643,13 @@ _FILE_INODE_TOOL = "file.inode_flags"
 
 
 def _read_inode_flags(fd: int) -> int:
-    buf = array.array("i", [0])
+    buf = array.array("l", [0])
     fcntl.ioctl(fd, FS_IOC_GETFLAGS, buf, True)
     return buf[0]
 
 
 def _write_inode_flags(fd: int, flags: int) -> None:
-    fcntl.ioctl(fd, FS_IOC_SETFLAGS, array.array("i", [flags]), False)
+    fcntl.ioctl(fd, FS_IOC_SETFLAGS, array.array("l", [flags]), False)
 
 
 @register(_FILE_INODE_TOOL, "get", spec=ToolSpec(resource_kind=_PATH))
@@ -2173,7 +2173,18 @@ def _build_file_lock_definition(action: str) -> ToolDefinition:
             if lock_action:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             else:
-                fcntl.fcntl(fd, F_SETLEASE, F_UNLCK)
+                try:
+                    fcntl.fcntl(fd, F_SETLEASE, F_UNLCK)
+                except OSError as exc:
+                    # lease_release already reached F_UNLCK in the handler.
+                    # Linux may return EAGAIN when asked to release the same
+                    # absent lease again; independent F_GETLEASE verification
+                    # above already proved the terminal state.
+                    if not (
+                        action == "lease_release"
+                        and exc.errno in {errno_module.EAGAIN, errno_module.EINVAL}
+                    ):
+                        raise
             os.close(fd)
         observed = _full_path_state(result.data["path"])
         checks = {"target_unchanged": observed == result.state_before, "held_fd_closed": "fd" not in state}

@@ -279,7 +279,7 @@ _FILE_PROFILES: dict[str, tuple[bytes, int, Callable[[Path], None] | None, bool]
         b"/var/log/osagent-fixture.log {\n daily\n postrotate\n  /usr/bin/true\n endscript\n}\n",
         0o644, None, True,
     ),
-    "persist.udev_rule": (b'ACTION=="add", RUN+="/usr/bin/true" # osagent-persist\n', 0o644, None, True),
+    "persist.udev_rule": (b'ACTION=="add", RUN+="/usr/bin/true"\n', 0o644, None, True),
     "persist.module_autoload": (b"dummy # osagent-persist\n", 0o644, None, True),
     "persist.legacy_init": (
         b"#!/bin/sh\n### BEGIN INIT INFO\n# Provides: osagent-persist\n### END INIT INFO\nexit 0\n",
@@ -1167,9 +1167,12 @@ def _profile_payload(tool: str, arguments: dict[str, Any], context: ToolContext)
         return (f"{log_path} {{\n daily\n postrotate\n  {executable}\n endscript\n}}\n".encode(), 0o644)
     if tool == "persist.udev_rule":
         executable = _safe_registered_executable(arguments, "executable_ref", context)
-        return f'ACTION=="add", RUN+="{executable}" # osagent-persist\n'.encode(), 0o644
+        return f'ACTION=="add", RUN+="{executable}"\n'.encode(), 0o644
     if tool == "persist.module_autoload":
-        module = _argument_string(arguments, "module_name_ref", context, r"osagent_fixture_[a-z0-9_]{1,40}")
+        module = _argument_string(
+            arguments, "module_name_ref", context,
+            r"(?:dummy|osagent_fixture_[a-z0-9_]{1,40})",
+        )
         return f"{module} # osagent-persist\n".encode(), 0o644
     if tool == "persist.legacy_init":
         executable = _safe_registered_executable(arguments, "executable_ref", context)
@@ -1220,7 +1223,13 @@ def _profile_validation(tool: str, path: Path) -> dict[str, Any]:
                                  "module": module}
         if validation.returncode: _raise_command_error(validation, "fixture module is unavailable")
     elif tool == "persist.tmpfiles":
-        validation = _run(["systemd-tmpfiles", "--dry-run", "--create", str(path)])
+        # Older supported systemd releases do not expose --dry-run.  A prefix
+        # that cannot match the registered fixture still parses the supplied
+        # configuration without applying any entry.
+        validation = _run([
+            "systemd-tmpfiles", "--create",
+            "--prefix=/__osagent_validation_no_match__", str(path),
+        ])
         observed["validator"] = {"argv0": "systemd-tmpfiles", "exit_code": validation.returncode}
         if validation.returncode: _raise_command_error(validation, "tmpfiles fixture validation failed")
     return observed
@@ -1496,7 +1505,13 @@ def _build_child_fixture_definition(tool: str, action: str) -> ToolDefinition:
                                   f"{name} operated only inside registered fixture directory")
 
     def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
-        target = state["target"]; observed = _observed_file(target)
+        target = state.get("target")
+        if result.outcome != "ALLOWED":
+            observed = _observed_file(target) if isinstance(target, Path) else {}
+            return _definition_verification(name, result, observed, {}, changed=False)
+        if not isinstance(target, Path):
+            return VerificationResult(name + "_verifier", "REJECTED", {"target_recorded": False}, {})
+        observed = _observed_file(target)
         if action == "remove": checks = {"fixture_absent": not observed["exists"]}
         else:
             checks = {"fixture_hash_requeried": observed.get("sha256") == state.get("expected_hash"),
@@ -1509,7 +1524,11 @@ def _build_child_fixture_definition(tool: str, action: str) -> ToolDefinition:
     def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
         target = state.get("target"); snapshot = state.get("before")
         if isinstance(target, Path) and isinstance(snapshot, _FullFileSnapshot): _restore_full(target, snapshot)
-        restored = isinstance(target, Path) and isinstance(snapshot, _FullFileSnapshot) and _snapshot_matches(target, snapshot)
+        restored = (
+            isinstance(target, Path)
+            and isinstance(snapshot, _FullFileSnapshot)
+            and _snapshot_matches(target, snapshot)
+        ) or (not result.changed and target is None and snapshot is None)
         after = _observed_file(target) if isinstance(target, Path) else {}
         return _definition_reset(name, result, after, {"fixture_tree_restored": restored}, changed=result.changed)
 
@@ -1593,6 +1612,8 @@ def _build_ld_preload_definition(action: str) -> ToolDefinition:
                                   f"{name} changed isolated preload fixture")
 
     def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED":
+            return _definition_verification(name, result, {}, {}, changed=False)
         target = state["path"]; observed = {"file": _observed_file(target)}
         if action == "install":
             probe_state = _isolated_library_probe(state["library"]); observed["isolated_child"] = probe_state
@@ -1603,6 +1624,11 @@ def _build_ld_preload_definition(action: str) -> ToolDefinition:
 
     def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
         path = state.get("path"); snapshot = state.get("before")
+        if not isinstance(path, Path) or not isinstance(snapshot, _FullFileSnapshot):
+            return _definition_reset(
+                name, result, {}, {"preload_mutation_not_started": result.changed is False},
+                changed=False,
+            )
         if isinstance(path, Path) and isinstance(snapshot, _FullFileSnapshot): _restore_full(path, snapshot)
         restored = isinstance(path, Path) and isinstance(snapshot, _FullFileSnapshot) and _snapshot_matches(path, snapshot)
         return _definition_reset(name, result, _observed_file(path) if isinstance(path, Path) else {},
@@ -1824,7 +1850,15 @@ def _build_systemd_unit_definition(tool: str, action: str, *, user: bool) -> Too
                                   f"{name} reloaded and queried systemd")
 
     def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
-        path = state["path"]; observed = _unit_observation(path, user=user)
+        path = state.get("path")
+        if result.outcome != "ALLOWED":
+            observed = _unit_observation(path, user=user) if isinstance(path, Path) else {}
+            return _definition_verification(name, result, observed, {}, changed=False)
+        if not isinstance(path, Path):
+            return VerificationResult(
+                name + "_verifier", "REJECTED", {"unit_path_recorded": False}, {},
+            )
+        observed = _unit_observation(path, user=user)
         if action == "remove": checks = {"unit_file_absent": not observed["file"]["exists"],
                                           "unit_not_loaded": observed["properties"].get("LoadState") in {None, "not-found"}}
         else:
@@ -1843,7 +1877,9 @@ def _build_systemd_unit_definition(tool: str, action: str, *, user: bool) -> Too
             after = _unit_observation(path, user=user)
             file_ok = isinstance(snapshot, _FullFileSnapshot) and _snapshot_matches(path, snapshot)
             enabled_ok = after["enabled"] == state.get("before_enabled") or (state.get("before_enabled") in {"", "disabled", "not-found"} and after["enabled"] != "enabled")
-        else: after = {}; file_ok = enabled_ok = False
+        else:
+            after = {}
+            file_ok = enabled_ok = not result.changed
         return _definition_reset(name, result, after, {"unit_file_restored": file_ok, "enable_state_restored": enabled_ok}, changed=result.changed)
 
     schema = {"executable_ref": str}
@@ -1896,8 +1932,19 @@ def _build_systemd_trigger_definition(action: str) -> ToolDefinition:
                                   f"{name} loaded matching trigger fixture")
 
     def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
-        trigger = state["trigger"]; observed = {"trigger": _unit_observation(trigger, user=False),
-                                                "service": _unit_observation(state["service"], user=False)}
+        trigger = state.get("trigger"); service = state.get("service")
+        if result.outcome != "ALLOWED":
+            observed = {
+                "trigger": _unit_observation(trigger, user=False) if isinstance(trigger, Path) else {},
+                "service": _unit_observation(service, user=False) if isinstance(service, Path) else {},
+            }
+            return _definition_verification(name, result, observed, {}, changed=False)
+        if not isinstance(trigger, Path) or not isinstance(service, Path):
+            return VerificationResult(
+                name + "_verifier", "REJECTED", {"unit_paths_recorded": False}, {},
+            )
+        observed = {"trigger": _unit_observation(trigger, user=False),
+                    "service": _unit_observation(service, user=False)}
         if action == "remove": checks = {"trigger_absent": not observed["trigger"]["file"]["exists"],
                                           "trigger_not_loaded": observed["trigger"]["properties"].get("LoadState") in {None, "not-found"}}
         else: checks = {"trigger_loaded": observed["trigger"]["properties"].get("LoadState") == "loaded",
@@ -1914,8 +1961,19 @@ def _build_systemd_trigger_definition(action: str) -> ToolDefinition:
         if isinstance(trigger, Path) and state.get("before_enabled") == "enabled": _systemctl(False, "enable", trigger.name)
         after = {"trigger": _unit_observation(trigger, user=False) if isinstance(trigger, Path) else {},
                  "service": _unit_observation(service, user=False) if isinstance(service, Path) else {}}
-        checks = {"trigger_file_restored": isinstance(trigger, Path) and _snapshot_matches(trigger, state["trigger_before"]),
-                  "service_file_restored": isinstance(service, Path) and _snapshot_matches(service, state["service_before"])}
+        untouched = not result.changed and trigger is None and service is None
+        checks = {
+            "trigger_file_restored": untouched or (
+                isinstance(trigger, Path)
+                and isinstance(state.get("trigger_before"), _FullFileSnapshot)
+                and _snapshot_matches(trigger, state["trigger_before"])
+            ),
+            "service_file_restored": untouched or (
+                isinstance(service, Path)
+                and isinstance(state.get("service_before"), _FullFileSnapshot)
+                and _snapshot_matches(service, state["service_before"])
+            ),
+        }
         return _definition_reset(name, result, after, checks, changed=result.changed)
 
     return ToolDefinition(name, tool, action, handler, verifier, resetter,

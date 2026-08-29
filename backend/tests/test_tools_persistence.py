@@ -254,6 +254,25 @@ def test_definition_verifier_and_reset(context):
     assert execution.rollback_verified is True
 
 
+def test_path_hijack_policy_block_has_verified_no_change(context):
+    context.destructive_enabled = True
+    replacement = context.resource_paths["replacement-file"]
+    assert isinstance(replacement, str)
+    os.chmod(replacement, 0o755)
+    context.evidence_writer = (
+        lambda run_id, action_id, kind, payload: f"evidence://{run_id}/{action_id}/{kind}"
+    )
+
+    execution = execute_tool_action(
+        "persist.path_hijack", "install",
+        {"resource_ref": "target-file", "executable_ref": "replacement-file"}, context,
+    )
+
+    assert execution.result.outcome == "POLICY_BLOCKED"
+    assert execution.verification.status == "VERIFIED_NO_CHANGE"
+    assert execution.reset.status == "VERIFIED_NO_CHANGE"
+
+
 def test_common_result_fields_present(context):
     context.destructive_enabled = True
     outcome = dispatch(

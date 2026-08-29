@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socketserver
 import subprocess
 import sys
@@ -10,9 +11,12 @@ from pathlib import Path
 import pytest
 
 # host_supervisor는 Ubuntu 전용 모듈이지만 이 회귀 테스트는 Windows 개발
-# 환경에서도 Docker 명령 조립만 검증할 수 있어야 한다.
-sys.modules.setdefault("grp", types.ModuleType("grp"))
-sys.modules.setdefault("pwd", types.ModuleType("pwd"))
+# 환경에서도 Docker 명령 조립만 검증할 수 있어야 한다. Linux에서는 실제
+# 모듈을 유지해야 root-only 테스트를 단독 실행해도 pytest가 사용자 정보를
+# 정상 조회할 수 있다.
+if sys.platform == "win32":
+    sys.modules.setdefault("grp", types.ModuleType("grp"))
+    sys.modules.setdefault("pwd", types.ModuleType("pwd"))
 if not hasattr(socketserver, "UnixStreamServer"):
     socketserver.UnixStreamServer = socketserver.TCPServer  # type: ignore[attr-defined]
 
@@ -126,6 +130,7 @@ def test_host_runtime_groups_are_scoped_to_one_process(monkeypatch) -> None:
     assert "--init-groups" not in command
 
 
+@pytest.mark.skipif(os.geteuid() != 0, reason="fixed topology ownership requires root")
 def test_target_canary_uses_fixed_topology_directories(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(host_supervisor, "TARGET_ROOT", tmp_path)
 
@@ -220,6 +225,13 @@ def test_experiment_environment_reset_restores_all_managed_surfaces(
         "c2",
         "c3",
     }
+    assert result["restored_state"]["target_directory_modes"] == {
+        target: oct(0o751) for target in host_supervisor.TARGET_DIRECTORIES
+    }
+    assert all(
+        (target_root / directory).stat().st_mode & 0o777 == 0o751
+        for directory in host_supervisor.TARGET_DIRECTORIES.values()
+    )
     assert all(
         (target_root / directory / "canary.txt").read_text(encoding="utf-8")
         == host_supervisor.INITIAL_CONTENT

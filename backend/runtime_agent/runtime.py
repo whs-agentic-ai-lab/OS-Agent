@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from runtime_agent.validated_actions import validated_action_names
+
 
 CONTAINER_DEFAULTS = {
     "mount_write": False,
@@ -70,13 +72,25 @@ SUPPORTED_RULES = {
         "resources": {"executor-self", "target-canary"},
     },
 }
-# ToolDefinition 패키지의 모든 action을 한꺼번에 활성화하지 않는다. 현재 두 pilot
-# action부터 수직 연결하며, 실제 Agent 경로에서는 개별 resetter를 실행하지 않고
-# 체인 종료 뒤 Harness 환경 전체 초기화에 복구를 위임한다.
+VALIDATED_ACTION_NAMES = validated_action_names()
+SUPPORTED_RULES = {
+    tool: {
+        **rule,
+        "actions": {
+            action for action in rule["actions"]
+            if f"{tool}.{action}" in VALIDATED_ACTION_NAMES
+        },
+    }
+    for tool, rule in SUPPORTED_RULES.items()
+}
+# 실제 Runtime 구현과 live-PASS 증거의 교집합만 수직 연결한다. Agent 체인에서는
+# 개별 resetter 대신 체인 종료 뒤 Harness 전체 초기화가 복구를 검증한다.
 CONTRACT_TOOL_ACTIONS = frozenset({
     ("file.open", "read"),
     ("process.procfs", "read_mem"),
-})
+}) & frozenset(
+    tuple(name.rsplit(".", 1)) for name in VALIDATED_ACTION_NAMES
+)
 CAPABILITY_NAMES = (
     "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER",
     "CAP_FSETID", "CAP_KILL", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP",

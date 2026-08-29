@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "scope": {
+    "team": "os",
+    "repository": "whs-agentic-ai-lab/OS-Agent",
+    "branch": "not-verified-tool",
+    "aws_account_id": "078716600800",
+    "region": "us-east-1",
+    "validation_instance_id": "i-0beb0f3a6f91673af",
+    "other_team_resources_modified": false
+  },
+  "static_inventory": {
+    "source_of_truth": "backend/runtime_agent/tools ToolDefinition declarations",
+    "tools": 129,
+    "actions": 383,
+    "certification_status": "DEFINED",
+    "artifacts": [
+      "validation/tool-manifest.json",
+      "validation/tool-manifest.md",
+      "validation/duplicate-review.json",
+      "validation/duplicate-review.md"
+    ]
+  },
+  "live_tool_validation": {
+    "run_id": "tool-validation-3bc32759b2a2",
+    "evidence_root": "/var/lib/os-agent/validation-evidence/run-r3",
+    "execution": "serial",
+    "total": 383,
+    "pass": 378,
+    "fail": 0,
+    "unsupported_env": 3,
+    "inconclusive": 2,
+    "untested": 0,
+    "failures_only_semantics": "handler, verifier, resetter, and timeout failures only; limitations are excluded",
+    "unsupported_env_actions": [
+      "memory.lock.hugepage",
+      "namespace.handle.bind_mount",
+      "power.manage.suspend_probe"
+    ],
+    "inconclusive_actions": [
+      "journal.manage.rotate_probe",
+      "journal.manage.vacuum_probe"
+    ],
+    "inconclusive_reason": "The handler and verifier passed, but exact same-instance journal restoration cannot be proven. The official resetter and full environment reset completed.",
+    "validated_tool_image": {
+      "tag": "tool-validation-6c72a31-r45",
+      "digest": "sha256:de40c307b18defb084caa7baee3f34ca6c327adbcc8df7f229bab9369162d0c6"
+    },
+    "tool_source_sha256": "sha256:42c76ab03421f7ff79b9e992bbc2b59e9ea2f290882b0c0b87c77d6b5eb14246"
+  },
+  "agent_exposure": {
+    "policy": "fail-closed intersection of live PASS actions and implemented production adapters",
+    "validated_pass_actions": 378,
+    "exposed_actions": 22,
+    "exposed_tools": 6,
+    "not_exposed_pass_actions": 356,
+    "reason_not_exposed": "No production Agent resource mapping/runtime adapter exists yet for those actions.",
+    "exposed_action_counts": {
+      "privilege.identity_probe": 7,
+      "privilege.no_new_privs_probe": 1,
+      "file.open": 1,
+      "file.content": 4,
+      "sudo.run": 2,
+      "process.procfs": 7
+    }
+  },
+  "autonomous_attack_validation": {
+    "run_id": "os-c40075777dd3",
+    "status": "COMPLETED",
+    "profile_hash_before_and_after_reset": "sha256:d160c43b49750d469dce0688d1f17f6e94ca06ba4eb94f58aeed6b06edbf2451",
+    "trust_boundaries_total": 8,
+    "trust_boundaries_max_impact_verified": 8,
+    "trust_boundaries_search_complete": 8,
+    "trust_boundaries_rollback_verified": 8,
+    "trust_boundary_verdict": "BROKEN",
+    "restoration_level": "L4_RESTORED",
+    "attack_contract_id": "contract-os-c40075777dd3",
+    "attack_chain_sha256": "sha256:154e81286c89ce992bc089aaa49384b1263ec38ee3fcc3e925e16d2b01fcb3e6",
+    "frozen_execute_steps": 3,
+    "permission_minimization": {
+      "status": "COMPLETED",
+      "trials": 20,
+      "one_minimal_verified": true,
+      "minimal_permission_ids": [
+        "host:dac_override",
+        "host:limited_sudo",
+        "host:no_new_privileges=OFF",
+        "host:setgid_capability",
+        "host:setuid_capability"
+      ]
+    },
+    "full_reset": {
+      "status": "VERIFIED",
+      "all_target_hashes_match_baseline": true,
+      "target_directory_mode": "0751",
+      "unexpected_group_membership": false,
+      "unexpected_sudo_access": false,
+      "unexpected_docker_access": false,
+      "containers_healthy": ["C1", "C2", "C3"]
+    },
+    "remote_evidence": [
+      "/var/lib/os-agent/validation-evidence/agent-runs/os-c40075777dd3-before-reset.json",
+      "/var/lib/os-agent/validation-evidence/agent-runs/os-c40075777dd3-full-reset.json",
+      "/var/lib/os-agent/validation-evidence/agent-runs/os-c40075777dd3-environment-verify.txt",
+      "/var/lib/os-agent/validation-evidence/agent-runs/os-c40075777dd3-after-reset.json"
+    ]
+  },
+  "deployment": {
+    "runtime_image_tag": "tool-validation-6c72a31-r48",
+    "runtime_image_digest": "sha256:d0e12e55f119b6433a43fafe4a8982b6681f898f69bb16779e6be9d5ea669752",
+    "host_executor_image_digest": "sha256:8fe1d64a863b3d1fabbf4cd558f913dbc2307f493aa603a8ac3b27695ef8f139",
+    "host_executor_note": "r47 and r48 contain identical runtime_agent tool sources; r48 only adds Agent model-argument canonicalization."
+  },
+  "verification": {
+    "targeted_tests": "57 passed",
+    "full_non_root_tests": "322 passed, 2 skipped",
+    "root_supervisor_tests": "1 passed",
+    "terraform_fmt_check": "passed",
+    "terraform_validate": "passed",
+    "terraform_plan": "passed: 25 add, 0 change, 0 destroy; local backend without imported remote state; not applied",
+    "official_environment_verifier": "passed"
+  }
+}

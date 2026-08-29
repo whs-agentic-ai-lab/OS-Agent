@@ -1054,7 +1054,14 @@ def _build_namespace_handle_definition(action: str) -> ToolDefinition:
             directory = _registered_path(decision, context, directory=True); destination = _safe_child(directory, "ns-" + kind, context)
             fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600); os.close(fd); state.update(destination=destination, paths=[destination])
             rc = libc.mount(source.encode(), destination.encode(), None, 4096, None)
-            if rc != 0: raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+            if rc != 0:
+                error_number = ctypes.get_errno()
+                if error_number == errno_module.EINVAL:
+                    raise OSError(
+                        errno_module.EOPNOTSUPP,
+                        "kernel rejected namespace-handle bind mount (EINVAL)",
+                    )
+                raise OSError(error_number, os.strerror(error_number))
             reached = {"destination": _path_state(destination), "mountinfo_contains": destination in (_safe_read("/proc/self/mountinfo") or "")}
         else:
             fd = os.open(source, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)); state["fd"] = fd
@@ -1231,7 +1238,10 @@ def _build_rlimit_definition(action: str) -> ToolDefinition:
         def operation() -> dict[str, Any]:
             soft, hard = _resource.getrlimit(resource_id)
             bounded = min(soft if soft != _resource.RLIM_INFINITY else 1024, hard if hard != _resource.RLIM_INFINITY else 1024, 1024)
-            if action == "set_soft": _resource.setrlimit(resource_id, (bounded, hard))
+            if action == "set_soft":
+                if bounded == soft:
+                    bounded = soft - 1 if soft > 0 else min(1, hard)
+                _resource.setrlimit(resource_id, (bounded, hard))
             else: _resource.setrlimit(resource_id, (min(soft, bounded), bounded))
             return {"limit": _resource.getrlimit(resource_id), "profile": profile}
         pid, reached = _spawn_isolated(operation); state.update(child_pid=pid, reached=reached, resource_id=resource_id)
@@ -1254,11 +1264,22 @@ def _build_time_definition(action: str) -> ToolDefinition:
     tool = _TIME; name = f"{tool}.{action}"
     def handler(state: dict[str, Any], decision: ToolDecision, context: ToolContext) -> ToolResult:
         identity_before = identity_snapshot(); before = {"clock_ns": time.time_ns(), "parent_time_ns": ns_snapshot("self").get("time")}
+        offset_path = None
+        if action == "set_namespace_offset":
+            if decision.resource_ref is None:
+                raise ToolInputError("registered timens_offsets resource_ref is required")
+            resolved = context.resolve_resource(decision.resource_ref)
+            if resolved != "/proc/self/timens_offsets":
+                raise ToolPolicyBlocked("resource_ref must select the exact timens_offsets API")
+            offset_path = resolved
         def operation() -> dict[str, Any]:
             if action == "set_namespace_offset":
-                raw_syscall("unshare", CLONE_NEWTIME); offset_path = _registered_path(decision, context, directory=False)
+                raw_syscall("unshare", CLONE_NEWTIME)
                 with open(offset_path, "w") as stream: stream.write("monotonic 1 0\n")
-                return {"time_namespace": os.readlink("/proc/self/ns/time"), "offsets": _safe_read(offset_path)}
+                return {
+                    "time_namespace_for_children": os.readlink("/proc/self/ns/time_for_children"),
+                    "offsets": _safe_read(offset_path),
+                }
             class Timespec(ctypes.Structure): _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
             current = Timespec();
             if libc.clock_gettime(0, ctypes.byref(current)) != 0: raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
@@ -1268,7 +1289,12 @@ def _build_time_definition(action: str) -> ToolDefinition:
         return _result(tool, action, context, identity_before, before, {"child_pid": pid, **reached}, f"isolated time {action}", changed=True)
     def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
         if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
-        observed = {"child_alive": _proc_alive(state["child_pid"]), "child_time_ns": ns_snapshot(str(state["child_pid"])).get("time"), "parent_time_ns": ns_snapshot("self").get("time")}
+        child_time_path = f"/proc/{state['child_pid']}/ns/time_for_children"
+        observed = {
+            "child_alive": _proc_alive(state["child_pid"]),
+            "child_time_ns": os.readlink(child_time_path) if os.path.exists(child_time_path) else None,
+            "parent_time_ns": os.readlink("/proc/self/ns/time_for_children"),
+        }
         checks = {"child_alive": observed["child_alive"], "parent_namespace_unchanged": observed["parent_time_ns"] == result.state_before["parent_time_ns"]}
         if action == "set_namespace_offset": checks["time_namespace_created"] = observed["child_time_ns"] != observed["parent_time_ns"]
         else: checks["clock_api_reached"] = state["reached"].get("clock_settime_completed") is True
@@ -1662,7 +1688,9 @@ def _build_power_definition(action: str) -> ToolDefinition:
             elif action == "wake_alarm_probe" and state["original"]: _write_text(state["path"], state["original"])
         after = {"value": _read_text(state["path"]).strip()} if state.get("path") else {}
         expected = state.get("original")
-        if action == "wake_alarm_probe": restored = after.get("value") in ({expected} if expected else {"", "0"})
+        if not result.changed and not state.get("path"):
+            restored = True
+        elif action == "wake_alarm_probe": restored = after.get("value") in ({expected} if expected else {"", "0"})
         elif action in {"reboot_probe", "suspend_probe", "kexec_probe"}: restored = after.get("value") == expected
         else: restored = True
         checks = {"original_control_state_restored": restored}

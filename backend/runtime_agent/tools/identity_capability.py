@@ -612,6 +612,15 @@ def _reset_state_fixture(name: str, state: dict[str, Any]) -> ResetResult:
     pid = state.get("fixture_pid")
     command = state.pop("fixture_command", None)
     response = state.pop("fixture_response", None)
+    if not isinstance(pid, int) and command is None and response is None:
+        return ResetResult(
+            resetter=f"{name}_resetter",
+            status="VERIFIED_NO_CHANGE",
+            identity_after=identity_snapshot(),
+            state_after={"exists": False},
+            checks={"fixture_not_created": True},
+            output="identity fixture creation was blocked before mutation",
+        )
     acknowledged = False
     if command is not None:
         try:

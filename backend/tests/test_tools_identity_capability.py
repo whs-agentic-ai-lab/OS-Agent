@@ -25,7 +25,7 @@ import pytest
 if sys.platform != "linux":
     pytest.skip("runtime_agent.tools 계약 테스트는 Linux syscall 환경에서만 실행합니다.", allow_module_level=True)
 
-from runtime_agent.tools import ToolContext, dispatch, known_tools
+from runtime_agent.tools import ToolContext, dispatch, execute_tool_action, known_tools
 
 
 @pytest.fixture
@@ -153,6 +153,18 @@ def test_securebits_lock_requires_bits(context):
     outcome = dispatch("privilege.securebits_probe", "lock", {}, context)
     assert outcome.attempted is False
     assert outcome.outcome == "POLICY_BLOCKED"
+
+
+def test_securebits_policy_block_before_child_is_verified_no_change(context):
+    context.evidence_writer = lambda run_id, action_id, kind, payload: f"evidence:{kind}"
+
+    execution = execute_tool_action(
+        "privilege.securebits_probe", "set", {"profile": "not-allowlisted"}, context,
+    )
+
+    assert execution.result.outcome == "POLICY_BLOCKED"
+    assert execution.reset.status == "VERIFIED_NO_CHANGE"
+    assert context.run_guard.aborted is False
 
 
 def test_capability_add_returns_structured_outcome(context, monkeypatch):

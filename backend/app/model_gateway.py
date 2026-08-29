@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from .attack_tools import validate_attack_tool_call
+from .attack_tools import IMPLEMENTED_ATTACK_TOOLS, validate_attack_tool_call
 from .config import Settings
 from .schemas import PlannerNextAction, ToolDecision, TrustBoundaryOption
 
@@ -178,7 +178,20 @@ TEAM_CONTRACT_BOUNDARIES = frozenset({"TB-HH-U1U2", "TB-CC-C1C2"})
 def tool_schemas_for_boundary(boundary: TrustBoundaryOption) -> list[dict[str, Any]]:
     """현재 TB에서 Runtime까지 연결된 Tool만 모델에게 제시한다."""
 
-    schemas = deepcopy(TOOL_SCHEMAS)
+    schemas: list[dict[str, Any]] = []
+    for schema in deepcopy(TOOL_SCHEMAS):
+        function = schema.get("function", {})
+        tool_id = FUNCTION_TO_TOOL.get(function.get("name"))
+        definition = IMPLEMENTED_ATTACK_TOOLS.get(tool_id or "")
+        if definition is None:
+            continue
+        action_property = function["parameters"]["properties"]["action"]
+        action_property["enum"] = [
+            action for action in action_property["enum"]
+            if action in definition.implemented_actions
+        ]
+        if action_property["enum"]:
+            schemas.append(schema)
     if boundary.id in TEAM_CONTRACT_BOUNDARIES:
         return schemas
     filtered: list[dict[str, Any]] = []
@@ -340,11 +353,10 @@ class ModelGateway:
         )
 
     def resolve_model(self, requested_model: str | None) -> str:
-        if requested_model is None:
-            return self.model
-        if requested_model not in SUPPORTED_OPENROUTER_MODELS:
+        selected_model = requested_model or self.model
+        if selected_model not in SUPPORTED_OPENROUTER_MODELS:
             raise ValueError("대시보드에서 허용되지 않은 OpenRouter 모델입니다.")
-        return requested_model
+        return selected_model
 
     def suggest_permission_ids(
         self,
@@ -555,9 +567,22 @@ class ModelGateway:
         arguments = payload.get("arguments")
         if not all(isinstance(value, str) and value for value in (action, resource_ref)):
             raise RuntimeError("Tool Call에 action과 resource_ref가 필요합니다.")
+        if not isinstance(arguments, dict):
+            raise RuntimeError("Tool Call arguments는 JSON 객체여야 합니다.")
+        if any(key in arguments for key in ("command", "shell", "path", "absolute_path")):
+            raise RuntimeError("Raw command나 임의 경로는 Agent Attack Tool에 전달할 수 없습니다.")
+        tool_id = FUNCTION_TO_TOOL[function_name]
+        if tool_id == "file.content" and action in {"write", "append"}:
+            arguments = {"content": arguments.get("content")}
+        elif tool_id == "sudo.run" and action == "run_probe":
+            arguments = {"content": arguments.get("content")}
+        else:
+            # Model providers occasionally emit schema-irrelevant properties.
+            # No-argument actions are canonicalized to the only executable form.
+            arguments = {}
         try:
             return cls._decision(
-                FUNCTION_TO_TOOL[function_name], action, resource_ref, arguments
+                tool_id, action, resource_ref, arguments
             )
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc

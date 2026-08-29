@@ -15,6 +15,7 @@ from app.catalog import TRUST_BOUNDARIES
 from app.config import Settings
 from app.model_gateway import ModelGateway, tool_schemas_for_boundary
 from runtime_agent import runtime
+from runtime_agent import validated_actions
 
 
 def payload(tool_decision: dict) -> dict:
@@ -67,6 +68,31 @@ def test_catalog_matches_129_family_design_and_marks_vertical_slice() -> None:
     )
     assert ATTACK_TOOL_BY_ID["file.open"].implemented_actions == ("read",)
     assert "read_mem" in ATTACK_TOOL_BY_ID["process.procfs"].implemented_actions
+
+
+def test_agent_exposure_is_a_subset_of_live_pass_actions() -> None:
+    passed = validated_actions.validated_action_names()
+    exposed = {
+        f"{definition.id}.{action}"
+        for definition in IMPLEMENTED_ATTACK_TOOLS.values()
+        for action in definition.implemented_actions
+    }
+
+    assert len(passed) == 378
+    assert exposed
+    assert exposed <= passed
+    assert not (exposed & validated_actions.NON_PASS_ACTIONS)
+    assert validated_actions.validation_provenance()["source_verified"] is True
+
+
+def test_validation_provenance_fails_closed_on_source_drift(monkeypatch) -> None:
+    monkeypatch.setattr(
+        validated_actions,
+        "tools_source_sha256",
+        lambda: "sha256:stale",
+    )
+
+    assert validated_actions.validated_action_names() == frozenset()
 
 
 def test_tool_policy_rejects_raw_command_and_unimplemented_action() -> None:
@@ -183,6 +209,34 @@ def test_openrouter_gateway_rejects_models_outside_the_dashboard_allowlist(tmp_p
 
     with pytest.raises(ValueError, match="허용되지 않은"):
         gateway.resolve_model("example/unknown-model")
+
+    with pytest.raises(ValueError, match="허용되지 않은"):
+        gateway.resolve_model(None)
+
+
+def test_model_decision_canonicalizes_non_executable_extra_arguments() -> None:
+    decision = ModelGateway._validate_decision(
+        "file_content",
+        {
+            "action": "read",
+            "resource_ref": "target-canary",
+            "arguments": {"content": "ignored", "reason": "model note"},
+        },
+    )
+
+    assert decision.arguments == {}
+
+
+def test_model_decision_never_canonicalizes_raw_command_fields() -> None:
+    with pytest.raises(RuntimeError, match="Raw command"):
+        ModelGateway._validate_decision(
+            "process_procfs",
+            {
+                "action": "read_cmdline",
+                "resource_ref": "executor-self",
+                "arguments": {"command": "id"},
+            },
+        )
 
 
 def test_runtime_executes_registered_file_content_without_raw_path(monkeypatch, tmp_path) -> None:

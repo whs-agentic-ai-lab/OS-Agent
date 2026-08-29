@@ -615,7 +615,11 @@ def _build_enablement_definition(action: str) -> ToolDefinition:
         if result.outcome != "ALLOWED": return _verification(name, result, {}, {}, changed=False)
         enabled = _enabled_state(state["unit"]); observed = {"enabled": enabled, "unit": _unit_state(state["unit"])}
         expected = {"enable": {"enabled", "enabled-runtime", "linked", "linked-runtime"}, "disable": {"disabled", "static", "indirect"}, "mask": {"masked", "masked-runtime"}, "unmask": {"disabled", "static", "indirect"}}[action]
-        checks = {"enablement_requeried": enabled["state"] in expected, "unit_still_loaded": observed["unit"].get("LoadState") == "loaded"}
+        checks = {"enablement_requeried": enabled["state"] in expected}
+        if action == "mask":
+            checks["unit_masked"] = observed["unit"].get("LoadState") == "masked"
+        else:
+            checks["unit_still_loaded"] = observed["unit"].get("LoadState") == "loaded"
         return _verification(name, result, observed, checks, changed=True)
     def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
         after, checks = _cleanup_units(state); return _reset_result(name, result, after, checks, changed=result.outcome == "ALLOWED")
@@ -710,7 +714,7 @@ def _build_transient_definition(action: str) -> ToolDefinition:
         before = _transient_state(unit)
         if before.get("LoadState") not in {None, "not-found"}: raise ToolPolicyBlocked("transient fixture unit already exists")
         state.update(unit=unit, executable=executable)
-        if action == "service": argv = ["systemd-run", "--unit", unit, "--property=Type=oneshot", "--property=RemainAfterExit=yes", "--runtime-max-sec=15", executable]
+        if action == "service": argv = ["systemd-run", "--unit", unit, "--property=Type=oneshot", "--property=RemainAfterExit=yes", "--property=RuntimeMaxSec=15s", executable]
         else: argv = ["systemd-run", "--scope", "--unit", unit, "--property=RuntimeMaxSec=15", executable]
         completed = _run(argv, timeout=18); _require_completed(completed, "systemd-run")
         reached = _transient_state(unit); state["command_exit"] = completed.returncode
@@ -813,7 +817,18 @@ def _registered_username(decision: ToolDecision, context: ToolContext) -> str:
 
 def _linger_state(user: str) -> dict[str, Any]:
     completed = _run(["loginctl", "show-user", user, "--property=Linger", "--value", "--no-pager"], timeout=8)
-    return {"user": user, "query_exit": completed.returncode, "linger": completed.stdout.strip().lower(), "error": (completed.stderr or "")[:200]}
+    value = completed.stdout.strip().lower()
+    source = "loginctl"
+    if completed.returncode != 0:
+        # logind omits inactive non-lingering users from show-user.  The
+        # persistent marker is the authoritative state for that case.
+        marker = Path("/var/lib/systemd/linger") / user
+        value = "yes" if marker.is_file() else "no"
+        source = "linger-marker"
+    return {
+        "user": user, "query_exit": 0, "linger": value,
+        "source": source, "error": (completed.stderr or "")[:200],
+    }
 
 
 def _build_linger_definition(action: str) -> ToolDefinition:

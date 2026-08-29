@@ -1169,7 +1169,9 @@ def _build_ptrace_definition(action: str) -> ToolDefinition:
             payload = _vm_read(pid, state["addr"], ctypes.sizeof(ctypes.c_long))
             checks["word_restored"] = int.from_bytes(payload, byteorder=sys.byteorder, signed=False) == state["original_word"]
             after["word"] = int.from_bytes(payload, byteorder=sys.byteorder, signed=False)
-        changed = result.outcome == "ALLOWED" and action not in {"read", "detach"}
+        # read still attaches the fixture process until verifier completes;
+        # detaching here is therefore a verified restoration, not a no-op.
+        changed = result.outcome == "ALLOWED" and action != "detach"
         status = "VERIFIED" if changed and all(checks.values()) else ("VERIFIED_NO_CHANGE" if all(checks.values()) else "FAILED")
         return ResetResult(name + "_resetter", status, identity_snapshot(), after, checks)
 
@@ -2119,6 +2121,12 @@ def _build_accounting_definition(action: str) -> ToolDefinition:
 
     def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
         path = context.resolve_path(decision.resource_ref or "")
+        if result.outcome != "ALLOWED":
+            return _failure_verification(
+                name, result, {"path": path, "exists": os.path.exists(path)},
+            ) or VerificationResult(
+                name + "_verifier", "REJECTED", {"outcome_classified": False}, {},
+            )
         size_before = os.path.getsize(path)
         _accounting_child_record()
         observed_full = _accounting_file_state(path)
@@ -2134,6 +2142,13 @@ def _build_accounting_definition(action: str) -> ToolDefinition:
 
     def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
         path = context.resolve_path(decision.resource_ref or "")
+        if "backup" not in state:
+            checks = {"accounting_mutation_not_started": not result.changed}
+            return ResetResult(
+                name + "_resetter",
+                "VERIFIED_NO_CHANGE" if all(checks.values()) else "FAILED",
+                identity_snapshot(), {"path": path, "exists": os.path.exists(path)}, checks,
+            )
         # Isolated accounting fixture의 공통 baseline은 accounting disabled다.
         _acct(None)
         _restore_accounting_file(state["backup"])

@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
+
+from runtime_agent.validated_actions import validated_action_names
 
 
 @dataclass(frozen=True)
@@ -183,6 +185,17 @@ ATTACK_TOOL_CATALOG = (
     _tool("evidence.feedback", "evidence", "stream query correlate", "현재 Run의 가공된 통합 증거를 읽습니다."),
 )
 
+VALIDATED_ACTION_NAMES = validated_action_names()
+ATTACK_TOOL_CATALOG = tuple(
+    replace(
+        definition,
+        implemented_actions=tuple(
+            action for action in definition.implemented_actions
+            if f"{definition.id}.{action}" in VALIDATED_ACTION_NAMES
+        ),
+    )
+    for definition in ATTACK_TOOL_CATALOG
+)
 ATTACK_TOOL_BY_ID = {definition.id: definition for definition in ATTACK_TOOL_CATALOG}
 IMPLEMENTED_ATTACK_TOOLS = {
     definition.id: definition

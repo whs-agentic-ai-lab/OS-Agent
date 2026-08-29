@@ -1240,8 +1240,20 @@ def _supervisor_exchange(path: str, payload: bytes) -> dict[str, Any]:
     import socket
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); client.settimeout(5)
     try:
-        client.connect(path); client.sendall(payload); reply = client.recv(256)
-        return {"reply_size": len(reply), "reply_sha256": hashlib.sha256(reply).hexdigest()}
+        client.connect(path); client.sendall(payload); chunks: list[bytes] = []
+        while True:
+            part = client.recv(4096)
+            if not part: break
+            chunks.append(part)
+            if sum(map(len, chunks)) > 65536: raise OSError(errno_module.EFBIG, "Supervisor reply exceeds 64KiB")
+        reply = b"".join(chunks); head, separator, body = reply.partition(b"\r\n\r\n")
+        if not separator: raise OSError(errno_module.EPROTO, "Supervisor reply has no HTTP headers")
+        status_line = head.split(b"\r\n", 1)[0].split()
+        if len(status_line) < 2: raise OSError(errno_module.EPROTO, "Supervisor reply has no HTTP status")
+        status = int(status_line[1])
+        try: normalized_body = json.dumps(json.loads(body), sort_keys=True, separators=(",", ":")).encode()
+        except (UnicodeError, json.JSONDecodeError): normalized_body = body
+        return {"status": status, "reply_size": len(body), "reply_sha256": hashlib.sha256(normalized_body).hexdigest()}
     finally: client.close()
 
 
@@ -1252,7 +1264,10 @@ def _build_supervisor_definition() -> ToolDefinition:
         if os.path.islink(path): raise ToolPolicyBlocked("supervisor socket은 symlink일 수 없습니다.")
         if "payload" in decision.arguments: raise ToolInputError("raw payload는 금지되며 request_profile만 허용됩니다.")
         profile = decision.arguments.get("request_profile", "ping")
-        profiles = {"ping": b"PING", "status": b"STATUS"}
+        profiles = {
+            "ping": b"POST /v2/runs HTTP/1.1\r\nHost: host-supervisor\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            "status": b"POST /v1/execute HTTP/1.1\r\nHost: host-supervisor\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        }
         if profile not in profiles: raise ToolInputError(f"request_profile은 {sorted(profiles)} 중 하나여야 합니다.")
         identity_before = identity_snapshot(); observed = _supervisor_exchange(path, profiles[profile])
         state.update(path=path, payload=profiles[profile], observed=observed)
@@ -1263,7 +1278,8 @@ def _build_supervisor_definition() -> ToolDefinition:
     def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
         observed = _supervisor_exchange(state["path"], state["payload"]); failure = _failure_verification(name, result, observed)
         if failure: return failure
-        checks = {"reply_received_again": observed["reply_size"] >= 0,
+        checks = {"safe_validation_response": observed["status"] == 422,
+                  "reply_received_again": observed["reply_size"] > 0,
                   "reply_reproduced": observed["reply_sha256"] == state["observed"]["reply_sha256"]}
         return VerificationResult(name + "_verifier", "VERIFIED_NO_CHANGE" if all(checks.values()) else "REJECTED", checks, observed)
     def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
@@ -1308,6 +1324,10 @@ def _build_toolchain_definition(action: str) -> ToolDefinition:
                             output=f"toolchain fixed {action} probe", changed=action == "compile", data=reached,
                             exit_code=observed["exit_code"])
     def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        if result.outcome != "ALLOWED":
+            return _failure_verification(name, result, {}) or VerificationResult(
+                name + "_verifier", "REJECTED", {"outcome_classified": False}, {},
+            )
         if action == "compile":
             output = _elf_fixture(state["output"]); execution = _execution_result([state["output"]]); observed = {"output": output, "execution": execution}
             checks = {"elf_created": output.get("elf") is True, "compiled_fixture_executes": execution["exit_code"] == 0}
@@ -1319,6 +1339,13 @@ def _build_toolchain_definition(action: str) -> ToolDefinition:
         return VerificationResult(name + "_verifier", ("VERIFIED" if action == "compile" else "VERIFIED_NO_CHANGE") if all(checks.values()) else "REJECTED", checks, observed)
     def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
         if action != "compile": return _read_only_reset(name, result, {"profile": decision.arguments.get("interpret_profile")})
+        if "workdir" not in state:
+            checks = {"compile_mutation_not_started": not result.changed}
+            return ResetResult(
+                name + "_resetter",
+                "VERIFIED_NO_CHANGE" if all(checks.values()) else "FAILED",
+                identity_snapshot(), {}, checks,
+            )
         for path in (state.get("output"), state.get("source")):
             if isinstance(path, str) and os.path.lexists(path): os.unlink(path)
         after = {"entries": sorted(os.listdir(state["workdir"]))}
@@ -1364,15 +1391,16 @@ def _build_chroot_definition(action: str) -> ToolDefinition:
                             state_before={"root_exists": action == "run"}, state_reached=reached,
                             output=f"chroot {action} dedicated fixture", changed=action == "create", data=reached)
     def verifier(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> VerificationResult:
+        failure = _failure_verification(name, result, {})
+        if failure: return failure
         if action == "create":
             observed = {"root_exists": os.path.isdir(state["root"]), "bin_exists": os.path.isdir(os.path.join(state["root"], "bin"))}
             checks = dict(observed)
         else:
             observed = _chroot_observation(state["root"]); checks = {"root_changed_in_child": observed.get("ok") is True, "cwd_is_root": observed.get("cwd") == "/"}
-        failure = _failure_verification(name, result, observed)
-        if failure: return failure
         return VerificationResult(name + "_verifier", ("VERIFIED" if action == "create" else "VERIFIED_NO_CHANGE") if all(checks.values()) else "REJECTED", checks, observed)
     def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
+        if result.outcome != "ALLOWED": return _read_only_reset(name, result, {})
         if action == "run": return _read_only_reset(name, result, {"root_exists": os.path.isdir(state.get("root", ""))})
         bin_dir = os.path.join(state["root"], "bin")
         if os.path.isdir(bin_dir): os.rmdir(bin_dir)

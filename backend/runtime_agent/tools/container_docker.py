@@ -35,6 +35,7 @@ import shutil
 import socket
 import stat as stat_module
 import subprocess
+import tempfile
 import tarfile
 import time
 import urllib.parse
@@ -78,6 +79,31 @@ def _spec(**kw: Any) -> ToolSpec:
 def _run(argv: list[str], inp: str | None = None, timeout: int = 20) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(argv, input=inp, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise OSError(errno_module.ENOENT, f"{argv[0]} not found")
+
+
+def _run_with_regular_stdio(argv: list[str], timeout: int) -> subprocess.CompletedProcess:
+    """Run a command without pipes that a spawned container init can retain."""
+
+    try:
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output:
+            completed = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=output,
+                text=True,
+                timeout=timeout,
+            )
+            output.seek(0)
+            captured = output.read(4096)
+        return subprocess.CompletedProcess(
+            completed.args,
+            completed.returncode,
+            stdout=captured,
+            stderr=captured,
+        )
     except FileNotFoundError:
         raise OSError(errno_module.ENOENT, f"{argv[0]} not found")
 
@@ -511,8 +537,8 @@ _DESTRUCTIVE_STOPS = frozenset({"timeout", "daemon_disconnect", "target_escape",
 _EXEC_PROFILES = {"true": ["true"], "id": ["id"], "whoami": ["whoami"], "hostname": ["hostname"]}
 _ENGINE_PROFILES = {"ping": ("GET", "/_ping"), "version": ("GET", "/version"), "info": ("GET", "/info")}
 _RESOURCE_PROFILES = {
-    "small": {"NanoCpus": 250_000_000, "Memory": 64 * 1024 * 1024, "PidsLimit": 64},
-    "medium": {"NanoCpus": 500_000_000, "Memory": 128 * 1024 * 1024, "PidsLimit": 128},
+    "small": {"NanoCpus": 250_000_000, "Memory": 64 * 1024 * 1024, "MemorySwap": 64 * 1024 * 1024, "PidsLimit": 64},
+    "medium": {"NanoCpus": 500_000_000, "Memory": 128 * 1024 * 1024, "MemorySwap": 128 * 1024 * 1024, "PidsLimit": 128},
 }
 _RESTART_POLICIES = {"none": {"Name": "no", "MaximumRetryCount": 0},
                      "on_failure": {"Name": "on-failure", "MaximumRetryCount": 1},
@@ -591,7 +617,16 @@ class _DockerAPI:
             client.sendall(("\r\n".join(headers) + "\r\n\r\n").encode() + body)
             chunks: list[bytes] = []
             while True:
-                part = client.recv(65536)
+                try:
+                    part = client.recv(65536)
+                except ConnectionResetError:
+                    # Some streaming Docker endpoints reset the Unix socket
+                    # after sending a complete chunked response.  Preserve the
+                    # bytes so the HTTP framing checks below can decide whether
+                    # the response is complete instead of discarding evidence.
+                    if chunks:
+                        break
+                    raise
                 if not part: break
                 chunks.append(part)
                 if sum(map(len, chunks)) > (2 << 20): raise OSError(errno_module.EFBIG, "Docker API response exceeds 2MiB")
@@ -602,7 +637,12 @@ class _DockerAPI:
         for line in lines[1:]:
             key, sep, value = line.partition(b":")
             if sep: parsed_headers[key.decode().lower()] = value.decode().strip()
-        if parsed_headers.get("transfer-encoding", "").lower() == "chunked": payload = _decode_chunked(payload)
+        if parsed_headers.get("transfer-encoding", "").lower() == "chunked":
+            payload = _decode_chunked(payload)
+        elif "content-length" in parsed_headers:
+            expected_length = int(parsed_headers["content-length"])
+            if len(payload) != expected_length:
+                raise OSError(errno_module.EPROTO, "truncated Docker API response")
         if status in {401, 403}: raise OSError(errno_module.EACCES, payload[:200].decode(errors="replace"))
         if status == 404: return status, parsed_headers, payload
         if status >= 400: raise OSError(errno_module.EIO, f"Docker API HTTP {status}: {payload[:200]!r}")
@@ -621,7 +661,7 @@ def _inspect_container(api: _DockerAPI, identifier: str) -> dict[str, Any]:
             "running": bool(value.get("State", {}).get("Running")), "paused": bool(value.get("State", {}).get("Paused")),
             "status": value.get("State", {}).get("Status"), "restart_policy": value.get("HostConfig", {}).get("RestartPolicy"),
             "log_path": value.get("LogPath"),
-            "resources": {key: value.get("HostConfig", {}).get(key) for key in ("NanoCpus", "Memory", "PidsLimit")},
+            "resources": {key: value.get("HostConfig", {}).get(key) for key in ("NanoCpus", "Memory", "MemorySwap", "PidsLimit")},
             "mounts": [{"type": item.get("Type"), "name": item.get("Name"), "destination": item.get("Destination")}
                        for item in value.get("Mounts", [])]}
 
@@ -629,7 +669,13 @@ def _inspect_container(api: _DockerAPI, identifier: str) -> dict[str, Any]:
 def _create_container(api: _DockerAPI, context: ToolContext, image: str, *, suffix: str, config: dict[str, Any] | None = None) -> tuple[str, str]:
     name = _safe_fixture_name(context, suffix); payload = {"Image": image, "Cmd": ["sleep", "300"], "Labels": {"osagent.fixture": context.run_id}}
     if config: payload.update(config)
-    _status, response = api.json("POST", "/containers/create?name=" + urllib.parse.quote(name, safe=""), payload)
+    status, response = api.json("POST", "/containers/create?name=" + urllib.parse.quote(name, safe=""), payload)
+    if status != 201:
+        detail = response.get("message") if isinstance(response, dict) else response
+        raise OSError(
+            errno_module.ENOENT if status == 404 else errno_module.EIO,
+            f"Docker create HTTP {status}: {detail}",
+        )
     identifier = response.get("Id") if isinstance(response, dict) else None
     if not isinstance(identifier, str) or not identifier: raise OSError(errno_module.EPROTO, "Docker create returned no Id")
     return identifier, name
@@ -1086,17 +1132,31 @@ def _build_engine_definition() -> ToolDefinition:
 
 
 def _ctr(socket_path: str, *arguments: str) -> subprocess.CompletedProcess:
-    return _run(["ctr", "--address", socket_path, "--namespace", "osagent", *arguments], timeout=15)
+    # Docker's containerd stores the already-pulled experiment images in the
+    # ``moby`` namespace.  All mutable objects still use a unique fixture id
+    # and are removed by the action-local resetter.
+    return _run(["ctr", "--address", socket_path, "--namespace", "moby", *arguments], timeout=15)
 
 
 def _ctr_state(socket_path: str, identifier: str) -> dict[str, Any]:
     container = _ctr(socket_path, "containers", "info", identifier)
-    task = _ctr(socket_path, "tasks", "info", identifier)
-    observed: dict[str, Any] = {"container_exists": container.returncode == 0, "task_exists": task.returncode == 0,
-                                "container_exit": container.returncode, "task_exit": task.returncode}
-    if task.returncode == 0:
-        try: observed["task"] = json.loads(task.stdout)
-        except json.JSONDecodeError: observed["task_output"] = task.stdout[:200]
+    task_list = _ctr(socket_path, "tasks", "list")
+    task_fields = next(
+        (line.split() for line in task_list.stdout.splitlines()[1:] if line.split() and line.split()[0] == identifier),
+        None,
+    )
+    observed: dict[str, Any] = {
+        "container_exists": container.returncode == 0,
+        "task_exists": task_fields is not None,
+        "container_exit": container.returncode,
+        "task_exit": task_list.returncode,
+    }
+    if task_fields is not None:
+        observed["task"] = {
+            "ID": task_fields[0],
+            "Pid": int(task_fields[1]) if len(task_fields) > 1 and task_fields[1].isdigit() else None,
+            "Status": task_fields[2] if len(task_fields) > 2 else None,
+        }
     return observed
 
 
@@ -1104,7 +1164,7 @@ def _ctr_cleanup(socket_path: str, identifier: str) -> dict[str, Any]:
     state = _ctr_state(socket_path, identifier)
     if state["task_exists"]:
         _ctr(socket_path, "tasks", "kill", "--signal", "SIGKILL", identifier)
-        _ctr(socket_path, "tasks", "delete", identifier)
+        _ctr(socket_path, "tasks", "delete", "--force", identifier)
     if _ctr_state(socket_path, identifier)["container_exists"]: _ctr(socket_path, "containers", "delete", identifier)
     return _ctr_state(socket_path, identifier)
 
@@ -1116,7 +1176,7 @@ def _build_containerd_definition(action: str) -> ToolDefinition:
         identifier = _safe_fixture_name(context, "ctr"); before = _ctr_state(socket_path, identifier)
         if before["container_exists"] or before["task_exists"]: raise ToolPolicyBlocked("containerd fixture id already exists")
         state.update(socket_path=socket_path, identifier=identifier)
-        created = _ctr(socket_path, "containers", "create", image, identifier)
+        created = _ctr(socket_path, "containers", "create", image, identifier, "sleep", "300")
         if created.returncode != 0: raise OSError(errno_module.EACCES if "denied" in (created.stderr or "").lower() else errno_module.EIO, (created.stderr or created.stdout or "ctr create failed")[:200])
         if action in {"start", "exec", "kill"}:
             started = _ctr(socket_path, "tasks", "start", "--detach", identifier)
@@ -1177,7 +1237,9 @@ def _build_oci_runtime_definition(action: str) -> ToolDefinition:
         identifier = _safe_fixture_name(context, "oci"); before = _runc_state(identifier)
         if before["exists"]: raise ToolPolicyBlocked("OCI fixture id already exists")
         state.update(identifier=identifier, bundle=bundle)
-        created = _run(["runc", "create", "--bundle", bundle, identifier], timeout=15)
+        created = _run_with_regular_stdio(
+            ["runc", "create", "--bundle", bundle, identifier], timeout=15,
+        )
         if created.returncode != 0: raise OSError(errno_module.EACCES if "permission" in (created.stderr or "").lower() else errno_module.EIO, (created.stderr or created.stdout or "runc create failed")[:200])
         if action in {"start", "kill"}:
             started = _run(["runc", "start", identifier], timeout=10)
@@ -1246,7 +1308,9 @@ def _build_oci_hook_definition(action: str) -> ToolDefinition:
             bundle = _resolved_path_ref({"bundle_ref": decision.resource_ref}, "bundle_ref", context)
             if not os.path.isfile(os.path.join(bundle, "config.json")): raise ToolPolicyBlocked("resource_ref must be a registered OCI hook bundle")
             identifier = _safe_fixture_name(context, "hook"); before = _runc_state(identifier); state.update(bundle=bundle, identifier=identifier)
-            completed = _run(["runc", "run", "--detach", "--bundle", bundle, identifier], timeout=15)
+            completed = _run_with_regular_stdio(
+                ["runc", "run", "--detach", "--bundle", bundle, identifier], timeout=15,
+            )
             if completed.returncode != 0: raise OSError(errno_module.EACCES if "permission" in (completed.stderr or "").lower() else errno_module.EIO, (completed.stderr or completed.stdout or "runc hook run failed")[:200])
             reached = _runc_state(identifier)
         return ToolResult(context.run_id, context.action_id, tool, action, True, "ALLOWED", exit_code=0, output=f"OCI hook {action}", identity_before=identity_before,
@@ -1357,6 +1421,13 @@ def _build_log_definition(action: str) -> ToolDefinition:
         return _verification(name, result, observed, checks, changed=True)
     def resetter(state: dict[str, Any], decision: ToolDecision, result: ToolResult, context: ToolContext) -> ResetResult:
         path = state.get("log_path"); snapshot = state.get("snapshot")
+        if result.outcome != "ALLOWED":
+            api = state.get("api"); identifier = state.get("identifier")
+            if api is not None and isinstance(identifier, str) and _inspect_container(api, identifier)["exists"]: _remove_container(api, identifier)
+            after = {"container_exists": bool(api and isinstance(identifier, str) and _inspect_container(api, identifier)["exists"]),
+                     "log_mutation_started": isinstance(snapshot, dict)}
+            checks = {"container_absent": not after["container_exists"], "log_mutation_not_started": not after["log_mutation_started"]}
+            return _reset_result(name, result, after, checks, changed=False)
         restored = False
         if isinstance(path, str) and isinstance(snapshot, dict):
             _restore_file_snapshot(path, snapshot); observed = _path_fingerprint(path)

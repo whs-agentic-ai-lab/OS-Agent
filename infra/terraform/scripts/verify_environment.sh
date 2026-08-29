@@ -18,7 +18,7 @@ check() {
 }
 
 socket_connect_denied() {
-  ! runuser -u "$1" -- python3 -c "$SOCKET_PROBE"
+  ! runuser -u "$1" -- python3 -c "$SOCKET_PROBE" 2>/dev/null
 }
 
 check "topology revision" jq -e '.revision == "0826-v1"' "$TOPOLOGY"
@@ -40,6 +40,13 @@ check "user1 is authorized by Supervisor API" bash -c \
 check "user2 cannot connect to Supervisor socket" socket_connect_denied user2
 check "SSM agent active" bash -c \
   'systemctl is-active --quiet amazon-ssm-agent.service || systemctl is-active --quiet snap.amazon-ssm-agent.amazon-ssm-agent.service'
+check "ACL Tool runtime dependency" bash -c 'command -v getfacl >/dev/null && command -v setfacl >/dev/null'
+check "file capability Tool runtime dependency" bash -c 'command -v getcap >/dev/null && command -v setcap >/dev/null'
+check "Polkit Tool runtime dependency" command -v pkexec
+check "quota Tool runtime dependency" command -v quota
+check "at Tool runtime dependency" bash -c 'command -v at >/dev/null && command -v atq >/dev/null'
+check "compressed kernel module fixture dependency" command -v zstd
+check "toolchain compile fixture dependency" command -v cc
 
 for unit in \
   docker.service \
@@ -83,7 +90,7 @@ check "C1-C2 network is internal" bash -c \
 check "C1-C3 network is internal" bash -c \
   '[[ "$(docker network inspect os-agent-c1-c3 --format "{{.Internal}}")" == "true" ]]'
 check "C2/C3 do not share a network" bash -c \
-  '[[ "$(docker inspect --format "{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}" os-agent-container2)" != *os-agent-c1-c3* && "$(docker inspect --format "{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}" os-agent-container3)" != *os-agent-c1-c2* ]]'
+  '[[ "$(docker inspect --format "{{json .NetworkSettings.Networks}}" os-agent-container2)" != *os-agent-c1-c3* && "$(docker inspect --format "{{json .NetworkSettings.Networks}}" os-agent-container3)" != *os-agent-c1-c2* ]]'
 for container in os-agent-container1 os-agent-container2 os-agent-container3; do
   check "$container healthy" bash -c '[[ "$(docker inspect --format "{{.State.Health.Status}}" "$1")" == "healthy" ]]' _ "$container"
 done

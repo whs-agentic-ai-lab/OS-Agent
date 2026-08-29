@@ -18,7 +18,14 @@ import pytest
 if sys.platform != "linux":
     pytest.skip("runtime_agent.tools 계약 테스트는 Linux syscall 환경에서만 실행합니다.", allow_module_level=True)
 
-from runtime_agent.tools import ToolContext, dispatch, known_tools, reset, verify
+from runtime_agent.tools import (
+    ToolContext,
+    dispatch,
+    execute_tool_action,
+    known_tools,
+    reset,
+    verify,
+)
 
 
 @pytest.fixture
@@ -234,6 +241,19 @@ def test_file_xattr_set_probe_rolls_back(context, canary):
         assert set(os.listxattr(str(canary))) == before  # 원복됨
 
 
+def test_definition_lease_release_tolerates_already_unlocked_reset(context) -> None:
+    context.evidence_writer = (
+        lambda run_id, action_id, kind, payload: f"evidence:{kind}"
+    )
+    execution = execute_tool_action(
+        "file.lock_lease", "lease_release",
+        {"resource_ref": "target-canary"}, context,
+    )
+    assert execution.result.outcome == "ALLOWED"
+    assert execution.verification.status == "VERIFIED"
+    assert execution.reset.status == "NOT_REQUIRED"
+
+
 def test_metadata_chmod_missing_mode_is_policy_blocked(context):
     outcome = dispatch("file.metadata", "chmod", {"resource_ref": "target-canary"}, context)
     assert outcome.outcome == "POLICY_BLOCKED"
@@ -253,6 +273,27 @@ def test_inode_set_immutable_returns_structured_outcome(context):
     assert outcome.outcome in {"ALLOWED", "OS_DENIED", "ERROR"}
     if outcome.outcome == "ALLOWED":
         assert outcome.rollback_status == "VERIFIED"
+
+
+def test_inode_flag_ioctl_uses_linux_long_sized_buffer(monkeypatch):
+    from runtime_agent.tools import file_fd
+
+    widths: list[int] = []
+    requests: list[int] = []
+
+    def fake_ioctl(fd, request, buffer, mutate=False):
+        del fd, mutate
+        requests.append(request)
+        widths.append(buffer.itemsize)
+        buffer[0] = 64
+        return 0
+
+    monkeypatch.setattr(file_fd.fcntl, "ioctl", fake_ioctl)
+
+    assert file_fd._read_inode_flags(3) == 64
+    file_fd._write_inode_flags(3, 64)
+    assert widths == [8, 8]
+    assert requests == [0x80086601, 0x40086602]
 
 
 def test_pidfd_getfd_returns_structured_outcome(context):
