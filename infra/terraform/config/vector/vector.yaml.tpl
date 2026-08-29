@@ -23,6 +23,7 @@ sources:
       - os-agent-experiment.service
       - os-agent-docker-events.service
       - os-agent-docker-logs.service
+      - vector.service
       - init.scope
 
   auditd:
@@ -35,7 +36,6 @@ sources:
     read_from: beginning
     max_line_bytes: 262144
     offset_key: file_offset
-    rotate_wait_secs: 30
 
   docker_events:
     type: file
@@ -44,7 +44,6 @@ sources:
     read_from: beginning
     max_line_bytes: 262144
     offset_key: file_offset
-    rotate_wait_secs: 30
 
   docker_logs:
     type: file
@@ -53,7 +52,6 @@ sources:
     read_from: beginning
     max_line_bytes: 262144
     offset_key: file_offset
-    rotate_wait_secs: 30
 
   executor_events:
     type: file
@@ -62,7 +60,6 @@ sources:
     read_from: beginning
     max_line_bytes: 262144
     offset_key: file_offset
-    rotate_wait_secs: 30
 
   state_events:
     type: file
@@ -71,7 +68,6 @@ sources:
     read_from: beginning
     max_line_bytes: 262144
     offset_key: file_offset
-    rotate_wait_secs: 30
 
 transforms:
   tag_journal:

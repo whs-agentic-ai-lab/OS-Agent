@@ -75,8 +75,14 @@ vector_extract_dir="$(mktemp -d)"
 curl --proto '=https' --tlsv1.2 --retry 6 --retry-all-errors -fsSL "${vector_archive_url}" -o "$vector_archive"
 printf '%s  %s\n' "${vector_archive_sha256}" "$vector_archive" | sha256sum --check --strict
 tar -xzf "$vector_archive" -C "$vector_extract_dir" --strip-components=2
-vector_binary="$(find "$vector_extract_dir" -maxdepth 3 -type f -name vector -print -quit)"
-[[ -n "$vector_binary" ]] || { echo "Vector archive does not contain the vector binary" >&2; exit 1; }
+vector_binary=""
+while IFS= read -r candidate; do
+  if "$candidate" --version 2>/dev/null | grep -Fq "vector ${vector_version}"; then
+    vector_binary="$candidate"
+    break
+  fi
+done < <(find "$vector_extract_dir" -maxdepth 3 -type f -name vector -perm -u+x -print)
+[[ -n "$vector_binary" ]] || { echo "Vector archive does not contain the expected executable" >&2; exit 1; }
 install -o root -g root -m 0755 "$vector_binary" /usr/local/bin/vector
 rm -rf -- "$vector_archive" "$vector_extract_dir"
 
@@ -164,6 +170,7 @@ OS_AGENT_RUNTIME_IMAGE=${runtime_image_uri}
 OS_AGENT_HOST_USER1=user1
 OS_AGENT_HOST_USER2=user2
 OS_AGENT_SUPERVISOR_SOCKET=/run/os-agent/host-supervisor.sock
+OS_AGENT_EVIDENCE_REQUIRED=true
 ENVIRONMENT_EOF
 chown root:root /etc/os-agent/environment
 chmod 0644 /etc/os-agent/environment

@@ -4,6 +4,10 @@ set -Eeuo pipefail
 readonly TOPOLOGY=/etc/os-agent/topology.json
 readonly EXPECTED_CONTAINERS=$'os-agent-container1\nos-agent-container2\nos-agent-container3'
 readonly SOCKET_PROBE='import socket; s = socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect("/run/os-agent/host-supervisor.sock"); s.close()'
+readonly COLLECTOR_INPUT=/var/log/os-agent/state-captures.ndjson
+readonly COLLECTOR_OUTPUT=/var/lib/os-agent/evidence/collected/events.ndjson
+readonly COLLECTOR_TEST_MESSAGE=vector-end-to-end-self-test
+readonly COLLECTOR_TEST_ID="collector-self-test-$(tr -d '\r\n' </proc/sys/kernel/random/boot_id)"
 
 failures=0
 check() {
@@ -19,6 +23,42 @@ check() {
 
 socket_connect_denied() {
   ! runuser -u "$1" -- python3 -c "$SOCKET_PROBE"
+}
+
+collector_event_arrived() {
+  if jq -e \
+    --arg event_id "$COLLECTOR_TEST_ID" \
+    --arg message "$COLLECTOR_TEST_MESSAGE" \
+    'select(.event_id == $event_id and .message == $message)' \
+    "$COLLECTOR_OUTPUT" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! grep -Fq '"event_id":"'"$COLLECTOR_TEST_ID"'"' "$COLLECTOR_INPUT"; then
+    jq -cn \
+      --arg event_id "$COLLECTOR_TEST_ID" \
+      --arg occurred_at "$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" \
+      --arg message "$COLLECTOR_TEST_MESSAGE" \
+      '{
+        event_id: $event_id,
+        occurred_at: $occurred_at,
+        source: "collector-self-test",
+        event_type: "COLLECTOR_SELF_TEST",
+        message: $message
+      }' >>"$COLLECTOR_INPUT"
+  fi
+
+  for _ in {1..100}; do
+    if jq -e \
+      --arg event_id "$COLLECTOR_TEST_ID" \
+      --arg message "$COLLECTOR_TEST_MESSAGE" \
+      'select(.event_id == $event_id and .message == $message)' \
+      "$COLLECTOR_OUTPUT" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
 }
 
 check "topology revision" jq -e '.revision == "0826-v1"' "$TOPOLOGY"
@@ -99,6 +139,7 @@ check "Vector audit access" sudo -u vector test -r /var/log/audit/audit.log
 check "Vector Docker event access" sudo -u vector test -r /var/log/os-agent/docker-events.ndjson
 check "Vector Docker log access" sudo -u vector test -r /var/log/os-agent/docker-logs.ndjson
 check "local evidence sink writable" sudo -u vector test -w /var/lib/os-agent/evidence/collected
+check "Vector end-to-end event delivery and message preservation" collector_event_arrived
 
 if ((failures > 0)); then
   printf '%d environment checks failed\n' "$failures" >&2

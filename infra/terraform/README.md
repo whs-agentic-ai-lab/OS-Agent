@@ -160,11 +160,11 @@ sudo /opt/os-agent/scripts/capture_state.sh \
   <run_id> <action_id> <path_id> <before|after> <U1|U2|C1|C2|C3>
 ```
 
-Terraform은 이 스크립트를 설치하지만 action lifecycle에서 호출하는 것은 Supervisor
-애플리케이션의 책임이다.
+Terraform은 이 스크립트를 설치하고 Host Supervisor는 `/v2/runs` action lifecycle에서
+실행 직전과 직후에 각각 `before`/`after` 캡처를 호출한다.
 
 Supervisor/runtime은 모든 tool 요청에 동일한 `run_id`, `action_id`, `path_id`를 싣고,
-실제 명령, stdout, stderr, 종료 코드를 NDJSON event로 남겨야 한다. 원격 sink를 켜면
+Host Supervisor가 실제 실행 결과, stdout/stderr, 종료 코드를 executor NDJSON event로 남긴다. 원격 sink를 켜면
 FastAPI가 이 event를 검증해 Supabase Evidence Store에 idempotent하게 적재해야 한다.
 NDJSON writer는 rotation 후 새 파일을 따르도록 event마다 append-open해야 한다.
 

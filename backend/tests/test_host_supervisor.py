@@ -259,6 +259,79 @@ def test_runtime_payload_keeps_legacy_dispatch_stateless() -> None:
     assert normalized["preserve_state"] is False
 
 
+def test_capture_state_uses_fixed_action_path_contract(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(command: list[str], *, timeout_seconds: float = 8, **_kwargs):
+        captured["command"] = command
+        captured["timeout_seconds"] = timeout_seconds
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(host_supervisor, "EVIDENCE_REQUIRED", True)
+    monkeypatch.setattr(host_supervisor, "_run", fake_run)
+
+    host_supervisor._capture_state(
+        {
+            "run_id": "harness-aaaaaaaaaaaa",
+            "action_id": "action-aaaaaaaaaaaa",
+            "source_environment": "c1",
+            "target_environment": "c2",
+        },
+        "before",
+    )
+
+    assert captured["command"] == [
+        str(host_supervisor.STATE_CAPTURE_SCRIPT),
+        "harness-aaaaaaaaaaaa",
+        "action-aaaaaaaaaaaa",
+        "C1C2",
+        "before",
+        "C2",
+    ]
+    assert captured["timeout_seconds"] == 30
+
+
+def test_executor_event_is_vector_readable_ndjson(monkeypatch, tmp_path) -> None:
+    event_root = tmp_path / "executor"
+    monkeypatch.setattr(host_supervisor, "EVIDENCE_REQUIRED", True)
+    monkeypatch.setattr(host_supervisor, "EXECUTOR_EVENT_ROOT", event_root)
+    monkeypatch.setattr(
+        host_supervisor.grp,
+        "getgrnam",
+        lambda _name: types.SimpleNamespace(gr_gid=21020),
+        raising=False,
+    )
+    monkeypatch.setattr(host_supervisor.os, "chown", lambda *_args: None, raising=False)
+    monkeypatch.setattr(host_supervisor.os, "fchmod", lambda *_args: None, raising=False)
+    monkeypatch.setattr(host_supervisor.os, "fchown", lambda *_args: None, raising=False)
+
+    host_supervisor._append_executor_event(
+        {
+            "run_id": "harness-aaaaaaaaaaaa",
+            "action_id": "action-aaaaaaaaaaaa",
+            "subject_mode": "container",
+            "trust_boundary_id": "TB-CC-C1C2",
+            "source_environment": "c1",
+            "target_environment": "c2",
+            "tool_decision": {
+                "name": "file.content",
+                "action": "read",
+                "resource_ref": "target-canary",
+            },
+        },
+        started_at="2026-08-30T00:00:00.000000Z",
+        completed_at="2026-08-30T00:00:00.100000Z",
+        result={"runtime_result": "allowed", "exit_code": 0, "output": "content"},
+    )
+
+    event = json.loads((event_root / "C1.ndjson").read_text(encoding="utf-8"))
+    assert event["path_id"] == "C1C2"
+    assert event["message"] == "content"
+    assert event["stdout"] == "content"
+    assert event["stderr"] == ""
+    assert event["event_type"] == "EXECUTOR_ACTION_COMPLETED"
+
+
 def test_container_runtime_keeps_stdin_open_for_dispatch_payload(
     monkeypatch,
     tmp_path,
