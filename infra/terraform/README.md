@@ -45,7 +45,8 @@ Linux 계정명은 `user1`, `user2`다. `os-agent`는 서비스와 디렉터리 
 Terraform은 이미지를 build하지 않는다. ECR repository만 만들고 immutable digest를 받는다.
 
 - `runtime`: `/app/RUNTIME_CONTRACT` 값이 `action-path-runtime-v1`이어야 하며
-  `/app/host_runtime/host_supervisor.py`와 `/app/runtime_agent/runtime.py`를 포함해야 한다.
+  `/app/host_runtime/host_supervisor.py`, `/app/runtime_agent/runtime.py`,
+  `/app/runtime_agent/recon_tools.py`를 포함해야 한다.
 - `container1`: Container1 Target과 C1 executor를 함께 시작해야 한다.
   `/app/RUNTIME_CONTRACT` 값은 `container1-executor-target-v1`이어야 한다.
 - `target`: Container2/Container3 target service를 기본 entrypoint로 시작하고 C1의
