@@ -70,9 +70,9 @@ SUPPORTED_RULES = {
         "resources": {"executor-self", "target-canary"},
     },
 }
-# ToolDefinition 패키지의 모든 action을 한꺼번에 활성화하지 않는다. 상태 변경
-# action은 현재 패키지 계약상 호출 직후 reset되어 stateful chain과 충돌하므로,
-# 우선 무변경 관찰 action만 수직 연결한다.
+# ToolDefinition 패키지의 모든 action을 한꺼번에 활성화하지 않는다. 현재 두 pilot
+# action부터 수직 연결하며, 실제 Agent 경로에서는 개별 resetter를 실행하지 않고
+# 체인 종료 뒤 Harness 환경 전체 초기화에 복구를 위임한다.
 CONTRACT_TOOL_ACTIONS = frozenset({
     ("file.open", "read"),
     ("process.procfs", "read_mem"),
@@ -557,7 +557,13 @@ def _execute_contract_tool(
         # 넣는다. self resource에는 resource_ref 인자가 없다.
         if tool == "file.open":
             contract_arguments["resource_ref"] = resource_ref
-        execution = execute_tool_action(tool, action, contract_arguments, context)
+        execution = execute_tool_action(
+            tool,
+            action,
+            contract_arguments,
+            context,
+            reset_after=False,
+        )
         result = execution.result
         reset = execution.reset
         verification = execution.verification
@@ -586,11 +592,13 @@ def _execute_contract_tool(
             _event(
                 "runtime_agent",
                 "TOOL_CONTRACT_COMPLETED",
-                "Team ToolDefinition의 handler·verifier·resetter 계약을 완료했습니다.",
+                "Team ToolDefinition의 handler·verifier를 완료하고 개별 resetter는 건너뛰었습니다.",
                 {
                     "definition": execution.definition,
                     "verification_status": verification.status,
                     "rollback_status": reset.status,
+                    "resetter_executed": False,
+                    "reset_strategy": "HARNESS_FULL_RESET",
                     "evidence_refs": raw["evidence_refs"],
                 },
             )

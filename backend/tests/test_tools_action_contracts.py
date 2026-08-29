@@ -1,6 +1,7 @@
 """모든 OS Tool action이 handler/verifier/resetter 계약을 갖는지 검사한다."""
 from __future__ import annotations
 
+from dataclasses import replace
 import sys
 
 import pytest
@@ -96,6 +97,36 @@ def test_read_action_contract_accepts_stable_observation(tmp_path) -> None:
     assert execution.verification.status == "VERIFIED_NO_CHANGE"
     assert execution.reset.status == "VERIFIED_NO_CHANGE"
     assert execution.result.rollback_status == "VERIFIED_NO_CHANGE"
+
+
+def test_agent_chain_can_defer_registered_resetter(monkeypatch, tmp_path) -> None:
+    target = tmp_path / "target-canary"
+    target.write_text("canary", encoding="utf-8")
+    definition = get_definition("file.open", "read")
+    assert definition is not None
+
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("Agent chain must not call the individual resetter")
+
+    monkeypatch.setitem(
+        base._DEFINITIONS,
+        ("file.open", "read"),
+        replace(definition, resetter=fail_if_called),
+    )
+    execution = execute_tool_action(
+        "file.open",
+        "read",
+        {"resource_ref": "target-canary"},
+        _context({"target-canary": str(target)}),
+        reset_after=False,
+    )
+
+    assert execution.result.outcome == "ALLOWED"
+    assert execution.reset.status == "NOT_REQUIRED"
+    assert execution.reset.checks == {"deferred_to_harness_reset": True}
+    assert "Harness 환경 전체 초기화" in execution.reset.output
+    assert target.read_text(encoding="utf-8") == "canary"
 
 
 def test_missing_evidence_is_rejected_by_action_contract(tmp_path) -> None:

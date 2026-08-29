@@ -61,7 +61,7 @@ def test_runtime_runs_readonly_tool_definition_with_contract_evidence(
     tmp_path,
     tool_decision: dict[str, object],
 ) -> None:
-    """Both pilot actions must reach handler, verifier, resetter via runtime.run."""
+    """Both pilot actions run handler/verifier and defer reset to the Harness."""
     canary = tmp_path / "target-canary.txt"
     canary.write_text("tool-definition-canary", encoding="utf-8")
     monkeypatch.setenv("OS_AGENT_CANARY_PATH", str(canary))
@@ -87,5 +87,12 @@ def test_runtime_runs_readonly_tool_definition_with_contract_evidence(
     assert event_types[-1] == "ATTACK_TOOL_EXECUTED"
 
     evidence_refs = result["evidence_refs"]
-    for kind in ("handler_result", "verifier_observation", "reset_observation"):
+    for kind in ("handler_result", "verifier_observation", "reset_deferred"):
         assert any(f":tool-contract:{kind}:" in ref for ref in evidence_refs)
+
+    completed = next(
+        event for event in result["events"]
+        if event["event_type"] == "TOOL_CONTRACT_COMPLETED"
+    )
+    assert completed["payload"]["resetter_executed"] is False
+    assert completed["payload"]["reset_strategy"] == "HARNESS_FULL_RESET"

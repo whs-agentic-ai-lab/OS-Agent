@@ -853,12 +853,14 @@ def execute_definition(
     context: ToolContext,
     *,
     state: DefinitionState | None = None,
+    reset_after: bool = True,
 ) -> ToolExecution:
-    """완전한 action 계약을 정책→실행→독립 검증→복구 순서로 실행한다.
+    """완전한 action 계약을 정책→실행→독립 검증 순서로 실행한다.
 
-    Verifier가 REJECTED여도 resetter는 반드시 실행한다. resetter가 FAILED이거나
-    상태 변경 action이 복구를 증명하지 못하면 RunGuard를 abort하여 다음 action을
-    차단하고 Harness abort_handler를 호출한다.
+    ``reset_after=True``는 Tool 단위 테스트와 독립 실행을 위한 기존 동작으로,
+    verifier 뒤에 등록된 resetter까지 실행한다. 실제 Agent 체인은
+    ``reset_after=False``를 사용해 변경 상태를 다음 Tool에 누적하고, 체인 종료 뒤
+    Harness가 환경 전체를 한 번 초기화한다. resetter 구현 자체는 계약에 보존한다.
     """
     definition = _DEFINITIONS.get((tool_id, action))
     if definition is None:
@@ -961,7 +963,9 @@ def execute_definition(
         raise ToolContractError(f"{definition.name} handler는 ToolResult를 반환해야 합니다.")
     _validate_tool_result(definition, result, context)
 
-    # Evidence 저장 실패가 발생해도 변경 상태를 남기지 않도록 resetter까지 진행한다.
+    # Tool 단위 실행에서는 Evidence 실패 뒤에도 resetter까지 진행한다. Agent 체인은
+    # 상태를 누적해야 하므로 Evidence 실패 여부와 관계없이 Harness 전체 초기화에
+    # 복구를 위임한다.
     evidence_errors: list[str] = []
     try:
         handler_ref = context.record_evidence("handler_result", result.to_dict())
@@ -982,7 +986,7 @@ def execute_definition(
             raise ToolContractError(
                 f"{definition.name} attempted action의 verifier가 실행되지 않았습니다."
             )
-    except Exception as exc:  # resetter는 verifier 오류에도 반드시 실행해야 한다.
+    except Exception as exc:
         verification = VerificationResult(
             verifier=f"{definition.name}.verifier",
             status="REJECTED",
@@ -1004,6 +1008,42 @@ def execute_definition(
         evidence_errors.append(f"verifier evidence: {exc}")
         verification.status = "REJECTED"
         verification.checks["evidence_recorded"] = False
+
+    if not reset_after:
+        identity_after = identity_snapshot()
+        reset_result = ResetResult(
+            resetter=f"{definition.name}.resetter",
+            status="NOT_REQUIRED",
+            identity_after=identity_after,
+            state_after=dict(verification.observed),
+            checks={"deferred_to_harness_reset": True},
+            output=(
+                "개별 resetter를 실행하지 않았습니다. "
+                "Agent 체인 종료 후 Harness 환경 전체 초기화가 수행됩니다."
+            ),
+        )
+        try:
+            reset_ref = context.record_evidence(
+                "reset_deferred",
+                {
+                    "resetter": reset_result.resetter,
+                    "executed": False,
+                    "strategy": "HARNESS_FULL_RESET",
+                    "state_preserved_for_next_tool": True,
+                },
+            )
+            reset_result.evidence_refs.append(reset_ref)
+        except Exception as exc:
+            evidence_errors.append(f"reset deferred evidence: {exc}")
+
+        result.identity_after = identity_after
+        result.state_after = dict(verification.observed)
+        result.rollback_status = "NOT_REQUIRED"
+        result.evidence_refs.extend(verification.evidence_refs)
+        result.evidence_refs.extend(reset_result.evidence_refs)
+        if evidence_errors:
+            result.output = "; ".join(filter(None, [result.output, *evidence_errors]))
+        return ToolExecution(definition.name, result, verification, reset_result)
 
     try:
         reset_result = definition.resetter(
