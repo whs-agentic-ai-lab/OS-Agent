@@ -23,8 +23,8 @@ os-Agent-test/
 - 시작 Executor: Host Executor=`U1`, Container Executor=`C1`이며 공통 실행 잠금으로 한 Trial에는 반드시 하나만 활성화
 - 환경 TB: `U1→U2`, `U1→C1/C2/C3`, `C1→U1/U2`, `C1→C2/C3`의 8개 방향
 - 경계별 권한 시험: 세 OFF/ON 값을 하나의 `permission_profile` 묶음으로 적용
-- AgentRun 의미: Host·Container 전체 권한 프로파일 1쌍 + 고정 `profile_hash` + 8개 TB 전체 실행·판정 = `run_id` 1개
-- Agent Orchestrator: `Recon → Infrastructure → Analyze → TB별 Plan → Policy Gate → Execute → Verify → Rollback → Worst case` 순서로 동작
+- AgentRun 의미: 등록 권한 자동 최대화 + 8개 TB 실행·판정 + Attack Contract + 1-minimal 권한 검증 = `run_id` 1개
+- Agent Orchestrator: `권한 수집·최대화 → Recon → 상태 기반 다음 Tool 선택·실행 반복 → 체인 검증·1회 Rollback → 피해 점수 비교 → 전체 Attack Chain 고정 → 권한 축소 재현` 순서로 동작
 - TB 판정: 경계마다 `BROKEN`, `BLOCKED`, `INCONCLUSIVE`와 L0~L4 증명 수준, 증거 참조, 복구 상태를 독립 기록
 - Agent Tool 카탈로그: 설계된 129개 family와 최소 action enum을 `/api/options`에 동일하게 제공하며 실제 구현 여부를 `implemented`/`implemented_actions`로 구분
 - 현재 실제 Tool: `file.content`, `privilege.identity_probe`, `privilege.no_new_privs_probe`, `process.procfs`, `sudo.run`
@@ -47,19 +47,23 @@ os-Agent-test/
 
 대시보드의 주 실험 진입점은 `POST /api/remote/agent-runs`다. 로컬 백엔드는 SSM으로 EC2의 `POST /api/agent-runs`를 호출하고, Host·Container 두 Executor를 한 Run 안에서 순차 잠금해 8개 TB를 모두 시험한다. 기존 `POST /api/runs`는 단일 TB 로그와 호환 클라이언트를 위해 유지한다.
 
-- Host·Container 전체 권한 Profile을 시작 시 정규화하고 `profile_hash`로 고정
+Agent Orchestrator v5부터 실행 요청은 전체 실험 완료를 기다리지 않는다. `POST`는 저장된 `RECEIVED` 레코드와 `run_id`를 즉시 반환하고, 실제 실행은 Executor 잠금을 보유한 background worker가 이어서 수행한다. 대시보드는 `#/agent-runs/{run_id}?source=remote` 전용 화면에서 `/api/remote/agent-runs/{run_id}`를 1초 간격으로 조회한다. 일시적인 연결 오류에는 마지막 정상 스냅샷을 유지하고 자동 재연결하며, 완료·실패·복구까지 끝난 취소 상태에서만 자동 조회를 멈춘다.
+
+- 등록된 Host·Container control 전체를 공격에 유리한 방향으로 합치고 최대 권한 `profile_hash`를 고정 (`no_new_privileges` 같은 방어 통제는 OFF)
 - 읽기 전용 Recon으로 유효 UID/GID, capability, namespace, mount와 socket 상태를 확인
-- 8개 TB 각각에 구조화된 실행 계획을 만들고 Policy Gate를 통과한 Tool만 U1/C1 Executor에 전달
-- Control Backend가 위험별 Evidence를 판정하고 Supervisor가 각 TB 직후 Trial 상태를 Reset
-- 8개 결과 중 실제 `BROKEN`으로 검증된 최고 위험 경로만 `worst_case_scenario`로 확정
+- 8개 TB 각각에서 Agent가 최신 구조화 증거와 state fingerprint를 보고 다음 최적 Tool 하나를 동적으로 선택
+- 같은 TB의 Tool 사이에는 fixture 상태를 보존하고, 의미 기반 종료·오류·Watchdog 뒤 Supervisor가 시나리오 전체를 한 번만 Reset
+- Watchdog 중단은 안전 판정이 아니라 `INCONCLUSIVE`이며, 복구 검증 후 저장한 checkpoint의 Tool prefix를 replay해 `/resume`에서 이어서 탐색
+- L3/L4로 검증된 성공 결과를 피해 점수로 비교하고 최고 경로의 전체 Tool 순서·상태 fingerprint·Verifier·Rollback을 `attack_contract`로 고정
+- 별도 최소화 LLM은 허용된 권한 ID만 제안하며 profile/policy를 작성하지 않음. 프로그램이 고정된 전체 Attack Chain을 Tool 사이 Reset 없이 재실행하고 trial 끝에 한 번 복구해 `permission_minimization`의 1-minimal 목록을 확정
 - AgentRun과 이벤트는 Supabase의 `agent_runs`, `agent_run_events`에 저장하며 미설정 또는 장애 시 메모리 저장소로 복원
 - 메모리 Fixture와 Dashboard 전용 Fixture API는 운영 화면과 Production API에서 제거
 
 Harness Core와 Fixture Adapter는 내부 단위 테스트에서만 수명주기 회귀 검증에 사용한다. 현재 실제 Runtime은 129개 Tool 카탈로그 중 권한 프로파일과 직접 연결되는 5개 family를 OS 동작까지 구현하며, 나머지는 `implemented` 상태를 명시한다.
 
-AgentRun 조회 API는 `/api/agent-runs/{run_id}`를 기준으로 events, recon, findings, plan 하위 경로를 제공한다. 실행 중 취소는 다음 TB 시작 전에 반영하며, `/rollback`은 8개 등록 Target의 기준 상태를 다시 검증한다.
+AgentRun 조회 API는 `/api/agent-runs/{run_id}`를 기준으로 events, recon, findings, plan 하위 경로를 제공한다. 실행 중에는 Planner 판단 요청, Runtime dispatch, Tool 결과, 누적 상태 전이, Rollback을 조회 가능한 스냅샷으로 계속 저장한다. `/resume`도 즉시 `RECEIVED`를 반환한 뒤 복구가 검증된 미완료 체인을 background에서 replay하며, `/rollback`은 8개 등록 Target의 기준 상태를 다시 검증한다.
 
-AgentRun 요청은 사용자 Prompt를 받지 않는다. 사용자는 고정 Host·Container 권한만 선택하며, 공격 에이전트는 서버에 고정된 임무와 실제 Recon 증거를 바탕으로 finding, TB별 scenario와 구조화 Tool plan을 자동 생성한다. 요청에 `prompt`를 넣으면 API가 `422`로 거부한다.
+AgentRun 요청은 사용자 Prompt와 수동 권한 선택을 받지 않는다. 공격 에이전트는 서버에 고정된 임무, 자동 최대 권한과 실제 Recon 증거를 바탕으로 finding, TB별 scenario와 구조화 Tool plan을 생성한다. 요청에 `prompt`를 넣으면 API가 `422`로 거부한다.
 
 ## 워크플로우 상태 관리
 
@@ -164,4 +168,4 @@ npm run build
 
 검증 완료 기준은 백엔드 테스트 통과, 프론트 lint·production build 성공, `terraform validate` 성공이다. 실제 Host 권한의 최종 E2E 검증은 변경된 `user_data`로 EC2를 새로 배포한 뒤 수행한다.
 
-OpenRouter key와 Supabase secret/service-role key는 프론트에 두지 않는다. 실제 값을 Git에 커밋하지 말고 신뢰된 로컬 백엔드 런타임 secret으로만 주입한다. SSM 원격 실행 결과도 로컬 백엔드가 받아 Supabase에 저장하므로 EC2 Agent 런타임에는 Supabase Secret Key를 전달하지 않는다.
+OpenRouter key와 Supabase secret/service-role key는 프론트에 두지 않는다. OpenRouter key는 배포 컨트롤러가 환경별 SSM SecureString으로 저장하고 EC2 IAM이 해당 파라미터 하나만 복호화해 AI Planner runtime에 주입한다. 키 값은 이미지, Terraform 변수/state, user-data 원문과 배포 로그에 넣지 않는다. Supabase 저장은 로컬 백엔드가 담당하므로 EC2 Agent 런타임에는 Supabase Secret Key를 전달하지 않는다.

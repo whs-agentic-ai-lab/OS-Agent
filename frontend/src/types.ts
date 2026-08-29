@@ -73,12 +73,13 @@ export interface PlannerModelOption {
 export interface HealthResponse {
   status: string;
   run_api_version?: "permission-control-runtime-v5" | "permission-control-runtime-v6";
-  agent_run_api_version?: "os-agent-orchestrator-v1" | "os-agent-orchestrator-v2";
+  agent_run_api_version?: "os-agent-orchestrator-v1" | "os-agent-orchestrator-v2" | "os-agent-orchestrator-v3" | "os-agent-orchestrator-v4" | "os-agent-orchestrator-v5";
   harness_api_version?: "os-harness-v1";
   planner: string;
   storage: string;
   host_supervisor: "connected" | "unavailable";
   active_executor?: SubjectModeId | null;
+  active_agent_run_id?: string | null;
 }
 
 export interface RunRequest {
@@ -178,8 +179,10 @@ export interface AgentBudget {
   max_steps_per_tb: number;
   max_tool_calls_per_tb: number;
   max_elapsed_seconds_per_tb: number;
+  max_stagnant_plans_per_tb: number;
   max_changed_targets_per_tb: number;
   max_output_bytes_per_tool: number;
+  max_minimization_trials: number;
 }
 
 export interface FixedPermissionProfiles {
@@ -189,8 +192,59 @@ export interface FixedPermissionProfiles {
 
 export interface AgentRunRequest {
   scope: "all_trust_boundaries";
-  fixed_permission_profiles: FixedPermissionProfiles;
   planner_model?: PlannerModelId;
+}
+
+export interface DamageScore {
+  total: number;
+  impact: number;
+  proof: number;
+  blast_radius: number;
+  reproducibility: number;
+}
+
+export interface AttackContract {
+  contract_id: string;
+  trust_boundary_id: string;
+  objective: string;
+  impact: string;
+  source_environment: EnvironmentNodeId;
+  target_environment: EnvironmentNodeId;
+  tool: string;
+  action: string;
+  resource_ref: string;
+  arguments: Record<string, unknown>;
+  verifier: string;
+  success_criteria: string[];
+  rollback: string;
+  original_evidence_refs: string[];
+  maximum_profile_hash: string;
+  damage_score: DamageScore;
+  chain_hash?: string;
+  chain_steps?: AgentPlanStep[];
+}
+
+export interface PermissionTrial {
+  sequence: number;
+  strategy: "llm_seed" | "service_group" | "partition" | "single" | "restore_verify" | "final_verify";
+  candidate_permission_ids: string[];
+  removed_permission_ids: string[];
+  success: boolean;
+  proof_level: string;
+  verifier: string;
+  evidence_refs: string[];
+}
+
+export interface PermissionMinimizationResult {
+  status: "NOT_STARTED" | "SKIPPED" | "COMPLETED" | "FAILED";
+  initial_permission_ids: string[];
+  llm_suggested_permission_ids: string[];
+  minimal_permission_ids: string[];
+  essential_permission_ids: string[];
+  minimal_permission_profiles: FixedPermissionProfiles;
+  trials: PermissionTrial[];
+  one_minimal_verified: boolean;
+  fallback_to_maximum: boolean;
 }
 
 export interface AgentFinding {
@@ -211,8 +265,55 @@ export interface AgentPlanStep {
   tool: string;
   action: string;
   resource_ref: string;
+  arguments?: Record<string, unknown>;
   expected_result: "allowed" | "denied" | "observed" | "restored";
   status: string;
+  sequence?: number;
+  selection_rationale?: string;
+  policy_decision?: "ALLOWED" | "DENIED";
+  execution_status?: "EXECUTED" | "FAILED" | "SKIPPED";
+  verification_status?: "VERIFIED" | "REJECTED" | "INCONCLUSIVE";
+  state_before?: AgentChainState;
+  state_after?: AgentChainState;
+  state_changes?: AgentStateChange[];
+  evidence_refs?: string[];
+  runtime_result?: "allowed" | "denied" | "error" | null;
+  outcome?: string | null;
+}
+
+export interface AgentChainState {
+  version: number;
+  fingerprint: string;
+}
+
+export interface AgentStateChange {
+  key: string;
+  before: unknown;
+  after: unknown;
+  evidence_refs: string[];
+}
+
+export interface AgentSearchState {
+  status: string;
+  discovered_states: number;
+  explored_states: number;
+  unique_transitions: number;
+  repeated_states: number;
+  frontier_candidates: number;
+  policy_pruned_candidates: number;
+  tool_calls_used: number;
+  planner_calls_used?: number;
+  automatic_extensions: number;
+  termination_reason: string | null;
+  termination_explanation: string | null;
+  search_complete: boolean;
+  budget_exhausted: boolean;
+  resume_available: boolean;
+  checkpoint_id: string | null;
+  checkpoint?: Record<string, unknown>;
+  visited_transitions?: string[];
+  remaining_frontier?: string[];
+  last_state_fingerprint?: string;
 }
 
 export interface TbScenario {
@@ -224,6 +325,10 @@ export interface TbScenario {
   impact: string;
   tool_implemented: boolean;
   steps: AgentPlanStep[];
+  chain_id?: string;
+  chain_status?: "PENDING" | "RUNNING" | "COMPLETED" | "PAUSED" | "FAILED";
+  search?: AgentSearchState;
+  rollback_status?: "NOT_REQUIRED" | "VERIFIED" | "FAILED";
 }
 
 export interface TbResult {
@@ -248,8 +353,8 @@ export interface AgentRunRecord {
   run_id: string;
   objective: string;
   scope: "all_trust_boundaries";
-  status: "RECEIVED" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED";
-  agent_stage: "profile" | "recon" | "analyze" | "plan" | "execute" | "compare" | "finished";
+  status: "RECEIVED" | "RUNNING" | "PAUSED" | "COMPLETED" | "FAILED" | "CANCELLED";
+  agent_stage: "profile" | "maximize" | "recon" | "analyze" | "plan" | "execute" | "compare" | "contract" | "minimize" | "reverify" | "finished";
   fixed_permission_profiles: FixedPermissionProfiles;
   profile_hash: string;
   effective_permissions: Record<string, Record<string, unknown>>;
@@ -259,6 +364,8 @@ export interface AgentRunRecord {
   tb_scenarios: TbScenario[];
   tb_results: TbResult[];
   worst_case_scenario: TbScenario | null;
+  attack_contract: AttackContract | null;
+  permission_minimization: PermissionMinimizationResult;
   summary: { broken: number; blocked: number; inconclusive: number };
   budget: AgentBudget;
   planner_mode: "local" | "openrouter";
@@ -321,6 +428,14 @@ export interface DeploymentStatus {
   completed_at: string | null;
   caller_identity: AwsCallerIdentity | null;
   instances: AwsInstanceSummary[];
+}
+
+export interface ExperimentEnvironmentResetResult {
+  status: "RESET" | "RESET_FAILED";
+  duration_ms: number;
+  reset_scopes: string[];
+  evidence_refs: string[];
+  restored_state: Record<string, unknown>;
 }
 
 export type TunnelState = "not_ready" | "installing" | "idle" | "starting" | "connected" | "failed";

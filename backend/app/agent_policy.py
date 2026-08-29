@@ -46,10 +46,6 @@ class AgentPolicyGate:
             violations.append("profile_hash")
         if decision.name not in self.implemented_tools:
             violations.append("implemented_tool")
-        if len(scenario.steps) > run.budget.max_steps_per_tb:
-            violations.append("step_budget")
-        if run.budget.max_tool_calls_per_tb < 1:
-            violations.append("tool_budget")
         approved = any(
             step.type == "execute"
             and step.tool == decision.name
@@ -59,8 +55,8 @@ class AgentPolicyGate:
         )
         if not approved:
             violations.append("approved_plan_step")
-        if not any(step.type == "rollback" for step in scenario.steps):
-            violations.append("rollback")
+        if not scenario.chain_id:
+            violations.append("chain_session")
         if violations:
             raise AgentPolicyViolation(
                 "Agent Policy Gate 차단: " + ", ".join(violations)

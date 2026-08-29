@@ -261,7 +261,12 @@ class InMemoryAgentRunRepository:
 
     def save(self, run: AgentRunRecord) -> None:
         with self._lock:
-            self._items[run.run_id] = run.model_copy(deep=True)
+            stored = self._items.get(run.run_id)
+            snapshot = run.model_copy(deep=True)
+            if stored is not None and stored.status == "CANCELLED":
+                snapshot.status = "CANCELLED"
+                run.status = "CANCELLED"
+            self._items[run.run_id] = snapshot
 
     def get(self, run_id: str) -> AgentRunRecord | None:
         with self._lock:
@@ -274,18 +279,25 @@ class SupabaseAgentRunRepository:
 
     def __init__(self, url: str, secret_key: str, client: Client | None = None) -> None:
         self._client = client or create_client(url, secret_key)
+        self._lock = Lock()
+        self._cancelled_run_ids: set[str] = set()
 
     def save(self, run: AgentRunRecord) -> None:
-        row = run.model_dump(mode="json", exclude={"events"})
-        self._client.table("agent_runs").upsert(row, on_conflict="run_id").execute()
-        if run.events:
-            events = [
-                {"run_id": run.run_id, **event.model_dump(mode="json")}
-                for event in run.events
-            ]
-            self._client.table("agent_run_events").upsert(
-                events, on_conflict="run_id,sequence"
-            ).execute()
+        with self._lock:
+            if run.status == "CANCELLED":
+                self._cancelled_run_ids.add(run.run_id)
+            elif run.run_id in self._cancelled_run_ids:
+                run.status = "CANCELLED"
+            row = run.model_dump(mode="json", exclude={"events"})
+            self._client.table("agent_runs").upsert(row, on_conflict="run_id").execute()
+            if run.events:
+                events = [
+                    {"run_id": run.run_id, **event.model_dump(mode="json")}
+                    for event in run.events
+                ]
+                self._client.table("agent_run_events").upsert(
+                    events, on_conflict="run_id,sequence"
+                ).execute()
 
     def get(self, run_id: str) -> AgentRunRecord | None:
         response = (

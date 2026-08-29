@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 from threading import Lock, Thread
 from typing import Literal
 
@@ -61,6 +62,7 @@ class EnvironmentContext(BaseModel):
     account_id: str
     base_ami_id: str | None = None
     image_digests: dict[str, str] = Field(default_factory=dict)
+    openrouter_parameter_name: str | None = None
 
 
 class AwsInstanceSummary(BaseModel):
@@ -145,6 +147,7 @@ class DeploymentManager:
             "aws_cli": self._find_working_executable("aws", ["--version"]),
             "docker": self._find_working_executable("docker", ["version"]),
             "terraform_files": (self.settings.terraform_dir / "fixed.auto.tfvars").is_file(),
+            "openrouter_api_key": bool(self.settings.openrouter_api_key),
         }
         caller_identity = None
         instances: list[AwsInstanceSummary] = []
@@ -312,7 +315,13 @@ class DeploymentManager:
         environment = self.resolve_environment(request.environment_name)
         snapshot = self._begin(
             operation="deploy",
-            required=("terraform", "aws_cli", "docker", "terraform_files"),
+            required=(
+                "terraform",
+                "aws_cli",
+                "docker",
+                "terraform_files",
+                "openrouter_api_key",
+            ),
             message=f"{environment.environment_id} 환경 배포를 시작합니다.",
         )
         Thread(
@@ -432,6 +441,7 @@ class DeploymentManager:
             )
             if not state_path.is_file():
                 self._delete_orphaned_flow_log_group(aws, environment_id)
+                self._delete_openrouter_parameter(aws, environment)
                 self._succeed(f"{environment_id} 환경에는 삭제할 Terraform 리소스가 없습니다.")
                 return
             state_resources = self._capture(
@@ -441,6 +451,7 @@ class DeploymentManager:
             ).splitlines()
             if not state_resources:
                 self._delete_orphaned_flow_log_group(aws, environment_id)
+                self._delete_openrouter_parameter(aws, environment)
                 self._succeed(f"{environment_id} 환경에는 삭제할 Terraform 리소스가 없습니다.")
                 return
             missing_images = set(self.IMAGE_DOCKERFILES) - set(environment.image_digests)
@@ -471,6 +482,7 @@ class DeploymentManager:
                         terraform_dir,
                     )
                 self._delete_orphaned_flow_log_group(aws, environment_id)
+                self._delete_openrouter_parameter(aws, environment)
                 self._succeed(f"{environment_id} 부분 배포 환경 삭제가 완료되었습니다.")
                 return
             self._command(
@@ -486,6 +498,7 @@ class DeploymentManager:
                 terraform_dir,
             )
             self._delete_orphaned_flow_log_group(aws, environment_id)
+            self._delete_openrouter_parameter(aws, environment)
             self._succeed(f"{environment_id} 환경 삭제가 완료되었습니다.")
         except Exception as exc:
             self._fail(exc)
@@ -497,6 +510,17 @@ class DeploymentManager:
             docker = self._required_executable("docker")
             terraform_dir = self.settings.terraform_dir
             state_path = self._state_path(environment.environment_id, create=True)
+            if not self.settings.openrouter_api_key:
+                raise RuntimeError("OPENROUTER_API_KEY가 없어 AI 공격 환경을 배포할 수 없습니다.")
+            environment.openrouter_parameter_name = (
+                f"/os-agent/{environment.environment_id}/openrouter-api-key"
+            )
+            self._save_environment_context(environment)
+            self._put_openrouter_parameter(
+                aws,
+                environment.openrouter_parameter_name,
+                self.settings.openrouter_api_key,
+            )
             environment.base_ami_id = self._resolve_base_ami_id(aws)
             self._save_environment_context(environment)
             variable_args = self._terraform_variable_args(environment)
@@ -741,6 +765,88 @@ class DeploymentManager:
             self.settings.backend_context,
         )
 
+    def _put_openrouter_parameter(
+        self,
+        aws: str,
+        parameter_name: str,
+        secret_value: str,
+    ) -> None:
+        """키를 로그, Terraform 인수, user-data에 노출하지 않고 SecureString으로 저장한다."""
+        payload = {
+            "Name": parameter_name,
+            "Description": "OS Agent OpenRouter API key",
+            "Value": secret_value,
+            "Type": "SecureString",
+            "Overwrite": True,
+            "Tier": "Standard",
+        }
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".json",
+                delete=False,
+            ) as temporary:
+                json.dump(payload, temporary)
+                temporary_path = Path(temporary.name)
+            os.chmod(temporary_path, 0o600)
+            self._append(f"OpenRouter 키를 환경 전용 SSM SecureString {parameter_name}에 저장합니다.")
+            completed = subprocess.run(
+                [
+                    aws,
+                    "ssm",
+                    "put-parameter",
+                    "--cli-input-json",
+                    f"file://{temporary_path}",
+                    "--region",
+                    self.settings.aws_region,
+                    "--profile",
+                    self.settings.aws_profile,
+                ],
+                cwd=self.settings.backend_context,
+                env=self._environment(),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = self._command_error_detail(completed.stderr or completed.stdout)
+                raise RuntimeError(
+                    "OpenRouter SecureString 저장에 실패했습니다."
+                    + (f" {detail}" if detail else "")
+                )
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    def _delete_openrouter_parameter(
+        self,
+        aws: str,
+        environment: EnvironmentContext,
+    ) -> None:
+        parameter_name = environment.openrouter_parameter_name
+        if not parameter_name:
+            return
+        self._append(f"환경 전용 OpenRouter SecureString {parameter_name}을 삭제합니다.")
+        self._command(
+            [
+                aws,
+                "ssm",
+                "delete-parameters",
+                "--names",
+                parameter_name,
+                "--region",
+                self.settings.aws_region,
+                "--profile",
+                self.settings.aws_profile,
+            ],
+            self.settings.backend_context,
+        )
+
     def _flow_log_group_exists(self, aws: str, log_group_name: str) -> bool:
         raw = self._capture(
             [
@@ -835,6 +941,8 @@ class DeploymentManager:
             f"-var=owner_arn={environment.owner_arn}",
             f"-var=aws_profile={self.settings.aws_profile}",
             "-var=confirm_new_state=true",
+            "-var=openrouter_api_key_parameter_name="
+            + (environment.openrouter_parameter_name or ""),
         ]
 
     def _terraform_runtime_args(

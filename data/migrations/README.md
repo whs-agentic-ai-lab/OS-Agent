@@ -17,6 +17,8 @@ Executor 결과는 다음 네 테이블로 물리 분리한다.
 
 8개 TB 전체 Orchestrator 실행은 `agent_runs`, `agent_run_events`에 별도로 저장한다. 두 Executor의 단일 실행 로그를 물리적으로 합치지 않고, AgentRun에는 고정 `profile_hash`, Recon/Infrastructure snapshot, findings, TB별 plan/result, worst-case와 참조 이벤트를 저장한다. 적용 SQL은 `20260828194500_add_agent_orchestrator_runs.sql`이다.
 
+상태 누적형 탐색이 Watchdog에서 멈추면 `PAUSED`와 replay checkpoint로 저장한다. 기존 `agent_runs.status` 제약에는 `20260829013000_add_agent_run_paused_status.sql`을 적용한다.
+
 1. Supabase CLI를 설치하고 `supabase --version` 및 `supabase migration new --help`를 확인한다.
 2. 신규 변경은 `supabase migration new <name>`으로 파일을 생성한다.
 3. `schema.sql`의 해당 변경 내용을 생성된 파일에 옮긴다.

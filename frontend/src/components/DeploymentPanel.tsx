@@ -1,4 +1,4 @@
-import type { DeploymentState, DeploymentStatus, TunnelStatus } from "../types";
+import type { DeploymentState, DeploymentStatus, ExperimentEnvironmentResetResult, TunnelStatus } from "../types";
 
 interface DeploymentPanelProps {
   deployment: DeploymentStatus | null;
@@ -6,11 +6,14 @@ interface DeploymentPanelProps {
   actionError: string | null;
   isStarting: boolean;
   isStartingTunnel: boolean;
+  isResettingExperiment: boolean;
+  experimentResetResult: ExperimentEnvironmentResetResult | null;
+  experimentResetError: string | null;
   onDeploy: (environmentName: string) => void;
   onEnvironmentNameChange: (environmentName: string) => void;
   onDestroy: (environmentId: string) => void;
-  onInitialize: () => void;
   onRefresh: () => void;
+  onResetExperiment: () => void;
   onSelectInstance: (instanceId: string) => void;
   onStartTunnel: () => void;
   onStopTunnel: () => void;
@@ -53,11 +56,14 @@ export function DeploymentPanel({
   actionError,
   isStarting,
   isStartingTunnel,
+  isResettingExperiment,
+  experimentResetResult,
+  experimentResetError,
   onDeploy,
   onEnvironmentNameChange,
   onDestroy,
-  onInitialize,
   onRefresh,
+  onResetExperiment,
   onSelectInstance,
   onStartTunnel,
   onStopTunnel,
@@ -67,14 +73,9 @@ export function DeploymentPanel({
 }: DeploymentPanelProps) {
   const status = deployment?.status ?? "not_ready";
   const prerequisites = deployment?.prerequisites ?? {};
-  const isBusy = status === "running" || isStarting;
+  const isBusy = status === "running" || isStarting || isResettingExperiment;
   const canDeploy = Boolean(
     Object.values(prerequisites).every(Boolean) &&
-      !isBusy,
-  );
-  const canInitialize = Boolean(
-    prerequisites.terraform &&
-      prerequisites.terraform_files &&
       !isBusy,
   );
   const selectedInstance = deployment?.instances.find(
@@ -89,6 +90,12 @@ export function DeploymentPanel({
     selectedInstance &&
       tunnel?.target_instance_id === selectedInstance.instance_id &&
       tunnel.status === "connected",
+  );
+  const canResetExperiment = Boolean(
+    selectedInstanceTunnelConnected &&
+      selectedInstance?.state === "running" &&
+      !isBusy &&
+      !isResettingExperiment,
   );
   const canDestroy = Boolean(
     prerequisites.terraform &&
@@ -131,11 +138,6 @@ export function DeploymentPanel({
                 {prerequisiteLabels[key] ?? key}
               </span>
             ))}
-          </div>
-          <div className="infrastructure-actions">
-            <button className="infrastructure-button is-secondary" disabled={!canInitialize} onClick={onInitialize} type="button">
-              Terraform 초기화
-            </button>
           </div>
           <div className="environment-create">
             <label htmlFor="environment-name">환경 이름</label>
@@ -223,7 +225,7 @@ export function DeploymentPanel({
           {selectedInstanceTunnelConnected ? (
             <button
               className="infrastructure-button is-secondary"
-              disabled={isStartingTunnel}
+              disabled={isStartingTunnel || isResettingExperiment}
               onClick={onStopTunnel}
               type="button"
             >
@@ -236,6 +238,7 @@ export function DeploymentPanel({
                 !selectedInstance ||
                 selectedInstance.state !== "running" ||
                 isStartingTunnel ||
+                isResettingExperiment ||
                 tunnel?.status === "connected" ||
                 tunnel?.status === "installing" ||
                 tunnel?.status === "starting"
@@ -248,6 +251,14 @@ export function DeploymentPanel({
                 : "선택 EC2 SSM 연결"}
             </button>
           )}
+          <button
+            className="infrastructure-button is-secondary"
+            disabled={!canResetExperiment}
+            onClick={onResetExperiment}
+            type="button"
+          >
+            {isResettingExperiment ? "실험 환경 초기화 중" : "실험 환경 초기화"}
+          </button>
           <button
             className="infrastructure-button is-danger"
             disabled={!canDestroy || !selectedInstance || selectedInstanceHasTunnel}
@@ -265,6 +276,12 @@ export function DeploymentPanel({
             EC2만 종료
           </button>
         </div>
+        {experimentResetResult?.status === "RESET" ? (
+          <p className="deployment-notice is-success">
+            실험 환경 초기화와 기준 상태 검증이 완료되었습니다. ({(experimentResetResult.duration_ms / 1000).toFixed(1)}초)
+          </p>
+        ) : null}
+        {experimentResetError ? <p className="error-message">{experimentResetError}</p> : null}
         {selectedInstance && !selectedInstance.local_state_available ? (
           <p className="deployment-notice">
             이 PC에는 {selectedInstance.environment_id}의 Terraform state가 없어 전체 삭제할 수 없습니다. EC2 단독 종료는 다른 AWS 리소스를 남깁니다.

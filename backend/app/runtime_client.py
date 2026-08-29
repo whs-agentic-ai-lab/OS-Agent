@@ -4,6 +4,7 @@ from typing import Protocol
 import httpx
 
 from .schemas import (
+    ExperimentEnvironmentResetResult,
     RuntimeAgentResult,
     RuntimeDispatchRequest,
     RuntimeResetRequest,
@@ -20,6 +21,8 @@ class EnvironmentRuntime(Protocol):
     def execute(self, request: RuntimeDispatchRequest) -> RuntimeAgentResult: ...
 
     def reset_harness(self, request: RuntimeResetRequest) -> RuntimeResetResult: ...
+
+    def reset_environment(self) -> ExperimentEnvironmentResetResult: ...
 
 
 class SupervisorRuntimeClient:
@@ -90,3 +93,32 @@ class SupervisorRuntimeClient:
             suffix = f": {detail}" if detail else ""
             raise RuntimeError(f"환경 Runtime Reset 요청에 실패했습니다{suffix}") from exc
         return RuntimeResetResult.model_validate(payload)
+
+    def reset_environment(self) -> ExperimentEnvironmentResetResult:
+        if not self.socket_path.exists():
+            raise RuntimeError(
+                "환경 Runtime Supervisor 소켓이 없습니다. SSM으로 EC2 Runtime에 연결하세요."
+            )
+        transport = httpx.HTTPTransport(uds=str(self.socket_path))
+        try:
+            with httpx.Client(
+                transport=transport,
+                base_url="http://environment-runtime",
+                timeout=45.0,
+            ) as client:
+                response = client.post(
+                    "/v2/environment/reset",
+                    json={"confirmation": "RESET_EXPERIMENT_ENVIRONMENT"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            detail = ""
+            if isinstance(exc, httpx.HTTPStatusError):
+                try:
+                    detail = str(exc.response.json().get("detail", ""))
+                except (ValueError, AttributeError):
+                    detail = exc.response.text
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(f"실험 환경 초기화 요청에 실패했습니다{suffix}") from exc
+        return ExperimentEnvironmentResetResult.model_validate(payload)

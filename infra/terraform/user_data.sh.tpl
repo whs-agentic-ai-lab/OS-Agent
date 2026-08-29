@@ -132,6 +132,18 @@ install -d -o user2 -g user2 -m 0751 \
 install -d -o 22001 -g 22001 -m 0751 /srv/os-agent/targets/container1
 install -d -o 22002 -g 22002 -m 0751 /srv/os-agent/targets/container2
 install -d -o 22003 -g 22003 -m 0751 /srv/os-agent/targets/container3
+install -d -o root -g root -m 0700 /etc/os-agent/secrets
+
+openrouter_api_key="$(retry 12 aws ssm get-parameter \
+  --region '${aws_region}' \
+  --name '${openrouter_parameter_name}' \
+  --with-decryption \
+  --query 'Parameter.Value' \
+  --output text)"
+printf 'OPENROUTER_API_KEY=%s\n' "$openrouter_api_key" >/etc/os-agent/secrets/runtime.env
+unset openrouter_api_key
+chown root:root /etc/os-agent/secrets/runtime.env
+chmod 0600 /etc/os-agent/secrets/runtime.env
 
 asset_bundle="$(mktemp)"
 printf '%s' '${bootstrap_bundle_b64}' | base64 -d | gzip -dc >"$asset_bundle"
