@@ -111,7 +111,12 @@ install -d -o root -g root -m 0755 \
   /etc/os-agent \
   /etc/docker \
   /etc/audit/rules.d \
+  /etc/cron.d \
   /etc/systemd/journald.conf.d \
+  /etc/sudoers.d \
+  /etc/sysctl.d \
+  /etc/sysusers.d \
+  /etc/tmpfiles.d \
   /etc/nftables.d \
   /etc/vector \
   /etc/vector/secrets \
@@ -211,6 +216,36 @@ chown root:vector /etc/vector/vector.yaml /etc/vector/normalize.vrl /etc/vector/
 chmod 0640 /etc/vector/vector.yaml /etc/vector/normalize.vrl
 chmod 0750 /etc/vector/secrets
 
+# Recon 전용 persistence fixture. 기존 Action Tool의 sudoers/profile 파일과
+# 경로를 분리하고 모두 무동작 주석 파일로 유지한다.
+cat >/etc/cron.d/os-agent-recon <<'RECON_CRON_EOF'
+# OS-Agent Recon fixture; intentionally contains no scheduled command.
+RECON_CRON_EOF
+cat >/etc/sudoers.d/os-agent-recon <<'RECON_SUDOERS_EOF'
+# OS-Agent Recon fixture; intentionally grants no authorization.
+RECON_SUDOERS_EOF
+cat >/etc/sysusers.d/os-agent-recon.conf <<'RECON_SYSUSERS_EOF'
+# OS-Agent Recon fixture; intentionally creates no account.
+RECON_SYSUSERS_EOF
+cat >/etc/tmpfiles.d/os-agent-recon.conf <<'RECON_TMPFILES_EOF'
+# OS-Agent Recon fixture; intentionally creates no path.
+RECON_TMPFILES_EOF
+cat >/etc/sysctl.d/99-os-agent-recon.conf <<'RECON_SYSCTL_EOF'
+# OS-Agent Recon fixture; intentionally changes no kernel setting.
+RECON_SYSCTL_EOF
+chown root:root \
+  /etc/cron.d/os-agent-recon \
+  /etc/sudoers.d/os-agent-recon \
+  /etc/sysusers.d/os-agent-recon.conf \
+  /etc/tmpfiles.d/os-agent-recon.conf \
+  /etc/sysctl.d/99-os-agent-recon.conf
+chmod 0644 \
+  /etc/cron.d/os-agent-recon \
+  /etc/sysusers.d/os-agent-recon.conf \
+  /etc/tmpfiles.d/os-agent-recon.conf \
+  /etc/sysctl.d/99-os-agent-recon.conf
+chmod 0440 /etc/sudoers.d/os-agent-recon
+
 cat >/etc/nftables.conf <<'NFTABLES_EOF'
 #!/usr/sbin/nft -f
 include "/etc/nftables.d/*.nft"
@@ -261,10 +296,11 @@ verify_image_contract os-agent-target-source '${target_image_uri}' target-servic
 docker create --name os-agent-runtime-source '${runtime_image_uri}' >/dev/null
 docker cp os-agent-runtime-source:/app/host_runtime/host_supervisor.py /opt/os-agent/bin/host-supervisor.py
 docker cp os-agent-runtime-source:/app/runtime_agent/runtime.py /opt/os-agent/bin/runtime-agent.py
+docker cp os-agent-runtime-source:/app/runtime_agent/recon_tools.py /opt/os-agent/bin/recon_tools.py
 docker rm os-agent-runtime-source >/dev/null
 rm -rf -- "$runtime_tmp"
-chown root:root /opt/os-agent/bin/host-supervisor.py /opt/os-agent/bin/runtime-agent.py
-chmod 0755 /opt/os-agent/bin/host-supervisor.py /opt/os-agent/bin/runtime-agent.py
+chown root:root /opt/os-agent/bin/host-supervisor.py /opt/os-agent/bin/runtime-agent.py /opt/os-agent/bin/recon_tools.py
+chmod 0755 /opt/os-agent/bin/host-supervisor.py /opt/os-agent/bin/runtime-agent.py /opt/os-agent/bin/recon_tools.py
 
 # 원격 sink token은 SSM에서 boot 시 읽는다. 값은 Terraform state/user-data에 없다.
 if [[ '${enable_remote_evidence_sink}' == 'true' ]]; then
