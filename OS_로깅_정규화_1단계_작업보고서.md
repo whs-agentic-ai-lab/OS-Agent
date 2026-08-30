@@ -4,8 +4,6 @@
 
 **현재 배포 준비 완료 상태가 아니다.** 기존 로깅 코드를 선택 이식했지만, 최종 검증에서 이번 이식으로 EC2 user-data의 기존 15 KiB 상한을 초과한 것을 확인했다. 상한을 늘리거나 새 배포 경로를 추가하지 않았으며, 추가 패키징 조정은 사용자 승인 전 중단한다.
 
-- 원본: `C:\Users\oeseo\Desktop\OS-Tool\OS-Agent`, HEAD `d05da05868285bee50e8d893417ebdb03e07b537`.
-- 대상: `C:\Users\oeseo\Desktop\OS-Agent`, HEAD `809b845c1517a28295a589ab218c0904b3efb8c1` / `main`.
 - 대상의 최신 AgentOrchestrator, 모델 설정, 실행·Verifier 기준, Supervisor 캡처·기록과 프론트엔드는 유지한다.
 - 원본의 로깅 모듈·스키마·설정·테스트만 선택 이식한다. 아래 원본 작업 기록은 대상 검증 결과가 아니다.
 
