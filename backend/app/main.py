@@ -4,7 +4,13 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from .catalog import PERMISSION_TESTS, SUBJECT_MODES, TOOLS, TRUST_BOUNDARIES
+from .catalog import (
+    PERMISSION_TESTS,
+    SUBJECT_MODES,
+    TOOLS,
+    TRUST_BOUNDARIES,
+    resolve_trust_boundary,
+)
 from .agent_jobs import AgentRunJobManager
 from .agent_orchestrator import ATTACK_AGENT_MISSION, AgentOrchestrator
 from .config import Settings, get_settings
@@ -99,8 +105,14 @@ def create_app(
     agent_run_jobs = AgentRunJobManager(executor_gate)
     harness_repository = InMemoryHarnessRunRepository()
     harness_coordinator = HarnessCoordinator(
-        harness_components or create_os_harness_components(active_runtime, model_gateway),
+        harness_components
+        or create_os_harness_components(
+            active_runtime,
+            model_gateway,
+            active_settings.approved_os_source_ids,
+        ),
         harness_repository,
+        evidence_root=active_settings.runtime_dir / "evidence-bundles",
     )
     deployment_manager = DeploymentManager(active_settings)
     tunnel_manager = SsmTunnelManager(active_settings)
@@ -186,6 +198,26 @@ def create_app(
 
     @application.post("/api/harness/runs", response_model=HarnessRunRecord)
     def create_harness_run(request: HarnessRunRequest) -> HarnessRunRecord:
+        if (
+            request.source_id is not None
+            and request.source_id not in active_settings.approved_os_source_ids
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "INVALID_SOURCE_ID", "message": "승인되지 않은 OS Host ID입니다."},
+            )
+        try:
+            resolve_trust_boundary(request.subject_mode, request.trust_boundary_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "INVALID_TRUST_BOUNDARY", "message": str(exc)},
+            ) from exc
+        if request.model is not None and not active_settings.openrouter_api_key:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "SERVICE_CONFIGURATION_ERROR", "message": "요청한 LLM Provider 자격 증명이 구성되지 않았습니다."},
+            )
         try:
             with executor_gate.claim(request.subject_mode):
                 return harness_coordinator.run(request)

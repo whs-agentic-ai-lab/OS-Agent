@@ -90,9 +90,16 @@ class FixtureToolCatalog:
             candidate_id="fixture-read-canary",
             tool_name="fixture_file_read",
             arguments={"resource_id": "fixture-canary"},
+            argument_schema={
+                "type": "object",
+                "properties": {"resource_id": {"type": "string"}},
+                "required": ["resource_id"],
+                "additionalProperties": False,
+            },
             target_resource="fixture-canary",
             risk_level="observe",
             required_evidence=["fixture-read-evidence"],
+            verifier_id="fixture-independent-verifier",
         ),
         ActionCandidate(
             candidate_id="fixture-write-canary",
@@ -101,18 +108,36 @@ class FixtureToolCatalog:
                 "resource_id": "fixture-canary",
                 "content": "OS_AGENT_HARNESS_FIXTURE_WRITE",
             },
+            argument_schema={
+                "type": "object",
+                "properties": {
+                    "resource_id": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["resource_id", "content"],
+                "additionalProperties": False,
+            },
             target_resource="fixture-canary",
             risk_level="reversible",
             changes_state=True,
             required_evidence=["fixture-write-evidence"],
+            verifier_id="fixture-independent-verifier",
+            resetter_id="fixture-exact-change-resetter",
         ),
         ActionCandidate(
             candidate_id="fixture-service-status",
             tool_name="fixture_service_status",
             arguments={"service_id": "fixture-service"},
+            argument_schema={
+                "type": "object",
+                "properties": {"service_id": {"type": "string"}},
+                "required": ["service_id"],
+                "additionalProperties": False,
+            },
             target_resource="fixture-service",
             risk_level="observe",
             required_evidence=["fixture-service-evidence"],
+            verifier_id="fixture-independent-verifier",
         ),
     )
 
@@ -159,6 +184,7 @@ class FixtureExecutor:
                     success=allowed,
                     output=self.runtime.canary if allowed else "permission denied",
                     error_code=None if allowed else "ACCESS_DENIED",
+                    error_message=None if allowed else "permission denied",
                     evidence={
                         "evidence_id": "fixture-runtime-read",
                         "resource_id": "fixture-canary",
@@ -175,6 +201,7 @@ class FixtureExecutor:
                     success=allowed,
                     output="fixture written" if allowed else "permission denied",
                     error_code=None if allowed else "ACCESS_DENIED",
+                    error_message=None if allowed else "permission denied",
                     evidence={
                         "evidence_id": "fixture-runtime-write",
                         "resource_id": "fixture-canary",
@@ -193,6 +220,7 @@ class FixtureExecutor:
                         else "permission denied"
                     ),
                     error_code=None if allowed else "ACCESS_DENIED",
+                    error_message=None if allowed else "permission denied",
                     evidence={
                         "evidence_id": "fixture-runtime-service",
                         "resource_id": "fixture-service",
@@ -268,6 +296,8 @@ class FixtureResetter:
         self.runtime.restore()
         return ResetRecord(
             status="RESET",
+            recovery_kind="tool_reset",
+            strategy_id="fixture-exact-change-resetter",
             evidence_refs=["fixture-reset-canary"],
             restored_state={"resource_id": "fixture-canary", "value": self.runtime.baseline},
         )
