@@ -116,12 +116,33 @@ transforms:
       - tag_executor
       - tag_state
     file: /etc/vector/normalize.vrl
-    drop_on_error: false
+    drop_on_error: true
+    reroute_dropped: true
+
+  normalization_error:
+    type: remap
+    inputs: [normalize.dropped]
+    source: |
+      event_id = "normalization-error-" + sha2(encode_json(.), variant: "SHA-256")
+      . = {
+        "schema_version": "os-agent-evidence-v1",
+        "event_id": event_id,
+        "environment_id": "${environment_id}",
+        "topology_revision": "${topology_revision}",
+        "source_type": "unknown", "source": "vector-normalize",
+        "event_type": "evidence.normalization_error",
+        "occurred_at": now(), "collector_received_at": now(),
+        "message": "normalization failed; unsafe original omitted",
+        "context": {"run_id": null, "action_id": null, "step_id": null, "tool_call_id": null},
+        "status": "collection_error",
+        "collector": {"channel": "unknown", "vector_source_type": null, "host": null, "file": null, "file_offset": null, "journal_cursor": null, "vector_timestamp": null},
+        "payload": {"collection_error": {"code": "normalization_failed"}, "raw_omitted": true},
+      }
 
 sinks:
   local_evidence:
     type: file
-    inputs: [normalize]
+    inputs: [normalize, normalization_error]
     path: /var/lib/os-agent/evidence/collected/events.ndjson
     encoding:
       codec: json
@@ -137,7 +158,7 @@ sinks:
 %{ if remote_sink_enabled ~}
   evidence_api:
     type: http
-    inputs: [normalize]
+    inputs: [normalize, normalization_error]
     uri: ${evidence_api_uri}
     method: post
     compression: gzip
@@ -147,10 +168,12 @@ sinks:
       method: newline_delimited
     batch:
       max_events: 250
+      max_bytes: 1048576
       timeout_secs: 2
     request:
       headers:
         Authorization: "Bearer SECRET[collector.collector_token]"
+        Content-Type: application/x-ndjson
       timeout_secs: 30
       retry_initial_backoff_secs: 1
       retry_max_duration_secs: 300

@@ -1,0 +1,369 @@
+transforms:
+  normalize:
+    type: remap
+    inputs: []
+    file: normalize.vrl.tpl
+
+tests:
+  - name: normalize_auditd_evidence
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {
+            "collector_channel": "auditd",
+            "file": "/var/log/audit/audit.log",
+            "file_offset": 42,
+            "message": "type=SYSCALL msg=audit(1788051601.123:42): syscall=59 success=yes",
+            "source_type": "file",
+            "timestamp": t'2026-08-30T01:00:02Z',
+          }
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.schema_version, "os-agent-evidence-v1")
+              assert_eq!(.source_type, "auditd")
+              assert_eq!(.event_type, "audit.syscall")
+              assert_eq!(.payload.message, .message)
+              assert_eq!(.collector.file_offset, 42)
+              assert_eq!(to_unix_timestamp!(.occurred_at), 1788051601)
+              assert_eq!(format_timestamp!(.occurred_at, format: "%+"), "2026-08-30T01:00:01.123+00:00")
+              assert_eq!(.status, "ok")
+              assert_eq!(.context.run_id, null)
+
+  - name: normalize_journald_evidence
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {
+            "collector_channel": "journald",
+            "__CURSOR": "s=cursor-1",
+            "_SYSTEMD_UNIT": "os-agent-host-supervisor.service",
+            "message": "request completed",
+            "source_type": "journald",
+            "timestamp": t'2026-08-30T01:00:02Z',
+          }
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.source_type, "journald")
+              assert_eq!(.source, "os-agent-host-supervisor.service")
+              assert_eq!(.event_type, "journal_entry")
+              assert_eq!(.collector.journal_cursor, "s=cursor-1")
+              assert!(is_object(.payload) && is_timestamp(.occurred_at))
+
+  - name: normalize_docker_log_evidence
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {
+            "collector_channel": "docker_json",
+            "message": encode_json({
+              "event_id": "docker-log-abc",
+              "occurred_at": "2026-08-30T01:00:03Z",
+              "source": "docker-logs-relay",
+              "stream": "stdout",
+              "message": encode_json({"message": "inner-json-must-survive"}),
+            }),
+            "source_type": "file",
+            "timestamp": t'2026-08-30T01:00:04Z',
+          }
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event_id, "docker-log-abc")
+              assert_eq!(.source_type, "docker_log")
+              assert_eq!(.source, "docker-logs-relay")
+              assert_eq!(.event_type, "docker_log")
+              assert_eq!(.payload.message, .message)
+              assert_eq!(.message, encode_json({"message": "inner-json-must-survive"}))
+
+  - name: normalize_docker_event_evidence
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {
+            "collector_channel": "docker_event",
+            "message": encode_json({
+              "event_id": "docker-event-def",
+              "source": "docker-events-relay",
+              "Type": "container",
+              "Action": "start",
+              "timeNano": 1788051603123456789,
+            }),
+            "source_type": "file",
+            "timestamp": t'2026-08-30T01:00:05Z',
+          }
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.source_type, "docker_event")
+              assert_eq!(.event_type, "docker_event.start")
+              assert_eq!(.message, "container.start")
+              assert_eq!(to_unix_timestamp!(.occurred_at), 1788051603)
+
+  - name: normalize_executor_evidence
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {
+            "collector_channel": "executor",
+            "message": encode_json({
+              "source": "runtime_agent",
+              "event_type": "TOOL_EXECUTED",
+              "message": "tool completed",
+              "payload": {"exit_code": 0},
+              "created_at": "2026-08-30T01:00:06+00:00",
+              "environment": {"SECRET": "must-not-survive"},
+            }),
+            "source_type": "file",
+          }
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.source_type, "executor")
+              assert_eq!(.source, "runtime_agent")
+              assert_eq!(.event_type, "TOOL_EXECUTED")
+              assert_eq!(.payload.payload.exit_code, 0)
+              assert!(!exists(.payload.environment) && is_timestamp(.occurred_at))
+
+  - name: normalize_snapshot_evidence
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {
+            "collector_channel": "state",
+            "message": encode_json({
+              "event_id": "state-ghi",
+              "occurred_at": "2026-08-30T01:00:08Z",
+              "source": "snapshot-runner",
+              "event_type": "STATE_CAPTURED",
+              "run_id": "run-1",
+              "phase": "before",
+            }),
+            "source_type": "file",
+          }
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event_id, "state-ghi")
+              assert_eq!(.source_type, "snapshot")
+              assert_eq!(.source, "snapshot-runner")
+              assert_eq!(.event_type, "STATE_CAPTURED")
+              assert_eq!(.message, "state capture completed")
+              assert_eq!(.payload.phase, "before")
+              assert_eq!(.context.run_id, "run-1")
+              assert_eq!(.context.step_id, null)
+
+  - name: backend_stdout_preserves_real_context_and_verifier
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          .collector_channel = "docker_json"
+          .message = encode_json({
+            "event_id": "relay-1", "container_name": "os-agent-runtime", "stream": "stdout",
+            "message": encode_json({
+              "evidence_kind": "executor", "source": "control-backend",
+              "event_id": "executor-1", "event_type": "VERIFIER_RESULT",
+              "run_id": "os-test", "action_id": "action-test",
+              "occurred_at": "2026-08-30T01:00:01Z",
+              "payload": {"verifier_result": {"verifier": "file_content_verifier", "status": "PASS", "checks": {"matches": true}}},
+            }),
+          })
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.source_type, "executor")
+              assert_eq!(.event_type, "VERIFIER_RESULT")
+              assert_eq!(.event_id, "executor-1")
+              assert_eq!(.context, {"run_id": "os-test", "action_id": "action-test", "step_id": null, "tool_call_id": null})
+              assert_eq!(.payload.payload.verifier_result.status, "PASS")
+              assert_eq!(.payload.docker.event_id, "relay-1")
+              assert_eq!(.collector.channel, "docker_json")
+
+  - name: os_logs_do_not_infer_execution_context
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {"collector_channel": "journald", "message": "run_id=os-pretend", "run_id": "os-pretend", "_SYSTEMD_UNIT": "docker.service"}
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.context.run_id, null)
+              assert_eq!(.payload.run_id, "os-pretend")
+
+  - name: malformed_snapshot_is_an_explicit_masked_parse_failure
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {"collector_channel": "state", "message": "broken password=raw-secret Authorization: Bearer raw-bearer-secret"}
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.status, "parse_error")
+              assert_eq!(.event_type, "evidence.parse_error")
+              assert_eq!(.message, "structured log parsing failed")
+              assert_eq!(.payload.parse_error, true)
+              assert!(!contains(encode_json(.), "raw-secret"))
+              assert!(!contains(encode_json(.), "raw-bearer-secret"))
+
+  - name: recursive_keys_and_cli_arrays_are_masked
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          .collector_channel = "executor"
+          .message = encode_json({
+            "message": "curl --password 'two word secret' --token=cli-secret",
+            "payload": {
+              "settings": {"OPENROUTER_API_KEY": "nested-secret", "password": "nested-password"},
+              "Cmd": ["curl", "--api-key", "array-secret"],
+              "raw": "{\"api_key\":\"json-string-secret\"}",
+            },
+          })
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.payload.payload.settings.OPENROUTER_API_KEY, "[REDACTED]")
+              assert_eq!(.payload.payload.settings.password, "[REDACTED]")
+              assert_eq!(.payload.payload.Cmd[2], "[REDACTED]")
+              assert!(!contains(encode_json(.), "two word secret"))
+              assert!(!contains(encode_json(.), "cli-secret"))
+              assert!(!contains(encode_json(.), "json-string-secret"))
+
+  - name: non_object_json_is_not_silently_accepted
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {"collector_channel": "executor", "message": "[\"--password\", \"array-password\"]"}
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.status, "parse_error")
+              assert_eq!(.payload.parse_error_code, "expected_object")
+              assert_eq!(.payload.raw_value[1], "[REDACTED]")
+              assert!(!contains(encode_json(.), "array-password"))
+
+  - name: collection_failure_is_distinct_from_parse_failure
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          .collector_channel = "state"
+          .message = encode_json({"event_type": "ARTIFACT_UPLOAD_FAILED", "collection_error": true, "message": "artifact upload failed", "run_id": "run-1", "action_id": "action-1"})
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.status, "collection_error")
+              assert_eq!(.event_type, "ARTIFACT_UPLOAD_FAILED")
+              assert_eq!(.context.action_id, "action-1")
+
+  - name: invalid_producer_time_is_visible
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          .collector_channel = "executor"
+          .message = encode_json({"occurred_at": "not-a-date", "event_type": "TOOL_RESULT"})
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.status, "parse_error")
+              assert_eq!(.payload.timestamp_parse_error, true)
+              assert!(is_timestamp(.occurred_at))
+
+  - name: audit_encoded_and_split_arguments_cannot_leak
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {"collector_channel": "auditd", "message": "type=EXECVE msg=audit(1788051601.123:42): argc=3 a0=6375726c a1=\"--token\" a2=\"audit-argument-secret\" proctitle=736563726574"}
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.payload.audit_arguments_omitted, true)
+              assert_eq!(.event_type, "audit.execve")
+              assert!(!contains(encode_json(.), "audit-argument-secret"))
+              assert!(!contains(encode_json(.), "736563726574"))
+
+  - name: docker_exec_action_is_a_bounded_kind
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          .collector_channel = "docker_event"
+          .message = encode_json({"Type": "container", "Action": "exec_create: /bin/echo a very long command --token=exec-secret", "time": 1788051601})
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event_type, "docker_event.exec_create")
+              assert!(contains(string!(.payload.Action), "/bin/echo"))
+              assert!(!contains(encode_json(.), "exec-secret"))
+
+  - name: nul_is_safely_represented_for_jsonb_storage
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {"collector_channel": "journald", "message": "before" + decode_base16!("00") + "after"}
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.message, "before\\u0000after")
+              assert_eq!(.payload.nul_byte_escaped, true)
+              assert_eq!(.status, "collection_error")
+
+  - name: cookie_header_masks_all_values
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {"collector_channel": "journald", "message": "Cookie: session=first-cookie; refresh=second-cookie"}
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert!(!contains(encode_json(.), "first-cookie"))
+              assert!(!contains(encode_json(.), "second-cookie"))

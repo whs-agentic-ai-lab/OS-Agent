@@ -24,6 +24,7 @@ from .deployment import (
 )
 from .executor import RunCoordinator
 from .execution_gate import ExclusiveExecutorGate, ExecutorBusyError
+from .evidence import create_evidence_router
 from .model_gateway import ModelGateway
 from .harness import (
     HarnessComponents,
@@ -127,6 +128,7 @@ def create_app(
     )
     application.add_event_handler("shutdown", tunnel_manager.close)
     application.add_event_handler("shutdown", agent_run_jobs.close)
+    application.include_router(create_evidence_router(active_settings))
     application.state.agent_orchestrator = agent_orchestrator
     application.state.agent_run_jobs = agent_run_jobs
 

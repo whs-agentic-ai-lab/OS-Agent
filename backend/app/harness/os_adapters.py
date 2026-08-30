@@ -4,6 +4,7 @@ from typing import Any
 
 from ..attack_tools import IMPLEMENTED_ATTACK_TOOLS
 from ..catalog import build_profile_id, resolve_trust_boundary
+from ..evidence_emitter import emit_execution_evidence
 from ..model_gateway import ModelGateway
 from ..runtime_client import EnvironmentRuntime
 from ..schemas import (
@@ -379,6 +380,10 @@ class OsIndependentVerifier(_RuntimeBackedAdapter):
             after_sha256=result.after_sha256,
         )
         tool_verification = verify_tool(record)
+        emit_execution_evidence(
+            "VERIFIER_RESULT", result=result, verification=tool_verification,
+            source="harness-backend",
+        )
         checks = {
             "runtime_run_id_matches": result.run_id == run_id,
             "runtime_boundary_matches": result.subject_mode.value == state["subject_mode"],

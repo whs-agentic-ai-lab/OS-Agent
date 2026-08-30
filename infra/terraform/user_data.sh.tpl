@@ -163,12 +163,11 @@ unset openrouter_api_key
 chown root:root /etc/os-agent/secrets/runtime.env
 chmod 0600 /etc/os-agent/secrets/runtime.env
 
-asset_bundle="$(mktemp)"
-printf '%s' '${bootstrap_bundle_b64}' | base64 -d | gzip -dc >"$asset_bundle"
 write_asset() {
-  local asset_key="$1"
-  local destination="$2"
-  jq -er --arg key "$asset_key" '.[$key]' "$asset_bundle" >"$destination"
+case "$1" in
+${bootstrap_asset_cases}
+*) return 1 ;;
+esac >"$2"
 }
 
 write_asset topology_json /etc/os-agent/topology.json
@@ -194,6 +193,8 @@ write_asset journald /etc/systemd/journald.conf.d/99-os-agent.conf
 write_asset nftables /etc/nftables.d/os-agent.nft
 write_asset vector_config /etc/vector/vector.yaml
 write_asset normalize_vrl /etc/vector/normalize.vrl
+write_asset evidence_upload_config /etc/os-agent/evidence-upload.json
+chmod 0644 /etc/os-agent/evidence-upload.json
 write_asset logrotate /etc/logrotate.d/os-agent
 write_asset supervisor_unit /etc/systemd/system/os-agent-host-supervisor.service
 write_asset experiment_unit /etc/systemd/system/os-agent-experiment.service
@@ -204,7 +205,6 @@ write_asset relay_docker_events /opt/os-agent/scripts/relay_docker_events.sh
 write_asset relay_docker_logs /opt/os-agent/scripts/relay_docker_logs.sh
 write_asset capture_state /opt/os-agent/scripts/capture_state.sh
 write_asset verify_environment /opt/os-agent/scripts/verify_environment.sh
-rm -f -- "$asset_bundle"
 
 chown root:root \
   /etc/docker/daemon.json \
@@ -310,10 +310,14 @@ verify_image_contract os-agent-target-source '${target_image_uri}' target-servic
 docker create --name os-agent-runtime-source '${runtime_image_uri}' >/dev/null
 docker cp os-agent-runtime-source:/app/host_runtime/host_supervisor.py /opt/os-agent/bin/host-supervisor.py
 docker cp os-agent-runtime-source:/app/runtime_agent /opt/os-agent/runtime_agent
+docker cp os-agent-runtime-source:/app/host_runtime/evidence_upload.py /opt/os-agent/bin/evidence-upload.py
+docker cp os-agent-runtime-source:/app/app/evidence_security.py /opt/os-agent/bin/evidence_security.py
 docker rm os-agent-runtime-source >/dev/null
 rm -rf -- "$runtime_tmp"
 chown root:root /opt/os-agent/bin/host-supervisor.py
 chmod 0755 /opt/os-agent/bin/host-supervisor.py
+chown root:root /opt/os-agent/bin/evidence-upload.py /opt/os-agent/bin/evidence_security.py
+chmod 0644 /opt/os-agent/bin/evidence-upload.py /opt/os-agent/bin/evidence_security.py
 chown -R root:root /opt/os-agent/runtime_agent
 find /opt/os-agent/runtime_agent -type d -exec chmod 0755 {} +
 find /opt/os-agent/runtime_agent -type f -exec chmod 0644 {} +

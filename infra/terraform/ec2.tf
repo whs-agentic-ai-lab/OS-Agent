@@ -39,6 +39,12 @@ locals {
       environment_id    = var.environment_id
       topology_revision = local.topology_revision
     })
+    evidence_upload_config = jsonencode({
+      enabled        = var.enable_remote_evidence_sink
+      api_url        = var.evidence_api_url
+      environment_id = var.environment_id
+      token_file     = "/etc/vector/secrets/collector_token"
+    })
     logrotate           = file("${path.module}/config/logrotate/os-agent")
     supervisor_unit     = file("${path.module}/systemd/os-agent-host-supervisor.service")
     experiment_unit     = file("${path.module}/systemd/os-agent-experiment.service")
@@ -53,14 +59,23 @@ locals {
 
   minified_bootstrap_assets = {
     for name, content in local.bootstrap_assets : name => join("\n", [
-      for line in split("\n", replace(content, "\r\n", "\n")) : line
+      for line in split("\n", replace(content, "\r\n", "\n")) : name == "normalize_vrl" ? trimspace(line) : line
       if trimspace(line) != "" && (
         !startswith(trimspace(line), "#") || startswith(trimspace(line), "#!")
       )
     ])
   }
 
-  bootstrap_bundle_b64 = base64gzip(jsonencode(local.minified_bootstrap_assets))
+  # Quoted heredocs keep asset bytes literal; one outer gzip avoids nested
+  # base64/JSON escaping overhead while retaining the existing size limit.
+  bootstrap_asset_cases = join("\n", [
+    for name, content in local.minified_bootstrap_assets : join("\n", [
+      "${name}) cat <<'OS_AGENT_ASSET'",
+      content,
+      "OS_AGENT_ASSET",
+      ";;",
+    ])
+  ])
 
   rendered_user_data_source = templatefile("${path.module}/user_data.sh.tpl", {
     aws_region                  = var.aws_region
@@ -76,7 +91,7 @@ locals {
     enable_remote_evidence_sink = var.enable_remote_evidence_sink
     collector_parameter_name    = var.collector_token_parameter_name
     openrouter_parameter_name   = var.openrouter_api_key_parameter_name
-    bootstrap_bundle_b64        = local.bootstrap_bundle_b64
+    bootstrap_asset_cases       = local.bootstrap_asset_cases
   })
 
   rendered_user_data = join("\n", [

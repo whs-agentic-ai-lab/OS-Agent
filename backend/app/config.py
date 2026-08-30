@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import os
 
@@ -15,6 +15,7 @@ class Settings:
     runtime_dir: Path
     supabase_url: str | None = None
     supabase_secret_key: str | None = None
+    evidence_collector_token: str | None = field(default=None, repr=False)
     aws_profile: str = "whs-team"
     aws_region: str = "us-east-1"
     terraform_dir: Path = PROJECT_ROOT / "infra" / "terraform"
@@ -44,6 +45,7 @@ def get_settings() -> Settings:
             or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
             or None
         ),
+        evidence_collector_token=os.getenv("EVIDENCE_COLLECTOR_TOKEN") or None,
         aws_profile=os.getenv("AWS_PROFILE", "whs-team"),
         aws_region=os.getenv("AWS_REGION", "us-east-1"),
         terraform_dir=PROJECT_ROOT / "infra" / "terraform",

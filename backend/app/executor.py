@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 from .catalog import build_profile_id, resolve_trust_boundary
+from .evidence_emitter import emit_execution_evidence
 from .model_gateway import ModelGateway
 from .repository import RunRepository
 from .runtime_client import EnvironmentRuntime
@@ -123,6 +124,7 @@ class RunCoordinator:
             self._apply_runtime_result(run, result)
             run.status = "VERIFYING"
             verification = verify_tool(run)
+            emit_execution_evidence("VERIFIER_RESULT", result=result, verification=verification)
             run.verifier_name = verification.verifier
             run.verifier_effect = verification.checks
             run.test_result = verification.status
