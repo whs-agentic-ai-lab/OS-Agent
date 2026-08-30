@@ -130,6 +130,81 @@ def test_host_runtime_groups_are_scoped_to_one_process(monkeypatch) -> None:
     assert "--init-groups" not in command
 
 
+def test_recon_identity_capability_sets_satisfy_host_profile_checks(monkeypatch) -> None:
+    _install_fixed_host_identities(monkeypatch)
+    monkeypatch.setattr(
+        host_supervisor.grp,
+        "getgrnam",
+        lambda name: types.SimpleNamespace(
+            gr_gid=999 if name == "docker" else 21002,
+            gr_mem=[],
+        ),
+        raising=False,
+    )
+    profile = {
+        **host_supervisor.HOST_PROFILE_DEFAULTS,
+        "group_write": True,
+        "docker_group_access": True,
+        "no_new_privileges": False,
+        "dac_override": True,
+        "setuid_capability": True,
+        "setgid_capability": True,
+        "sys_ptrace_capability": True,
+    }
+    effective = [
+        "CAP_DAC_OVERRIDE",
+        "CAP_SETUID",
+        "CAP_SETGID",
+        "CAP_SYS_PTRACE",
+    ]
+
+    checks = host_supervisor._runtime_profile_checks(
+        "host",
+        profile,
+        {
+            "identity_before": {
+                "euid": 21001,
+                "groups": [21002, 999],
+                "no_new_privs": False,
+                "capability_sets": {"effective": effective},
+            }
+        },
+    )
+
+    assert checks["requested_capabilities_effective"] is True
+    assert all(checks.values())
+
+
+def test_conflicting_capability_shapes_fail_closed(monkeypatch) -> None:
+    _install_fixed_host_identities(monkeypatch)
+    monkeypatch.setattr(
+        host_supervisor.grp,
+        "getgrnam",
+        lambda _name: types.SimpleNamespace(gr_gid=21002, gr_mem=[]),
+        raising=False,
+    )
+    profile = {
+        **host_supervisor.HOST_PROFILE_DEFAULTS,
+        "dac_override": True,
+    }
+
+    checks = host_supervisor._runtime_profile_checks(
+        "host",
+        profile,
+        {
+            "identity_before": {
+                "euid": 21001,
+                "groups": [],
+                "no_new_privs": True,
+                "capabilities": ["CAP_DAC_OVERRIDE"],
+                "capability_sets": {"effective": []},
+            }
+        },
+    )
+
+    assert checks["requested_capabilities_effective"] is False
+
+
 @pytest.mark.skipif(os.geteuid() != 0, reason="fixed topology ownership requires root")
 def test_target_canary_uses_fixed_topology_directories(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(host_supervisor, "TARGET_ROOT", tmp_path)

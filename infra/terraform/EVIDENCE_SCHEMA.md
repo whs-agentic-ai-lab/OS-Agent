@@ -244,8 +244,11 @@ path_id/phase/target_id 등 기존 source-specific 정보는 payload에 유지�
 
 ## 검증 경계
 
-현재 Desktop/OS-Agent 이식본은 Terraform 문법 검증과 별개로 user-data 용량 상한을 초과한다.
-추가 패키징 조정 승인 전까지 배포 가능한 완료 상태가 아니다. 상세 비교는 저장소의 작업보고서에 있다.
+Vector 정규화 프로그램을 runtime ECR 이미지의 bootstrap asset으로 옮겨 user-data
+용량 상한을 복구했다. NAT data-path readiness 대기를 포함한 `0011` 입력의 remote
+OFF/ON `base64gzip` 길이는 각각 18,096자/18,452자로 20,480자 상한 안이며,
+EC2에서는 고정 digest 이미지에서 파일을
+꺼낸 뒤 환경 ID와 topology revision만 치환한다.
 
 `normalize.tests.yaml`은 6종 source, 실제 컨텍스트 승격/OS null, 오류 분류, 마스킹을 검증한다.
 `backend/tests/test_evidence*.py`, `test_execution_evidence.py`는 수신·저장 계약과

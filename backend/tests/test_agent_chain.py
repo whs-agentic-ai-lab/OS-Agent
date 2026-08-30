@@ -1,7 +1,11 @@
 import json
 
+import httpx
+
 from app.agent_orchestrator import AgentOrchestrator, permission_profile_hash
 from app.catalog import TRUST_BOUNDARIES
+from app.config import Settings
+from app.model_gateway import ATTACK_FUNCTION_NAME, ModelGateway
 from app.permission_minimizer import collect_maximum_permission_profiles
 from app.repository import InMemoryAgentRunRepository
 from app.schemas import (
@@ -302,6 +306,196 @@ def test_duplicate_state_and_decision_stops_before_another_dispatch() -> None:
     assert result.verdict == "INCONCLUSIVE"
     assert result.rollback_status == "VERIFIED"
     assert len(runtime.reset_requests) == 1
+
+
+def test_openrouter_invalid_registry_pair_falls_back_to_current_frontier(
+    monkeypatch, tmp_path
+) -> None:
+    gateway = ModelGateway(
+        Settings(
+            openrouter_api_key="test-key",
+            openrouter_model="openai/gpt-5-mini",
+            allowed_origins=("http://127.0.0.1:5173",),
+            runtime_dir=tmp_path,
+        )
+    )
+
+    class InvalidPairResponse:
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "choices": [{"message": {"tool_calls": [{"function": {
+                    "name": ATTACK_FUNCTION_NAME,
+                    "arguments": {
+                        "tool_id": "file.content",
+                        "action": "read_cmdline",
+                        "resource_ref": "target-canary",
+                        "arguments": {},
+                    },
+                }}]}}]
+            }
+
+    monkeypatch.setattr("app.model_gateway.httpx.post", lambda *args, **kwargs: InvalidPairResponse())
+    prompt = json.dumps({
+        "untried_candidates": [OBSERVE.model_dump(mode="json")],
+        "executed_steps": [],
+    })
+
+    action = gateway.next_action(prompt, TRUST_BOUNDARIES[0])
+
+    assert action.kind == "tool"
+    assert action.decision == OBSERVE
+    assert "결정론적 대체 행동" in action.rationale
+
+
+def test_openrouter_candidate_outside_frontier_falls_back_without_dispatching_it(
+    monkeypatch, tmp_path
+) -> None:
+    gateway = ModelGateway(
+        Settings(
+            openrouter_api_key="test-key",
+            openrouter_model="openai/gpt-5-mini",
+            allowed_origins=("http://127.0.0.1:5173",),
+            runtime_dir=tmp_path,
+        )
+    )
+
+    class OutsideFrontierResponse:
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "choices": [{"message": {"tool_calls": [{"function": {
+                    "name": ATTACK_FUNCTION_NAME,
+                    "arguments": {
+                        "tool_id": "file.content",
+                        "action": "read",
+                        "resource_ref": "target-canary",
+                        "arguments": {},
+                    },
+                }}]}}]
+            }
+
+    monkeypatch.setattr("app.model_gateway.httpx.post", lambda *args, **kwargs: OutsideFrontierResponse())
+    prompt = json.dumps({
+        "untried_candidates": [OBSERVE.model_dump(mode="json")],
+        "executed_steps": [],
+    })
+
+    action = gateway.next_action(prompt, TRUST_BOUNDARIES[0])
+
+    assert action.decision == OBSERVE
+    assert "frontier 밖" in action.rationale
+
+
+def test_openrouter_transport_error_falls_back_to_current_frontier(
+    monkeypatch, tmp_path
+) -> None:
+    gateway = ModelGateway(
+        Settings(
+            openrouter_api_key="test-key",
+            openrouter_model="openai/gpt-5-mini",
+            allowed_origins=("http://127.0.0.1:5173",),
+            runtime_dir=tmp_path,
+        )
+    )
+
+    def fail_post(*args, **kwargs):
+        del args, kwargs
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr("app.model_gateway.httpx.post", fail_post)
+    prompt = json.dumps({
+        "untried_candidates": [OBSERVE.model_dump(mode="json")],
+        "executed_steps": [],
+    })
+
+    action = gateway.next_action(prompt, TRUST_BOUNDARIES[0])
+
+    assert action.decision == OBSERVE
+    assert "해석할 수 없었습니다" in action.rationale
+
+
+def test_openrouter_invalid_finish_falls_back_to_current_frontier(
+    monkeypatch, tmp_path
+) -> None:
+    gateway = ModelGateway(
+        Settings(
+            openrouter_api_key="test-key",
+            openrouter_model="openai/gpt-5-mini",
+            allowed_origins=("http://127.0.0.1:5173",),
+            runtime_dir=tmp_path,
+        )
+    )
+
+    class InvalidFinishResponse:
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "choices": [{"message": {"tool_calls": [{"function": {
+                    "name": "finish_attack_chain",
+                    "arguments": {"reason": "MODEL_DECIDED", "rationale": "done"},
+                }}]}}]
+            }
+
+    monkeypatch.setattr("app.model_gateway.httpx.post", lambda *args, **kwargs: InvalidFinishResponse())
+    prompt = json.dumps({
+        "untried_candidates": [OBSERVE.model_dump(mode="json")],
+        "executed_steps": [],
+    })
+
+    action = gateway.next_action(prompt, TRUST_BOUNDARIES[0])
+
+    assert action.decision == OBSERVE
+    assert "종료 사유" in action.rationale
+
+
+def test_permission_minimizer_invalid_model_ids_use_deterministic_subset(
+    monkeypatch, tmp_path
+) -> None:
+    gateway = ModelGateway(
+        Settings(
+            openrouter_api_key="test-key",
+            openrouter_model="openai/gpt-5-mini",
+            allowed_origins=("http://127.0.0.1:5173",),
+            runtime_dir=tmp_path,
+        )
+    )
+
+    class InvalidPermissionResponse:
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "choices": [{"message": {"tool_calls": [{"function": {
+                    "name": "select_permission_ids",
+                    "arguments": {"permission_ids": ["container:invented"]},
+                }}]}}]
+            }
+
+    monkeypatch.setattr("app.model_gateway.httpx.post", lambda *args, **kwargs: InvalidPermissionResponse())
+
+    selected = gateway.suggest_permission_ids(
+        available_ids=["host:limited_sudo", "host:no_new_privileges"],
+        relevant_ids=["host:limited_sudo"],
+        contract={},
+    )
+
+    assert selected == ["host:limited_sudo"]
 
 
 def test_tool_watchdog_returns_inconclusive_replay_checkpoint() -> None:

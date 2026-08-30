@@ -35,10 +35,6 @@ locals {
       remote_sink_enabled = var.enable_remote_evidence_sink
       evidence_api_uri    = jsonencode("${var.evidence_api_url}/internal/evidence/events")
     })
-    normalize_vrl = templatefile("${path.module}/config/vector/normalize.vrl.tpl", {
-      environment_id    = var.environment_id
-      topology_revision = local.topology_revision
-    })
     evidence_upload_config = jsonencode({
       enabled        = var.enable_remote_evidence_sink
       api_url        = var.evidence_api_url
@@ -59,7 +55,7 @@ locals {
 
   minified_bootstrap_assets = {
     for name, content in local.bootstrap_assets : name => join("\n", [
-      for line in split("\n", replace(content, "\r\n", "\n")) : name == "normalize_vrl" ? trimspace(line) : line
+      for line in split("\n", replace(content, "\r\n", "\n")) : line
       if trimspace(line) != "" && (
         !startswith(trimspace(line), "#") || startswith(trimspace(line), "#!")
       )

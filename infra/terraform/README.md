@@ -88,12 +88,14 @@ Collector token 값은 기존 SSM SecureString에서 boot 시 읽으며 Terrafor
 
 ## Evidence 원격 연결
 
-현재 선택 이식본은 **user-data 용량 검증에 실패해 배포 준비가 끝나지 않았다.**
-동일한 검증 입력에서 gzip 크기가 remote OFF 16,038 B / ON 16,273 B로,
-기존 15,360 B 상한을 초과한다. 이전 선택 이식의 기준 HEAD `809b845`는 두 경우 모두 통과했다.
-pull 후 `c049914`에서도 같은 크기를 재확인했으며, 기존 로깅 이식분은 이미 포함돼 있어 재복사하지 않았다.
-상한은 그대로 유지했으며, 추가 패키징 조정은 사용자 승인 전 보류했다.
-아래 설정 예시는 적용 완료를 의미하지 않는다. 비교 결과는 작업보고서를 참고한다.
+기준 HEAD `c049914`에서는 동일 검증 입력의 gzip 크기가 remote OFF 16,038 B /
+ON 16,273 B로 당시 15,360 B 상한을 초과했다. 현재 변경은 그 원인이던 Vector
+정규화 프로그램을 user-data에서 분리했다.
+Vector 정규화 프로그램은 runtime ECR 이미지의 bootstrap asset으로 패키징하고,
+EC2 부팅 시 고정 digest 이미지에서 꺼내 환경 ID와 topology revision만 치환한다.
+따라서 비밀값이나 정규화 기능을 제거하지 않고 user-data 15,360 B 상한을 유지한다.
+NAT data-path readiness 대기를 포함한 `0011` 검증 입력의 `base64gzip` 길이는
+remote OFF 18,096자 / ON 18,452자로, 20,480자 상한을 모두 통과한다.
 
 이 절은 기존 OS-Tool 구현의 설정 계약이다. 로컬 파일 이식은 배포·DB 적용·원격 검증 완료를
 뜻하지 않는다. 실제 대상과 영향을 승인받기 전에는 서비스 재시작·배포·migration을 실행하지 않는다.

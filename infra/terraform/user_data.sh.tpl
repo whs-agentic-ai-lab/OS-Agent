@@ -19,6 +19,11 @@ retry() {
   done
 }
 
+wait_for_https() {
+  retry 30 curl -4 --proto '=https' --tlsv1.2 \
+    --connect-timeout 5 --max-time 10 -fsSLo /dev/null "$1"
+}
+
 echo "Starting OS Agent topology ${topology_revision} bootstrap"
 
 # Private EC2 SG는 HTTP/80을 허용하지 않는다. Ubuntu package source도 HTTPS로 고정한다.
@@ -28,7 +33,12 @@ while IFS= read -r source_file; do
     "$source_file"
 done < <(find /etc/apt -maxdepth 3 -type f \( -name '*.list' -o -name '*.sources' \))
 
-retry 6 apt-get update -y
+# Terraform may report the NAT gateway as available just before its data path is
+# usable. apt-get update can still exit zero when every index download failed,
+# so gate bootstrap on real HTTPS traffic and make index errors fatal/retryable.
+wait_for_https https://security.ubuntu.com/ubuntu/
+wait_for_https https://${aws_region}.ec2.archive.ubuntu.com/ubuntu/
+retry 6 apt-get update -o APT::Update::Error-Mode=any -y
 retry 6 apt-get install -y \
   ca-certificates \
   curl \
@@ -68,7 +78,7 @@ chmod a+r /etc/apt/keyrings/docker.gpg
 printf '%s\n' \
   "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && printf '%s' "$VERSION_CODENAME") stable" \
   >/etc/apt/sources.list.d/docker.list
-retry 6 apt-get update -y
+retry 6 apt-get update -o APT::Update::Error-Mode=any -y
 retry 6 apt-get install -y \
   docker-ce \
   docker-ce-cli \
@@ -192,7 +202,6 @@ write_asset audit_rules /etc/audit/rules.d/50-os-agent.rules
 write_asset journald /etc/systemd/journald.conf.d/99-os-agent.conf
 write_asset nftables /etc/nftables.d/os-agent.nft
 write_asset vector_config /etc/vector/vector.yaml
-write_asset normalize_vrl /etc/vector/normalize.vrl
 write_asset evidence_upload_config /etc/os-agent/evidence-upload.json
 chmod 0644 /etc/os-agent/evidence-upload.json
 write_asset logrotate /etc/logrotate.d/os-agent
@@ -226,8 +235,8 @@ chmod 0644 \
   /opt/os-agent/compose/experiment-compose.yml
 chmod 0640 /etc/audit/rules.d/50-os-agent.rules
 chmod 0750 /opt/os-agent/scripts/*.sh
-chown root:vector /etc/vector/vector.yaml /etc/vector/normalize.vrl /etc/vector/secrets
-chmod 0640 /etc/vector/vector.yaml /etc/vector/normalize.vrl
+chown root:vector /etc/vector/vector.yaml /etc/vector/secrets
+chmod 0640 /etc/vector/vector.yaml
 chmod 0750 /etc/vector/secrets
 
 # Recon 전용 persistence fixture. 기존 Action Tool의 sudoers/profile 파일과
@@ -312,8 +321,15 @@ docker cp os-agent-runtime-source:/app/host_runtime/host_supervisor.py /opt/os-a
 docker cp os-agent-runtime-source:/app/runtime_agent /opt/os-agent/runtime_agent
 docker cp os-agent-runtime-source:/app/host_runtime/evidence_upload.py /opt/os-agent/bin/evidence-upload.py
 docker cp os-agent-runtime-source:/app/app/evidence_security.py /opt/os-agent/bin/evidence_security.py
+docker cp os-agent-runtime-source:/app/bootstrap_assets/normalize.vrl.tpl /etc/vector/normalize.vrl
 docker rm os-agent-runtime-source >/dev/null
 rm -rf -- "$runtime_tmp"
+sed -i \
+  -e 's|$${environment_id}|${environment_id}|g' \
+  -e 's|$${topology_revision}|${topology_revision}|g' \
+  /etc/vector/normalize.vrl
+chown root:vector /etc/vector/normalize.vrl
+chmod 0640 /etc/vector/normalize.vrl
 chown root:root /opt/os-agent/bin/host-supervisor.py
 chmod 0755 /opt/os-agent/bin/host-supervisor.py
 chown root:root /opt/os-agent/bin/evidence-upload.py /opt/os-agent/bin/evidence_security.py

@@ -11,15 +11,11 @@ hooks.
 from __future__ import annotations
 
 import errno as errno_module
-import fcntl
-import grp
 import hashlib
 import ipaddress
 import json
 import os
-import pwd
 import re
-import resource
 import shutil
 import socket
 import stat
@@ -28,6 +24,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
+
+try:
+    import fcntl
+except ImportError:  # Windows control plane: handlers execute on Linux only.
+    fcntl = None  # type: ignore[assignment]
+try:
+    import grp
+except ImportError:  # Windows control plane: handlers execute on Linux only.
+    grp = None  # type: ignore[assignment]
+try:
+    import pwd
+except ImportError:  # Windows control plane: handlers execute on Linux only.
+    pwd = None  # type: ignore[assignment]
+try:
+    import resource
+except ImportError:  # Windows control plane: handlers execute on Linux only.
+    resource = None  # type: ignore[assignment]
 
 
 MAX_TEXT_BYTES = 4096
@@ -1046,6 +1059,13 @@ def _file_data(tool_name: str, path: Path, arguments: dict[str, Any]) -> dict[st
         return {**base, "available": result["available"], "flags": flags[:64]}
     if tool_name in {"os_filesystem_type_status", "os_file_lock_status"}:
         if tool_name == "os_file_lock_status":
+            if fcntl is None:
+                return {
+                    **base,
+                    "shared_lock_available": False,
+                    "fd_closed": True,
+                    "platform_supported": False,
+                }
             descriptor = os.open(path, os.O_RDONLY)
             acquired = False
             try:
@@ -1281,6 +1301,14 @@ def _systemd_data(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         result = _run_fixed(("atq",))
         return {"available": result["available"], "job_count": len(result["stdout"].splitlines()[:maximum]), "output_sha256": _text_hash(result["stdout"])}
     if tool_name == "os_account_status":
+        if pwd is None:
+            return {
+                "accounts": [
+                    {"logical_id": name, "available": False}
+                    for name in ("user1", "user2")
+                ],
+                "platform_supported": False,
+            }
         accounts = []
         for name in ("user1", "user2"):
             try:
@@ -1290,6 +1318,14 @@ def _systemd_data(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 accounts.append({"logical_id": name, "available": False})
         return {"accounts": accounts}
     if tool_name == "os_group_status":
+        if grp is None:
+            return {
+                "groups": [
+                    {"logical_id": name, "available": False}
+                    for name in ("os-agent-supervisor", "os-agent-trial", "docker")
+                ],
+                "platform_supported": False,
+            }
         groups = []
         for name in ("os-agent-supervisor", "os-agent-trial", "docker"):
             try:
@@ -1810,6 +1846,8 @@ def _process_limits(pid: int) -> dict[str, dict[str, str]]:
 
 
 def _rlimit_snapshot() -> dict[str, Any]:
+    if resource is None:
+        return {"platform_supported": False}
     names = {
         "nofile": resource.RLIMIT_NOFILE,
         "nproc": getattr(resource, "RLIMIT_NPROC", resource.RLIMIT_NOFILE),

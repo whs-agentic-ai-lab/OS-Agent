@@ -587,12 +587,18 @@ class DeploymentManager:
                 repository_url = str(repository_urls[component])
                 local_image = f"{environment.environment_id}-{component}:{tag}"
                 remote_image = f"{repository_url}:{tag}"
+                build_context_args = (
+                    ["--build-context", f"terraform={self.settings.terraform_dir}"]
+                    if component == "runtime"
+                    else []
+                )
                 self._command(
                     [
                         docker,
                         "build",
                         "--platform",
                         "linux/amd64",
+                        *build_context_args,
                         "--file",
                         str(self.settings.backend_context / dockerfile),
                         "--tag",

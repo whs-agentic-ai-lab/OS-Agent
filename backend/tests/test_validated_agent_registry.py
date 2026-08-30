@@ -176,4 +176,10 @@ def test_representative_recon_dispatches_to_existing_handler() -> None:
 
     assert result["outcome"] == "ALLOWED"
     assert result["attempted"] is True
+    assert "capabilities" in result["identity_before"]
+    assert "capability_sets" in result["identity_before"]
+    assert "docker_socket" in result["identity_before"]
+    assert "apparmor_profile" in result["identity_before"]
+    assert "system_path_mounts" in result["identity_before"]
+    assert result["runtime_agent"].endswith("-executor-v6")
     assert any(event["event_type"] == "RECON_TOOL_EXECUTED" for event in result["events"])

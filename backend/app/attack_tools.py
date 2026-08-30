@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from runtime_agent.validated_actions import validated_action_names
+from runtime_agent.validated_actions import NON_PASS_ACTIONS
 from runtime_agent.validated_tool_registry import (
     VALIDATED_ACTION_REGISTRY,
     registry_by_tool,
@@ -26,14 +26,20 @@ class AttackToolDefinition:
 
 
 def _definition_catalogue() -> dict[str, list[str]]:
-    try:
-        from runtime_agent.tools import known_definitions
-        return known_definitions()
-    except (ImportError, RuntimeError, ValueError):
+    if not VALIDATED_ACTION_REGISTRY:
         return {}
+    catalogue: dict[str, set[str]] = {}
+    for registration in VALIDATED_ACTION_REGISTRY.values():
+        catalogue.setdefault(registration.tool_id, set()).add(registration.action)
+    for name in NON_PASS_ACTIONS:
+        tool_id, action = name.rsplit(".", 1)
+        catalogue.setdefault(tool_id, set()).add(action)
+    return {
+        tool_id: sorted(actions) for tool_id, actions in sorted(catalogue.items())
+    }
 
 
-VALIDATED_ACTION_NAMES = validated_action_names()
+VALIDATED_ACTION_NAMES = frozenset(VALIDATED_ACTION_REGISTRY)
 _CATALOGUE = _definition_catalogue()
 _REGISTRY_BY_TOOL = registry_by_tool()
 

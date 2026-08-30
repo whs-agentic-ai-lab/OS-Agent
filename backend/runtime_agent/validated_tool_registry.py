@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 
-from runtime_agent.validated_actions import NON_PASS_ACTIONS, validated_action_names
+from runtime_agent.validated_actions import (
+    NON_PASS_ACTIONS,
+    validated_action_contracts,
+    validated_action_names,
+)
 
 
 FORBIDDEN_ARGUMENT_NAMES = frozenset({
@@ -49,14 +54,87 @@ class ValidatedActionRegistration:
     reversible: bool
 
 
+class _ForbiddenManifestArgument:
+    """Uninstantiable marker used for arguments forbidden by the live contract."""
+
+    def __new__(cls) -> "_ForbiddenManifestArgument":
+        raise TypeError("forbidden Tool argument")
+
+
+_MANIFEST_SCHEMA_TYPES: dict[str, Any] = {
+    "str": str,
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "list": list,
+    "dict": dict,
+    "_ForbiddenRawArgument": _ForbiddenManifestArgument,
+}
+
+
+def _manifest_schema(schema: Any) -> dict[str, Any]:
+    if not isinstance(schema, dict):
+        raise ValueError("validated action argument schema is malformed")
+    converted: dict[str, Any] = {}
+    for name, type_name in schema.items():
+        if not isinstance(name, str) or type_name not in _MANIFEST_SCHEMA_TYPES:
+            raise ValueError("validated action argument type is unsupported")
+        converted[name] = _MANIFEST_SCHEMA_TYPES[type_name]
+    return converted
+
+
+def _manifest_registry(
+    passed: frozenset[str],
+) -> dict[str, ValidatedActionRegistration]:
+    registrations: dict[str, ValidatedActionRegistration] = {}
+    for contract in validated_action_contracts():
+        name = contract.get("name")
+        tool_id = contract.get("tool")
+        action = contract.get("action")
+        resource_kind = contract.get("resource_kind")
+        if (
+            not isinstance(name, str)
+            or name not in passed
+            or not isinstance(tool_id, str)
+            or not isinstance(action, str)
+            or not isinstance(resource_kind, str)
+        ):
+            return {}
+        resource_refs = _RESOURCE_REFS_BY_KIND.get(resource_kind)
+        if resource_refs is None:
+            return {}
+        try:
+            registrations[name] = ValidatedActionRegistration(
+                name=name,
+                tool_id=tool_id,
+                action=action,
+                resource_kind=resource_kind,
+                resource_refs=resource_refs,
+                argument_schema=_manifest_schema(contract.get("argument_schema")),
+                required_arguments=frozenset(contract.get("required_arguments", ())),
+                allowed_executors=frozenset(contract.get("allowed_executors", ())),
+                allowed_tbs=frozenset(contract.get("allowed_tbs", ())),
+                destructive=bool(contract.get("destructive")),
+                reversible=bool(contract.get("reversible")),
+            )
+        except (TypeError, ValueError):
+            return {}
+    return registrations
+
+
 def _build_registry() -> dict[str, ValidatedActionRegistration]:
     passed = validated_action_names()
     if not passed:
         return {}
+    if sys.platform != "linux":
+        registrations = _manifest_registry(passed)
+        if len(registrations) != 378 or NON_PASS_ACTIONS.intersection(registrations):
+            return {}
+        return registrations
     try:
         from runtime_agent.tools import get_definition, known_definitions
         catalogue = known_definitions()
-    except (ImportError, RuntimeError, ValueError):
+    except (ImportError, OSError, RuntimeError, ValueError):
         return {}
     registrations: dict[str, ValidatedActionRegistration] = {}
     for tool_id, actions in sorted(catalogue.items()):

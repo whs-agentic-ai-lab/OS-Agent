@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 
@@ -122,7 +123,37 @@ def _action_names_sha256(names: frozenset[str] | set[str]) -> str:
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
+def _manifest_catalogue(
+    manifest_path: Path | None = None,
+) -> tuple[dict[str, list[str]], frozenset[str]]:
+    selected = manifest_path if manifest_path is not None else _default_manifest_path()
+    if selected is None:
+        raise ValueError("validated action manifest is unavailable")
+    payload = json.loads(selected.read_text(encoding="utf-8"))
+    if payload.get("schema_version") == "validated-manifest-fingerprint-v1":
+        raise ValueError("fingerprint manifest does not contain action contracts")
+    catalogue: dict[str, list[str]] = {}
+    for contract in _manifest_actions(payload):
+        tool = contract.get("tool")
+        action = contract.get("action")
+        if not isinstance(tool, str) or not isinstance(action, str):
+            raise ValueError("validation manifest action identity is malformed")
+        catalogue.setdefault(tool, []).append(action)
+    catalogue = {
+        tool: sorted(actions) for tool, actions in sorted(catalogue.items())
+    }
+    names = frozenset(
+        f"{tool}.{action}" for tool, actions in catalogue.items() for action in actions
+    )
+    return catalogue, names
+
+
 def _catalogue_action_names() -> tuple[dict[str, list[str]], frozenset[str]]:
+    # The ToolDefinition modules intentionally use Linux-only APIs (libc, fcntl,
+    # resource, pwd/grp).  The Windows control backend needs only their validated
+    # contracts; the actual handlers are imported later by the Linux executor.
+    if sys.platform != "linux":
+        return _manifest_catalogue()
     from runtime_agent.tools import known_definitions
     catalogue = known_definitions()
     names = frozenset(
@@ -165,6 +196,44 @@ def _manifest_verification(
     return verified, inventory_hash, names_hash
 
 
+def validated_action_contracts(
+    *, verify_source: bool = True, manifest_path: Path | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Return verified live-PASS contracts for metadata-only control planes.
+
+    This avoids importing Linux syscall handlers on Windows.  Source, inventory,
+    and action-name fingerprints are still checked before any contract is exposed.
+    """
+    if verify_source and tools_source_sha256() != CANONICAL_TOOLS_SOURCE_SHA256:
+        return ()
+    selected = manifest_path if manifest_path is not None else _default_manifest_path()
+    if selected is None:
+        return ()
+    try:
+        payload = json.loads(selected.read_text(encoding="utf-8"))
+        if payload.get("schema_version") == "validated-manifest-fingerprint-v1":
+            return ()
+        actions = _manifest_actions(payload)
+        catalogue, names = _manifest_catalogue(selected)
+        manifest_verified, _, _ = _manifest_verification(names, selected)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return ()
+    if (
+        not manifest_verified
+        or len(catalogue) != 129
+        or len(names) != 383
+        or not NON_PASS_ACTIONS <= names
+    ):
+        return ()
+    passed = names - NON_PASS_ACTIONS
+    if len(passed) != VALIDATION_COUNTS["PASS"]:
+        return ()
+    by_name = {str(action.get("name")): action for action in actions}
+    if set(by_name) != names:
+        return ()
+    return tuple(dict(by_name[name]) for name in sorted(passed))
+
+
 def validated_action_names(
     *, verify_source: bool = True, manifest_path: Path | None = None,
 ) -> frozenset[str]:
@@ -173,7 +242,7 @@ def validated_action_names(
         return frozenset()
     try:
         catalogue, names = _catalogue_action_names()
-    except (ImportError, RuntimeError, ValueError):
+    except (ImportError, OSError, RuntimeError, ValueError):
         return frozenset()
     manifest_verified, _, _ = _manifest_verification(names, manifest_path)
     if not manifest_verified:
@@ -191,7 +260,7 @@ def validation_provenance(manifest_path: Path | None = None) -> dict[str, object
         manifest_verified, manifest_hash, names_hash = _manifest_verification(
             names, manifest_path
         )
-    except (ImportError, RuntimeError, ValueError):
+    except (ImportError, OSError, RuntimeError, ValueError):
         catalogue, names = {}, frozenset()
         manifest_verified, manifest_hash, names_hash = False, None, None
     source_verified = current_hash == CANONICAL_TOOLS_SOURCE_SHA256

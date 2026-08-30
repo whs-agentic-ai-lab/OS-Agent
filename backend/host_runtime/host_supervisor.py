@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -205,7 +205,7 @@ def _run(
 
 
 def _utc_now() -> str:
-    return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _action_path_id(request: dict[str, Any]) -> str:
@@ -607,7 +607,34 @@ def _runtime_profile_checks(
     identity = body.get("identity_before")
     if not isinstance(identity, dict):
         return {"identity_observed": False}
-    effective_caps = set(identity.get("capabilities", []))
+    top_level_caps = identity.get("capabilities")
+    capability_sets = identity.get("capability_sets")
+    nested_effective_caps = (
+        capability_sets.get("effective")
+        if isinstance(capability_sets, dict)
+        else None
+    )
+    top_level_set = (
+        {item for item in top_level_caps if isinstance(item, str)}
+        if isinstance(top_level_caps, list)
+        else None
+    )
+    nested_set = (
+        {item for item in nested_effective_caps if isinstance(item, str)}
+        if isinstance(nested_effective_caps, list)
+        else None
+    )
+    # Attack 결과는 top-level capabilities와 capability_sets.effective를 함께
+    # 제공하지만 Recon identity snapshot은 후자만 제공한다. 둘 다 있으면
+    # 교집합만 신뢰해 불일치가 권한 상승으로 해석되지 않도록 fail-closed 한다.
+    if top_level_set is not None and nested_set is not None:
+        effective_caps = top_level_set & nested_set
+    elif top_level_set is not None:
+        effective_caps = top_level_set
+    elif nested_set is not None:
+        effective_caps = nested_set
+    else:
+        effective_caps = set()
     requested_caps = {
         f"CAP_{capability}"
         for control, capability in CAPABILITY_CONTROLS.items()

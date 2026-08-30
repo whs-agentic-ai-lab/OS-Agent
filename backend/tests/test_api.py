@@ -266,8 +266,11 @@ def test_agent_run_recons_and_tests_all_eight_boundaries_with_one_profile_hash(t
     assert "공격 가설을 스스로 생성" in body["objective"]
     assert body["profile_hash"].startswith("sha256:")
     assert len(body["tb_results"]) == 8
-    assert body["summary"] == {"broken": 8, "blocked": 0, "inconclusive": 0}
-    assert {item["proof_level"] for item in body["tb_results"]} == {"L4_RESTORED"}
+    assert body["summary"] == {"broken": 2, "blocked": 0, "inconclusive": 6}
+    assert {item["proof_level"] for item in body["tb_results"]} == {
+        "L1_REACHABLE",
+        "L4_RESTORED",
+    }
     assert len(runtime.requests) > 10
     main_chain_ids = {
         request.chain_id
@@ -283,9 +286,9 @@ def test_agent_run_recons_and_tests_all_eight_boundaries_with_one_profile_hash(t
         and request.chain_id is not None
         and request.chain_id.startswith("min-")
     }
-    assert len(main_chain_ids) == 8
+    assert len(main_chain_ids) == 2
     assert len(runtime.reset_requests) == (
-        2 + len(main_chain_ids) + len(minimization_chain_ids)
+        2 + len(body["tb_scenarios"]) + len(minimization_chain_ids)
     )
     recon_positions = [
         index
@@ -317,11 +320,12 @@ def test_agent_run_recons_and_tests_all_eight_boundaries_with_one_profile_hash(t
             0,
             runtime.operations[positions[-1]][3],
         )
-    assert body["attack_contract"]["trust_boundary_id"] == "TB-HC-C1U1"
+    assert body["attack_contract"]["trust_boundary_id"] == "TB-HH-U1U2"
     assert body["permission_minimization"]["status"] == "COMPLETED"
     assert body["permission_minimization"]["one_minimal_verified"] is True
     assert body["permission_minimization"]["minimal_permission_ids"] == [
-        "container:setuid_capability",
+        "host:limited_sudo",
+        "host:no_new_privileges=OFF",
     ]
     assert all(
         event["payload"]["profile_hash"] == body["profile_hash"]
@@ -452,7 +456,10 @@ def test_agent_run_uses_selected_openrouter_model_for_each_boundary(tmp_path: Pa
         if call.kwargs["json"]["tools"][0]["function"]["name"]
         != "select_permission_ids"
     ]
-    assert len(planner_calls) >= 8
+    # Only the two Trust Boundaries represented by the validated Tool contracts
+    # have an executable Attack frontier. The remaining six complete without
+    # asking the model to invent an out-of-contract action.
+    assert len(planner_calls) >= 2
     assert any(
         call.kwargs["json"]["tools"][0]["function"]["name"]
         == "select_permission_ids"
@@ -462,12 +469,18 @@ def test_agent_run_uses_selected_openrouter_model_for_each_boundary(tmp_path: Pa
         call.kwargs["json"]["model"] == "z-ai/glm-5.3-flash"
         for call in openrouter_post.call_args_list
     )
-    selected_tools = [
-        next(step for step in scenario["steps"] if step["type"] == "execute")["tool"]
+    executed_scenarios = {
+        scenario["trust_boundary_id"]: [
+            step["tool"] for step in scenario["steps"] if step["type"] == "execute"
+        ]
         for scenario in body["tb_scenarios"]
-    ]
-    assert selected_tools[:4] == ["sudo.run"] * 4
-    assert selected_tools[4:] == ["privilege.identity_probe"] * 4
+        if any(step["type"] == "execute" for step in scenario["steps"])
+    }
+    assert set(executed_scenarios) == {"TB-HH-U1U2", "TB-CC-C1C2"}
+    assert all(
+        call.kwargs["json"]["tools"][0]["function"]["name"] == "validated_attack"
+        for call in planner_calls
+    )
     assert all(request.planner_mode == "openrouter" for request in runtime.requests)
 
 

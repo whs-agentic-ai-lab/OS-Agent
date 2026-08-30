@@ -12,6 +12,9 @@ $backendRoot = Join-Path $projectRoot "backend"
 $frontendRoot = Join-Path $projectRoot "frontend"
 $backendUrl = "http://127.0.0.1:8000"
 $frontendUrl = "http://127.0.0.1:5173"
+$backendLogRoot = Join-Path $backendRoot "runtime"
+$backendStdoutLog = Join-Path $backendLogRoot "launcher-backend.out.log"
+$backendStderrLog = Join-Path $backendLogRoot "launcher-backend.err.log"
 
 function Show-LauncherMessage {
     param(
@@ -676,10 +679,15 @@ try {
         Stop-OrphanedSsmTunnel
         Stop-FrontendServer -Reason "변경된 코드 반영"
         Write-Host "백엔드를 시작합니다..."
+        New-Item -ItemType Directory -Path $backendLogRoot -Force | Out-Null
+        Remove-Item -LiteralPath $backendStdoutLog -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $backendStderrLog -Force -ErrorAction SilentlyContinue
         $backendProcess = Start-Process `
             -FilePath $venvPython `
             -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000") `
             -WorkingDirectory $backendRoot `
+            -RedirectStandardOutput $backendStdoutLog `
+            -RedirectStandardError $backendStderrLog `
             -PassThru
     }
     finally {
@@ -692,7 +700,10 @@ try {
     $backendReady = $false
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         if ($backendProcess.HasExited) {
-            throw "백엔드가 시작 직후 종료되었습니다. 백엔드 CMD 창의 오류를 확인하세요. 종료 코드: $($backendProcess.ExitCode)"
+            throw (
+                "백엔드가 시작 직후 종료되었습니다. 종료 코드: $($backendProcess.ExitCode)`n" +
+                "오류 로그: $backendStderrLog"
+            )
         }
         try {
             $health = Invoke-RestMethod -Uri "$backendUrl/api/health" -TimeoutSec 2

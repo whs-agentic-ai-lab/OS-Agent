@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY host_runtime ./host_runtime
 COPY runtime_agent ./runtime_agent
+COPY --from=terraform config/vector/normalize.vrl.tpl ./bootstrap_assets/normalize.vrl.tpl
 COPY --from=fixture-builder /identity-reporter ./runtime_agent/fixtures/identity-reporter
 
 RUN printf '%s\n' 'action-path-runtime-v1' > /app/RUNTIME_CONTRACT

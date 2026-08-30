@@ -627,6 +627,9 @@ def _run_recon_tool(
     subject_mode: str,
     permission_profile: dict[str, bool],
 ) -> dict[str, Any]:
+    # Supervisor profile checks require the canonical Runtime identity. Recon
+    # handlers keep their narrower read-only snapshot in data/output.
+    runtime_identity_before = _identity()
     events = [
         _event(
             "tool_runner",
@@ -674,6 +677,7 @@ def _run_recon_tool(
     )
     source = payload["source_environment"]
     target = payload["target_environment"]
+    runtime_identity_after = _identity()
     return {
         "run_id": payload["run_id"],
         "action_id": payload["action_id"],
@@ -686,7 +690,7 @@ def _run_recon_tool(
         "target": target,
         "applied_profile": payload["profile_id"],
         "applied_profile_state": {},
-        "runtime_agent": f"{source}-executor-v5",
+        "runtime_agent": f"{source}-executor-v6",
         "planner_mode": payload.get("planner_mode", "local"),
         "tool": tool,
         "action": action,
@@ -696,6 +700,9 @@ def _run_recon_tool(
         "runtime_result": _runtime_result(raw["outcome"]),
         "evidence_refs": [f"action:{payload['action_id']}:runtime"],
         **raw,
+        "identity_before": runtime_identity_before,
+        "identity_reached": runtime_identity_before,
+        "identity_after": runtime_identity_after,
         "events": events,
     }
 
