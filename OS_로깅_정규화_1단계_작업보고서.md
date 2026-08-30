@@ -1,6 +1,60 @@
 # OS 로깅 선택 이식 작업보고서
 
-## 현재 대상: Desktop/OS-Agent (2026-08-30)
+## Pull 후 재확인: HEAD c049914 (2026-08-30)
+
+결론: **이전의 선택 이식분은 새 HEAD에 이미 포함돼 있어 프로덕션 코드를 다시 복사하지 않았다.**
+`fab08a4`에 기존 Evidence/Vector 이식이 들어 있고, 현재 `c049914`에는 그 이후의 validated tool 연결 변경도 포함돼 있다. 원본 파일을 다시 덮어쓰면 최신 툴 레지스트리·Harness 동작을 되돌릴 수 있다.
+
+### 이번에 확인·유지한 범위
+
+- 시작 시 tracked 파일은 clean이었다. 현재 코드와 OS-Tool 원본을 직접 비교했으며 과거 문서의 완료 여부만으로 판단하지 않았다.
+- Evidence API·인증·마스킹·업로더·DB migration·공통 Vector 정규화·선택형 HTTP sink는 이미 연결돼 있다. schema.sql에도 Evidence migration이 정확히 한 번 포함돼 있다.
+- API/security/emitter/uploader 및 관련 원본 fixture는 동일하며, 최신 source allowlist·OpenRouter SSM·Recon·runtime_agent 전체 디렉터리 설치를 유지했다.
+- Executor/Harness의 기존 Verifier-only 기록 훅도 있다. Supervisor의 실행 기록과 겹치는 TOOL_RESULT/실행 오류 stdout 훅은 다시 추가하지 않았다.
+- 모델·프롬프트·실행 순서·툴·Verifier·캡처·프론트엔드·실제 환경설정은 수정하지 않았다.
+- pull 후 남은 미추적 파일 5개는 삭제·덮어쓰기·이동하지 않았다:
+  `backend/host_runtime/verify_environment.sh`,
+  `backend/tests/test_artifact_conflicts.py`,
+  `backend/tests/test_evidence_security_edges.py`,
+  `backend/tests/test_evidence_vector_edges.py`,
+  `backend/tests/test_harness_evidence_security.py`.
+  이 파일들의 존재만으로 force-pull 전의 추가 구현까지 복구됐다고 판단하지 않는다.
+
+### 현재 HEAD 검증 결과
+
+| 검사 | 이번 실행 결과 |
+|---|---|
+| `test_evidence.py`, `test_evidence_upload.py`, `test_evidence_vector.py` | **115 passed, 4 skipped** (11.28초). Vector 실행 파일 부재 2개, Windows 심볼릭 링크 생성 권한 2개 미실행. |
+| 위 테스트와 실행 기록·기존 회귀 8개 파일의 통합 실행 | **테스트 수집 단계에서 6개 파일 오류** (6.93초). Windows에 없는 `libc.so.6`를 최신 툴 레지스트리가 import하면서 중단. 개별 테스트가 실행되어 6건 실패한 결과와는 다르다. |
+| Terraform fmt / validate | **통과**. 기존 설치·provider 사용, init/download/plan/apply 없음. |
+| 실제 templatefile OFF/ON 렌더·19개 자산·JSON/YAML | **통과**. 현재 템플릿과 이전 검증 helper의 일치를 확인해 재실행했고 렌더 SHA도 이전과 동일. |
+| user-data 기존 15,360 B 상한 | **실패**. OFF 16,038 B(678 B 초과), ON 16,273 B(913 B 초과). |
+| 실제 Vector / Linux 생산 경로 / 원격 Supabase·EC2 E2E | **미검증**. 설치·배포·서비스 재시작·DB 변경 없음. |
+
+수집 단계에서 중단된 파일은 `test_execution_evidence.py`, `test_api.py`, `test_harness.py`,
+`test_verifiers.py`, `test_agent_chain.py`, `test_agent_live_monitoring.py`다.
+현재 import 경로는 `validated_tool_registry.py` → `validated_actions.py` → `tools/base.py:1420`이며,
+Linux libc 로딩에서 실패했다. 테스트를 통과시키기 위해 툴 검증을 우회하거나 Windows 대체 실행을 추가하지 않았다.
+
+이전의 **123 passed / 기존 실패 16개**는 아래 과거 이식 시점의 결과다. 최신 코드의 결과로 재사용하지 않으며,
+현재 HEAD에서 기존 16개가 모두 해결됐거나 동일하게 남았다고 단정하지 않는다.
+이번 테스트 목록에 사용자 미추적 추가 테스트 4개를 포함해 검증한 것도 아니다.
+이번 재확인에서 Bash를 다시 실행하지는 않았으며, 부팅 스크립트 렌더는 이전 `bash -n` 통과본과 동일하다.
+
+### 변경 파일과 남은 작업
+
+- 이번 수정은 **이 작업보고서와 Terraform README의 기준 시점 설명만**이다. 프로덕션 코드 재이식·기능 추가는 하지 않았다.
+- 부팅 설정 용량은 현재 HEAD에도 남아 있는 문제다. 상한 확대·기능 제거·새 패키징/배포 경로를 승인 없이 적용하지 않았다.
+- 원본 `capture_state.sh`의 동기 업로드 훅은 여전히 미연결이다. 기존 자동 before/after 캡처의 30초 제한·호출 시점을 바꾸지 않는다.
+- validated attack 전체가 ToolDefinition 경로를 사용하지만 native Verifier 상세 결과를 Supervisor Evidence로 전달하는 추가 연결은 여전히 보류다.
+- 원격 수신 서버 설정·DB migration 적용·이미지/EC2 배포 및 실제 E2E는 수행하지 않았다.
+- Git pull·reset·commit·push를 실행하지 않았다. 사용자 요청으로 새로 받은 HEAD를 읽고 검증만 했다.
+
+---
+
+## 이전 선택 이식 기록 (2026-08-30)
+
+아래의 25개 수정 파일·테스트 수치는 이전 이식 당시의 이력이며, 위 c049914 재확인에서 다시 수정하거나 검증 완료한 목록이 아니다.
 
 **현재 배포 준비 완료 상태가 아니다.** 기존 로깅 코드를 선택 이식했지만, 최종 검증에서 이번 이식으로 EC2 user-data의 기존 15 KiB 상한을 초과한 것을 확인했다. 상한을 늘리거나 새 배포 경로를 추가하지 않았으며, 추가 패키징 조정은 사용자 승인 전 중단한다.
 
