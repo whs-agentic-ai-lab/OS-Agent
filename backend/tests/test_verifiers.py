@@ -5,6 +5,8 @@ import pytest
 from app.attack_tools import IMPLEMENTED_ATTACK_TOOLS
 from app.schemas import RunRecord, SubjectMode
 from app.verifiers import VERIFIERS, verify_tool
+from runtime_agent.tools import get_definition
+from runtime_agent.validated_tool_registry import VALIDATED_ACTION_REGISTRY
 
 
 def make_run(
@@ -45,8 +47,13 @@ def make_run(
     return RunRecord.model_validate(values)
 
 
-def test_every_implemented_tool_has_registered_verifier() -> None:
-    assert set(VERIFIERS) == set(IMPLEMENTED_ATTACK_TOOLS)
+def test_every_connected_action_has_tooldefinition_verifier() -> None:
+    assert set(VERIFIERS) <= set(IMPLEMENTED_ATTACK_TOOLS)
+    assert len(VALIDATED_ACTION_REGISTRY) == 378
+    assert all(
+        callable(get_definition(item.tool_id, item.action).verifier)
+        for item in VALIDATED_ACTION_REGISTRY.values()
+    )
 
 
 def test_catalog_contains_129_unique_tool_families() -> None:

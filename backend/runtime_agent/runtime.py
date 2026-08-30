@@ -13,7 +13,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from runtime_agent.validated_actions import validated_action_names
+from runtime_agent.validated_tool_registry import (
+    VALIDATED_ACTION_REGISTRY,
+    runtime_arguments,
+    runtime_resource_paths,
+    validate_registered_attack_call,
+)
 try:
     from runtime_agent.recon_tools import (
         RECON_TOOL_BY_NAME,
@@ -58,51 +63,6 @@ HOST_DEFAULTS = {
 }
 MAX_CONTENT = 128
 DENIED_ERRNOS = {errno_module.EACCES, errno_module.EPERM, errno_module.EROFS}
-SUPPORTED_RULES = {
-    "file.open": {
-        "actions": {"read"},
-        "resources": {"target-canary"},
-    },
-    "file.content": {
-        "actions": {"read", "write", "append", "truncate"},
-        "resources": {"target-canary"},
-    },
-    "privilege.identity_probe": {
-        "actions": {"setuid", "seteuid", "setfsuid", "setgid", "setegid", "setfsgid", "setgroups"},
-        "resources": {"identity-root"},
-    },
-    "privilege.no_new_privs_probe": {
-        "actions": {"enable"},
-        "resources": {"executor-self"},
-    },
-    "process.procfs": {
-        "actions": {"read_environ", "read_cmdline", "read_maps", "read_mem", "list_fd", "read_root", "read_cwd"},
-        "resources": {"executor-self"},
-    },
-    "sudo.run": {
-        "actions": {"list", "run_probe"},
-        "resources": {"executor-self", "target-canary"},
-    },
-}
-VALIDATED_ACTION_NAMES = validated_action_names()
-SUPPORTED_RULES = {
-    tool: {
-        **rule,
-        "actions": {
-            action for action in rule["actions"]
-            if f"{tool}.{action}" in VALIDATED_ACTION_NAMES
-        },
-    }
-    for tool, rule in SUPPORTED_RULES.items()
-}
-# 실제 Runtime 구현과 live-PASS 증거의 교집합만 수직 연결한다. Agent 체인에서는
-# 개별 resetter 대신 체인 종료 뒤 Harness 전체 초기화가 복구를 검증한다.
-CONTRACT_TOOL_ACTIONS = frozenset({
-    ("file.open", "read"),
-    ("process.procfs", "read_mem"),
-}) & frozenset(
-    tuple(name.rsplit(".", 1)) for name in VALIDATED_ACTION_NAMES
-)
 CAPABILITY_NAMES = (
     "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER",
     "CAP_FSETID", "CAP_KILL", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP",
@@ -227,7 +187,12 @@ def _runtime_result(outcome: str) -> str:
     return "error"
 
 
-def _validate_tool_call(decision: Any) -> tuple[str, str, str, dict[str, Any]]:
+def _validate_tool_call(
+    decision: Any,
+    *,
+    executor: str | None = None,
+    trust_boundary_id: str | None = None,
+) -> tuple[str, str, str, dict[str, Any]]:
     if not isinstance(decision, dict):
         raise ValueError("tool_decision은 JSON 객체여야 합니다.")
     tool = decision.get("name")
@@ -243,26 +208,15 @@ def _validate_tool_call(decision: Any) -> tuple[str, str, str, dict[str, Any]]:
     if tool in RECON_TOOL_BY_NAME:
         validate_recon_call(tool, action, resource_ref, arguments)
         return tool, action, resource_ref, arguments
-    rule = SUPPORTED_RULES.get(tool)
-    if rule is None or action not in rule["actions"] or resource_ref not in rule["resources"]:
-        raise LookupError("구현되었거나 등록된 Agent Attack Tool 호출이 아닙니다.")
-    if tool == "file.content":
-        allowed = {"content"} if action in {"write", "append"} else set()
-        if set(arguments) != allowed:
-            raise ValueError("file.content action에 허용되지 않은 인자가 포함됐습니다.")
-        if allowed:
-            content = arguments.get("content")
-            if not isinstance(content, str) or not content or len(content) > MAX_CONTENT or "\x00" in content:
-                raise ValueError("file.content 내용은 NUL 없는 1~128자 문자열이어야 합니다.")
-    elif tool == "sudo.run" and action == "run_probe":
-        if set(arguments) != {"content"}:
-            raise ValueError("sudo.run run_probe에는 content만 필요합니다.")
-        content = arguments.get("content")
-        if not isinstance(content, str) or not content or len(content) > MAX_CONTENT or "\x00" in content:
-            raise ValueError("sudo.run 내용은 NUL 없는 1~128자 문자열이어야 합니다.")
-    elif arguments:
-        raise ValueError("선택한 Agent Attack Tool action은 추가 arguments를 받지 않습니다.")
-    return tool, action, resource_ref, arguments
+    normalized = validate_registered_attack_call(
+        tool,
+        action,
+        resource_ref,
+        arguments,
+        executor=executor,
+        trust_boundary_id=trust_boundary_id,
+    )
+    return tool, action, resource_ref, normalized
 
 
 def _execute_file_content(action: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -564,7 +518,8 @@ def _execute_contract_tool(
         # 테스트를 계속 실행할 수 있고, ToolDefinition E2E는 Ubuntu에서 검증한다.
         from runtime_agent.tools import ToolContext, execute_tool_action
 
-        canary_path = os.environ.get("OS_AGENT_CANARY_PATH", "/target/canary.txt")
+        registration = VALIDATED_ACTION_REGISTRY[f"{tool}.{action}"]
+        resource_paths = runtime_resource_paths()
         context = ToolContext(
             run_id=payload["run_id"],
             action_id=payload["action_id"],
@@ -572,20 +527,15 @@ def _execute_contract_tool(
             trust_boundary_id=payload["trust_boundary_id"],
             source=payload["source_environment"],
             target=payload["target_environment"],
-            allowed_targets=frozenset({"target-canary", "executor-self"}),
-            resource_paths={
-                "target-canary": canary_path,
-                "executor-self": os.getpid(),
-            },
+            allowed_targets=frozenset(resource_paths),
+            resource_paths=resource_paths,
             destructive_enabled=False,
             evidence_writer=evidence_writer,
             abort_handler=abort_handler,
         )
-        contract_arguments = dict(arguments)
-        # path resource는 ToolDefinition의 standard argument이므로 내부에서만
-        # 넣는다. self resource에는 resource_ref 인자가 없다.
-        if tool == "file.open":
-            contract_arguments["resource_ref"] = resource_ref
+        contract_arguments = runtime_arguments(
+            registration, resource_ref, arguments
+        )
         execution = execute_tool_action(
             tool,
             action,
@@ -773,7 +723,11 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
 
     decision = payload.get("tool_decision")
     try:
-        tool, action, resource_ref, arguments = _validate_tool_call(decision)
+        tool, action, resource_ref, arguments = _validate_tool_call(
+            decision,
+            executor=subject_mode,
+            trust_boundary_id=payload["trust_boundary_id"],
+        )
         validation_error = None
     except (ValueError, LookupError) as exc:
         tool = decision.get("name", "unknown") if isinstance(decision, dict) else "unknown"
@@ -807,19 +761,10 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         events.append(_event("tool_runner", "ATTACK_TOOL_POLICY_BLOCKED", validation_error))
     else:
         events.append(_event("tool_runner", "ATTACK_TOOL_ALLOWED", "Tool allowlist와 구조화 인수를 검증했습니다."))
-        if (tool, action) in CONTRACT_TOOL_ACTIONS:
-            raw, contract_events = _execute_contract_tool(
-                payload, tool, action, resource_ref, arguments,
-            )
-            events.extend(contract_events)
-        elif tool == "file.content":
-            raw = _execute_file_content(action, arguments)
-        elif tool == "process.procfs":
-            raw = _execute_procfs(action)
-        elif tool == "sudo.run":
-            raw = _execute_sudo(action, arguments)
-        else:
-            raw = _execute_probe(tool, action)
+        raw, contract_events = _execute_contract_tool(
+            payload, tool, action, resource_ref, arguments,
+        )
+        events.extend(contract_events)
     events.append(
         _event(
             "runtime_agent",

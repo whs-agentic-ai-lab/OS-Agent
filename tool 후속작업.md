@@ -2,6 +2,33 @@
 
 검증된 OS Tool과 PM 공통·OS 하네스를 `main`에 병합한 뒤 실제 실험환경을 사용하기 전에 수행할 검증을 정리한다.
 
+## 현재 Agent 연결 상태 (canonical provenance migration)
+
+- 정적 Attack Inventory: **129 Tool family / 383 Action**
+- 기존 라이브 PASS 재사용: **378 Action**
+- Agent Attack 노출: **378 Action / 129 Tool family**
+- Agent Recon 노출: **113 Tool**
+- Non-PASS 제외: **5 Action**
+- PM Common OS Harness allowlist: 동일 validated Registry 사용, 비어 있지 않음
+- Source/manifest 불일치: Attack 노출 **0** (fail-closed)
+
+기존 라이브 run `tool-validation-3bc32759b2a2`와 image digest
+`sha256:de40c307b18defb084caa7baee3f34ca6c327adbcc8df7f229bab9369162d0c6`를
+그대로 재사용한다. legacy source hash는 보존하고, CRLF/LF를 정규화한
+canonical source hash
+`sha256:70b4e9e62ce442f539e04675c02fc2c6bf5c9401eab478b4e510fa7ffd8f170f`를
+Agent 연결 기준으로 추가했다. `origin/not-verified-tool`과 migration 기준
+`origin/main`의 Tool 소스 diff가 없었고, `origin/recon-tools`
+(`9a00cfc10b4faf0c637c54b8f9ac36d18fcae0b9`)와 main의 Recon 소스 diff도
+없었다. 이 변경에서는 383 Action 라이브
+검증, AWS/Terraform/ECR/Docker build, 전체 테스트 스위트를 실행하지 않았다.
+관련 경로의 WSL targeted test 8개 파일은 **90 passed**였다.
+
+Attack은 하나의 generic schema에서 자동 Registry가 최종 조합과 인수를
+검증한 뒤 기존 `ToolDefinition` handler/verifier로 dispatch한다. Recon은 별도
+generic schema에서 기존 `validate_recon_call` → `execute_recon` 경로를 사용한다.
+Tool handler 파일은 변경하지 않았다.
+
 ## 1. Linux 전용 전체 테스트 실행
 
 ### 목적

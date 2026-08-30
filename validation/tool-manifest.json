@@ -2,6 +2,23 @@
   "schema_version": "tool-validation-v1",
   "generated_at": "2026-08-29T14:37:26.551833+00:00",
   "authority": "not-verified-tool branch runtime_agent.tools ToolDefinition registry",
+  "canonical_provenance": {
+    "migration_type": "source_hash_line_ending_normalization",
+    "legacy_validation_hash": "sha256:42c76ab03421f7ff79b9e992bbc2b59e9ea2f290882b0c0b87c77d6b5eb14246",
+    "canonical_source_hash": "sha256:70b4e9e62ce442f539e04675c02fc2c6bf5c9401eab478b4e510fa7ffd8f170f",
+    "manifest_inventory_hash": "sha256:e9ca963cb31a3b0bbaf67d3fa56716428058f8ccc9ba1e3dc7fc1496b51ee22d",
+    "validation_branch": "origin/not-verified-tool",
+    "validation_branch_commit_sha": "07358c1f45579e6acb79961061d9c9fb67f33a99",
+    "recon_branch_commit_sha": "9a00cfc10b4faf0c637c54b8f9ac36d18fcae0b9",
+    "main_commit_sha": "fab08a414f372674238693665b5ae5b68b4fc260",
+    "tool_source_diff_from_validation_branch": false,
+    "recon_source_diff_from_recon_branch": false,
+    "inventory_129_tools_383_actions_matches": true,
+    "non_pass_five_matches": true,
+    "validation_run_id": "tool-validation-3bc32759b2a2",
+    "validation_image_digest": "sha256:de40c307b18defb084caa7baee3f34ca6c327adbcc8df7f229bab9369162d0c6",
+    "reason": "The legacy digest hashed checkout bytes and changed across CRLF/LF. The canonical digest normalizes Git text, uses POSIX relative paths, includes file membership, and sorts deterministically. No new live validation was performed."
+  },
   "summary": {
     "tools": 129,
     "actions": 383,

@@ -136,6 +136,7 @@ def test_harness_emits_existing_tool_verifier_not_aggregate(monkeypatch, capsys)
     state = {
         "subject_mode": "container",
         "objective": run_request.prompt,
+        "current_idempotency_key": "evidence-test",
         "permission_snapshot": {
             "permissions": run_request.permission_profile,
             "profile_id": build_profile_id(run_request.subject_mode, run_request.permission_profile),
@@ -148,7 +149,13 @@ def test_harness_emits_existing_tool_verifier_not_aggregate(monkeypatch, capsys)
         candidate_id="delegate-to-environment-runtime",
         tool_name=os_adapters.RUNTIME_ACTION_TOOL,
         target_resource="container-runtime-agent",
-        risk_level="reversible", changes_state=True,
+        domain="os",
+        risk_level="reversible",
+        changes_state=True,
+        verifier_id="os-independent-runtime-verifier",
+        environment_reinitialize_strategy_id=os_adapters.OS_REINITIALIZE_STRATEGY_ID,
+        baseline_version=os_adapters.OS_BASELINE_VERSION,
+        baseline_checks=["target_canary_sha256"],
     )
     runtime, model = CountingRuntime(), gateway()
     verify = Mock(wraps=os_adapters.verify_tool)

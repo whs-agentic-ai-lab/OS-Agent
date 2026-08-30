@@ -1,0 +1,12 @@
+{
+  "schema_version": "validated-manifest-fingerprint-v1",
+  "authority": "validation/tool-manifest.json canonical action contracts",
+  "manifest_inventory_sha256": "sha256:e9ca963cb31a3b0bbaf67d3fa56716428058f8ccc9ba1e3dc7fc1496b51ee22d",
+  "action_names_sha256": "sha256:401fd7468888192238905ce5d9949416b1de6d737fca38ad2910f1ddbf4ead53",
+  "tools": 129,
+  "actions": 383,
+  "live_pass_actions": 378,
+  "excluded_actions": 5,
+  "validation_run_id": "tool-validation-3bc32759b2a2",
+  "validation_image_digest": "sha256:de40c307b18defb084caa7baee3f34ca6c327adbcc8df7f229bab9369162d0c6"
+}
