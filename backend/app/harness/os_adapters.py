@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any
-from uuid import uuid4
 
 from ..attack_tools import IMPLEMENTED_ATTACK_TOOLS
 from ..catalog import build_profile_id, resolve_trust_boundary
@@ -11,7 +10,6 @@ from ..schemas import (
     RunRecord,
     RuntimeAgentResult,
     RuntimeDispatchRequest,
-    RuntimeResetRequest,
     SubjectMode,
 )
 from ..verifiers import verify_tool
@@ -23,12 +21,25 @@ from .models import (
     ResetRecord,
     ToolExecution,
     VerificationRecord,
+    canonical_hash,
+    deterministic_candidate_id,
 )
 from .ports import HarnessComponents
 
 
 RUNTIME_ACTION_TOOL = "environment_runtime_agent"
 ALLOWED_RUNTIME_TOOLS = set(IMPLEMENTED_ATTACK_TOOLS)
+OS_REINITIALIZE_STRATEGY_ID = "approved-environment-reinitialize-v1"
+OS_BASELINE_VERSION = "os-experiment-baseline-v1"
+OS_BASELINE_CHECKS = [
+    "trial_group_member",
+    "limited_sudo_rule",
+    "docker_group_member",
+    "container_run_root_empty",
+    "target_canary_sha256",
+    "running_containers",
+    "healthy_containers",
+]
 
 
 class _RuntimeBackedAdapter:
@@ -40,11 +51,17 @@ class _RuntimeBackedAdapter:
 
 
 class OsPermissionProvider(_RuntimeBackedAdapter):
+    def __init__(self, runtime: EnvironmentRuntime, approved_source_ids: tuple[str, ...]) -> None:
+        super().__init__(runtime)
+        self.approved_source_ids = frozenset(approved_source_ids)
+
     def snapshot(self, request: HarnessRunRequest) -> dict[str, Any]:
         if not self.runtime.is_available(request.subject_mode):
             raise RuntimeError("선택한 OS Runtime을 사용할 수 없습니다.")
         if request.permission_profile is None:
             raise ValueError("Live Harness에는 완전한 권한 프로파일이 필요합니다.")
+        if request.source_id is not None and request.source_id not in self.approved_source_ids:
+            raise ValueError("승인되지 않은 OS Host ID입니다.")
 
         profile = dict(request.permission_profile)
         profile_id = build_profile_id(request.subject_mode, profile)
@@ -57,8 +74,18 @@ class OsPermissionProvider(_RuntimeBackedAdapter):
             and request.permission_profile_id != profile_id
         ):
             raise ValueError("permission_profile_id가 실제 권한 프로파일과 일치하지 않습니다.")
-        return {
+        permission_observations = {
+            key: {
+                "declared": "declared",
+                "execution": "conditional_or_unknown",
+                "enabled": value,
+            }
+            for key, value in profile.items()
+        }
+        target_asset = f"{request.subject_mode.value}-runtime-agent"
+        snapshot = {
             "provider": "os-runtime",
+            "source_id": request.source_id or "legacy-runtime",
             "subject_mode": request.subject_mode.value,
             "trust_boundary_id": boundary.id,
             "source_environment": boundary.source_environment.value,
@@ -66,29 +93,96 @@ class OsPermissionProvider(_RuntimeBackedAdapter):
             "profile_id": profile_id,
             "permissions": profile,
             "verified_at_execution": True,
+            "permission_observations": permission_observations,
+            "assets": [
+                {
+                    "asset_id": boundary.source_environment.value,
+                    "kind": "host" if request.subject_mode == SubjectMode.host else "container",
+                    "subject": True,
+                },
+                {
+                    "asset_id": boundary.target_environment.value,
+                    "kind": "host" if boundary.target_environment.value.startswith("u") else "container",
+                    "subject": False,
+                },
+                {"asset_id": target_asset, "kind": "runtime", "subject": False},
+            ],
+            "relationships": [
+                {
+                    "source": boundary.source_environment.value,
+                    "target": boundary.target_environment.value,
+                    "type": "trust_boundary",
+                    "trust_boundary_id": boundary.id,
+                },
+                {
+                    "source": boundary.source_environment.value,
+                    "target": target_asset,
+                    "type": "executes_via",
+                },
+            ],
+            "capabilities": [
+                {
+                    "capability_id": f"permission:{key}",
+                    "permission": key,
+                    "target_asset": boundary.target_environment.value,
+                    "trust_boundary_id": boundary.id,
+                    "runtime_condition": value,
+                    "status": "inferred" if value else "conditional_or_unknown",
+                }
+                for key, value in profile.items()
+            ],
         }
+        snapshot["snapshot_hash"] = canonical_hash(snapshot)
+        return snapshot
 
 
 class OsToolCatalog(_RuntimeBackedAdapter):
     def candidates(self, state: dict[str, Any]) -> list[ActionCandidate]:
         if state.get("history"):
             return []
+        arguments = {
+            "objective": state["objective"],
+            "allowed_tools": sorted(ALLOWED_RUNTIME_TOOLS),
+        }
+        target = f"{state['subject_mode']}-runtime-agent"
+        policy_hash = state["permission_snapshot"]["snapshot_hash"]
         return [
             ActionCandidate(
-                candidate_id="delegate-to-environment-runtime",
+                candidate_id=deterministic_candidate_id(
+                    policy_hash=policy_hash,
+                    domain="os",
+                    tool_name=RUNTIME_ACTION_TOOL,
+                    arguments=arguments,
+                    target_resource=target,
+                ),
                 tool_name=RUNTIME_ACTION_TOOL,
-                arguments={
-                    "objective": state["objective"],
-                    "allowed_tools": sorted(ALLOWED_RUNTIME_TOOLS),
+                arguments=arguments,
+                argument_schema={
+                    "type": "object",
+                    "properties": {
+                        "objective": {"type": "string"},
+                        "allowed_tools": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["objective", "allowed_tools"],
+                    "additionalProperties": False,
                 },
-                target_resource=f"{state['subject_mode']}-runtime-agent",
+                target_resource=target,
+                domain="os",
+                tool_kind="action",
                 risk_level="reversible",
                 changes_state=True,
+                frontier_status="ready",
+                expected_state_change={"effect": "runtime-selected-os-impact"},
                 required_evidence=[
                     "applied_profile_state",
                     "runtime_result",
                     "tool_output",
                 ],
+                required_permissions_or_conditions=["approved_source", "matching_trust_boundary"],
+                verifier_id="os-independent-runtime-verifier",
+                environment_reinitialize_strategy_id=OS_REINITIALIZE_STRATEGY_ID,
+                baseline_version=OS_BASELINE_VERSION,
+                baseline_checks=OS_BASELINE_CHECKS,
             )
         ]
 
@@ -131,6 +225,17 @@ class OsRuntimeExecutor(_RuntimeBackedAdapter):
     ) -> ToolExecution:
         if candidate.tool_name != RUNTIME_ACTION_TOOL:
             raise ValueError("OS Runtime Adapter에 등록되지 않은 Candidate입니다.")
+        if state.get("model") and (
+            self.model_gateway is None or self.model_gateway.planner_mode != "openrouter"
+        ):
+            return ToolExecution(
+                success=False,
+                output="LLM Provider 자격 증명이 구성되지 않았습니다.",
+                error_code="SERVICE_CONFIGURATION_ERROR",
+                error_message="요청한 모델을 실행할 Provider 자격 증명이 없습니다.",
+                retryable=False,
+                evidence={"reset_required": False},
+            )
         snapshot = state["permission_snapshot"]
         try:
             boundary = resolve_trust_boundary(
@@ -138,7 +243,7 @@ class OsRuntimeExecutor(_RuntimeBackedAdapter):
                 snapshot["trust_boundary_id"],
             )
             tool_decision = (
-                self.model_gateway.decide(state["objective"], boundary)
+                self.model_gateway.decide(state["objective"], boundary, state.get("model"))
                 if self.model_gateway is not None
                 else ModelGateway._local_decision(state["objective"])
             )
@@ -150,7 +255,7 @@ class OsRuntimeExecutor(_RuntimeBackedAdapter):
             result = self.runtime.execute(
                 RuntimeDispatchRequest(
                     run_id=run_id,
-                    action_id=f"action-{uuid4().hex[:12]}",
+                    action_id=f"action-{str(state['current_idempotency_key'])[:12]}",
                     prompt=state["objective"],
                     subject_mode=SubjectMode(state["subject_mode"]),
                     trust_boundary_id=boundary.id,
@@ -170,14 +275,23 @@ class OsRuntimeExecutor(_RuntimeBackedAdapter):
                         "target_environment": boundary.target_environment,
                     }
                 )
+        except TimeoutError as exc:
+            return ToolExecution(
+                success=False,
+                output="OS Runtime 실행 시간이 초과되었습니다.",
+                error_code="TIMEOUT",
+                error_message=str(exc),
+                retryable=True,
+                evidence={"reset_required": True},
+            )
         except Exception as exc:
             return ToolExecution(
                 success=False,
-                output=str(exc),
-                error_code="RUNTIME_DISPATCH_FAILED",
+                output="OS Runtime 실행 요청에 실패했습니다.",
+                error_code="EXECUTION_ERROR",
+                error_message=str(exc),
                 retryable=False,
                 evidence={
-                    "runtime_error": str(exc),
                     "reset_required": True,
                 },
             )
@@ -195,10 +309,17 @@ class OsRuntimeExecutor(_RuntimeBackedAdapter):
             success=result.outcome == "ALLOWED",
             output=result.output,
             error_code=error_code,
+            error_message=None if result.outcome == "ALLOWED" else result.output,
             retryable=False,
             evidence={
                 "runtime_result": result.model_dump(mode="json"),
-                "reset_required": True,
+                "evidence_refs": list(result.evidence_refs),
+                "actual_changes": (
+                    [{"changed": True, "tool": result.tool, "resource_ref": result.resource_ref}]
+                    if result.changed or result.temporary_changed
+                    else []
+                ),
+                "reset_required": bool(result.changed or result.temporary_changed),
             },
         )
 
@@ -285,54 +406,80 @@ class OsIndependentVerifier(_RuntimeBackedAdapter):
         return VerificationRecord(
             status=status,
             evidence_refs=[
-                *result.evidence_refs,
-                f"runtime:{run_id}:{result.tool}",
-                f"verifier:{tool_verification.verifier}",
+                f"verifier-observation:{run_id}:{result.tool}",
+                f"verifier:{tool_verification.verifier}:{run_id}",
             ],
             checks=checks,
+            impact_facts=(
+                [{"tool": result.tool, "resource_ref": result.resource_ref, "outcome": result.outcome}]
+                if status == "VERIFIED"
+                else []
+            ),
         )
 
 
-class OsRuntimeResetter(_RuntimeBackedAdapter):
-    def reset(
+class OsEnvironmentReinitializer(_RuntimeBackedAdapter):
+    """Control Backend의 승인된 전체 환경 초기화만 호출한다."""
+
+    def reinitialize(
         self,
         run_id: str,
-        candidate: ActionCandidate,
-        execution: ToolExecution,
         state: dict[str, Any],
+        *,
+        strategy_id: str,
+        baseline_version: str,
+        baseline_checks: list[str],
     ) -> ResetRecord:
-        del candidate, execution
+        del state
         try:
-            result = self.runtime.reset_harness(
-                RuntimeResetRequest(
-                    run_id=run_id,
-                    subject_mode=SubjectMode(state["subject_mode"]),
-                    trust_boundary_id=state.get("trust_boundary_id"),
-                    target_environment=state.get("target_environment"),
-                )
-            )
+            result = self.runtime.reset_environment()
         except Exception as exc:
             return ResetRecord(
                 status="RESET_FAILED",
-                evidence_refs=[f"reset:{run_id}:failed"],
-                restored_state={"error": str(exc)},
+                recovery_kind="environment_reinitialize",
+                strategy_id=strategy_id,
+                baseline_version=baseline_version,
+                evidence_refs=[f"environment-reinitialize:{run_id}:failed"],
+                restored_state={"error_type": type(exc).__name__},
             )
+        restored = result.restored_state
+        checks = {
+            "trial_group_member": restored.get("trial_group_member") is False,
+            "limited_sudo_rule": restored.get("limited_sudo_rule") is False,
+            "docker_group_member": restored.get("docker_group_member") is False,
+            "container_run_root_empty": restored.get("container_run_root_empty") is True,
+            "target_canary_sha256": bool(restored.get("target_canary_sha256")),
+            "running_containers": bool(restored.get("running_containers")),
+            "healthy_containers": (
+                bool(restored.get("healthy_containers"))
+                and sorted(restored.get("healthy_containers", [])) == sorted(restored.get("running_containers", []))
+            ),
+        }
+        requested_checks = {name: checks.get(name, False) for name in baseline_checks}
+        status = "RESET" if result.status == "RESET" and all(requested_checks.values()) else "RESET_FAILED"
         return ResetRecord(
-            status=result.status,
+            status=status,
+            recovery_kind="environment_reinitialize",
+            strategy_id=strategy_id,
+            baseline_version=baseline_version,
             evidence_refs=result.evidence_refs,
-            restored_state=result.restored_state,
+            restored_state=restored,
+            verification_checks=requested_checks,
         )
 
 
 def create_os_harness_components(
     runtime: EnvironmentRuntime,
     model_gateway: ModelGateway | None = None,
+    approved_source_ids: tuple[str, ...] = ("approved-host-01",),
 ) -> HarnessComponents:
     return HarnessComponents(
-        permission_provider=OsPermissionProvider(runtime),
+        domain="os",
+        permission_provider=OsPermissionProvider(runtime, approved_source_ids),
         tool_catalog=OsToolCatalog(runtime),
         planner=OsRuntimePlanner(runtime),
         executor=OsRuntimeExecutor(runtime, model_gateway),
         verifier=OsIndependentVerifier(runtime),
-        resetter=OsRuntimeResetter(runtime),
+        resetter=None,
+        environment_reinitializer=OsEnvironmentReinitializer(runtime),
     )

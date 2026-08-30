@@ -20,12 +20,18 @@ class Settings:
     terraform_dir: Path = PROJECT_ROOT / "infra" / "terraform"
     backend_context: Path = BACKEND_ROOT
     host_supervisor_socket: Path = Path("/run/os-agent/host-supervisor.sock")
+    approved_os_source_ids: tuple[str, ...] = ("approved-host-01",)
 
 
 def get_settings() -> Settings:
     origins = os.getenv(
         "ALLOWED_ORIGINS",
         "http://127.0.0.1:5173,http://localhost:5173",
+    )
+    approved_sources = tuple(
+        value.strip()
+        for value in os.getenv("APPROVED_OS_SOURCE_IDS", "approved-host-01").split(",")
+        if value.strip()
     )
     return Settings(
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY") or None,
@@ -45,4 +51,5 @@ def get_settings() -> Settings:
         host_supervisor_socket=Path(
             os.getenv("HOST_SUPERVISOR_SOCKET", "/run/os-agent/host-supervisor.sock")
         ),
+        approved_os_source_ids=approved_sources,
     )

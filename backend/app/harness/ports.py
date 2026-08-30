@@ -61,21 +61,45 @@ class ActionResetter(Protocol):
     ) -> ResetRecord: ...
 
 
+class EnvironmentReinitializer(Protocol):
+    """OS 전용 전체 실험환경 초기화 포트. Tool 단위 Reset과 분리한다."""
+
+    def reinitialize(
+        self,
+        run_id: str,
+        state: dict[str, Any],
+        *,
+        strategy_id: str,
+        baseline_version: str,
+        baseline_checks: list[str],
+    ) -> ResetRecord: ...
+
+
 @dataclass(frozen=True)
 class HarnessComponents:
+    domain: str = "generic"
     permission_provider: PermissionProvider | None = None
     tool_catalog: ToolCatalog | None = None
     planner: Planner | None = None
     executor: ActionExecutor | None = None
     verifier: IndependentVerifier | None = None
     resetter: ActionResetter | None = None
+    environment_reinitializer: EnvironmentReinitializer | None = None
 
     def missing(self) -> list[HarnessComponentName]:
-        return [
-            name
-            for name in HarnessComponentName
-            if not self._ready(getattr(self, name.value))
+        required = [
+            HarnessComponentName.permission_provider,
+            HarnessComponentName.tool_catalog,
+            HarnessComponentName.planner,
+            HarnessComponentName.executor,
+            HarnessComponentName.verifier,
+            (
+                HarnessComponentName.environment_reinitializer
+                if self.domain == "os"
+                else HarnessComponentName.resetter
+            ),
         ]
+        return [name for name in required if not self._ready(getattr(self, name.value))]
 
     @staticmethod
     def _ready(component: object | None) -> bool:
