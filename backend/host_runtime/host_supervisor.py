@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -68,8 +69,12 @@ CONTAINER_TARGET_NETWORKS = {
     "c3": "os-agent-c1-c3",
 }
 SUDOERS_PATH = Path("/etc/sudoers.d/os-agent-limited")
+STATE_CAPTURE_SCRIPT = Path("/opt/os-agent/scripts/capture_state.sh")
+EXECUTOR_EVENT_ROOT = Path("/var/log/os-agent/executor")
+EVIDENCE_REQUIRED = os.environ.get("OS_AGENT_EVIDENCE_REQUIRED", "false").lower() == "true"
 INITIAL_CONTENT = "OS_AGENT_HOST_CANARY_INITIAL\n"
 MAX_REQUEST_BYTES = 16384
+MAX_EVIDENCE_OUTPUT_BYTES = 65536
 
 CANARIES = {
     "host-owner-canary": CANARY_ROOT / "owner.txt",
@@ -113,7 +118,9 @@ PROFILES = {
 }
 
 PROFILE_LOCK = threading.RLock()
+EVIDENCE_LOCK = threading.Lock()
 RUN_ID_PATTERN = re.compile(r"^(?:os|harness)-[a-f0-9]{12}$")
+ACTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 CHAIN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 PROFILE_HASH_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
 CHAIN_SESSIONS: dict[tuple[str, str, str], ChainSession] = {}
@@ -197,6 +204,89 @@ def _run(
     )
 
 
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _action_path_id(request: dict[str, Any]) -> str:
+    return f"{request['source_environment'].upper()}{request['target_environment'].upper()}"
+
+
+def _capture_state(request: dict[str, Any], phase: str) -> None:
+    if not EVIDENCE_REQUIRED:
+        return
+    result = _run(
+        [
+            str(STATE_CAPTURE_SCRIPT),
+            request["run_id"],
+            request["action_id"],
+            _action_path_id(request),
+            phase,
+            request["target_environment"].upper(),
+        ],
+        timeout_seconds=30,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "상태 캡처에 실패했습니다."
+        raise RuntimeError(f"{phase} 상태 Evidence 생성 실패: {detail}")
+
+
+def _append_executor_event(
+    request: dict[str, Any],
+    *,
+    started_at: str,
+    completed_at: str,
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    if not EVIDENCE_REQUIRED:
+        return
+    decision = request["tool_decision"]
+    status = "failed" if error is not None else "completed"
+    event_seed = f"{request['run_id']}|{request['action_id']}|{status}"
+    event_id = "executor-" + hashlib.sha256(event_seed.encode("utf-8")).hexdigest()
+    raw_output = error if error is not None else result.get("output", "") if result else ""
+    output = str(raw_output).encode("utf-8")[:MAX_EVIDENCE_OUTPUT_BYTES].decode(
+        "utf-8", "replace"
+    )
+    exit_code = result.get("exit_code") if result is not None else None
+    event = {
+        "event_id": event_id,
+        "occurred_at": completed_at,
+        "started_at": started_at,
+        "source": "host-supervisor",
+        "event_type": f"EXECUTOR_ACTION_{status.upper()}",
+        "message": output or f"Executor action {status}",
+        "run_id": request["run_id"],
+        "action_id": request["action_id"],
+        "path_id": _action_path_id(request),
+        "trust_boundary_id": request["trust_boundary_id"],
+        "executor_id": request["source_environment"].upper(),
+        "target_id": request["target_environment"].upper(),
+        "subject_mode": request["subject_mode"],
+        "tool": decision.get("name", "unknown"),
+        "action": decision.get("action", "unknown"),
+        "resource_ref": decision.get("resource_ref", "unknown"),
+        "runtime_result": result.get("runtime_result") if result is not None else "error",
+        "exit_code": exit_code,
+        "stdout": output if error is None and exit_code == 0 else "",
+        "stderr": output if error is not None or exit_code not in (None, 0) else "",
+    }
+    encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+    event_path = EXECUTOR_EVENT_ROOT / f"{request['source_environment'].upper()}.ndjson"
+    vector_gid = grp.getgrnam("vector").gr_gid
+    with EVIDENCE_LOCK:
+        EXECUTOR_EVENT_ROOT.mkdir(mode=0o750, parents=True, exist_ok=True)
+        os.chmod(EXECUTOR_EVENT_ROOT, 0o750)
+        os.chown(EXECUTOR_EVENT_ROOT, 0, vector_gid)
+        with event_path.open("a", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o640)
+            os.fchown(stream.fileno(), 0, vector_gid)
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+
 def _is_trial_group_member() -> bool:
     return HOST_EXECUTOR_USER in grp.getgrnam(TRIAL_GROUP).gr_mem
 
@@ -273,6 +363,9 @@ def _runtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
     run_id = _required_text(payload, "run_id")
     if not RUN_ID_PATTERN.fullmatch(run_id):
         raise ValueError("run_id 형식이 올바르지 않습니다.")
+    action_id = _required_text(payload, "action_id")
+    if not ACTION_ID_PATTERN.fullmatch(action_id):
+        raise ValueError("action_id 형식이 올바르지 않습니다.")
     subject_mode = _required_text(payload, "subject_mode")
     profile = _validate_profile_bundle(subject_mode, payload.get("permission_profile"))
     profile_id = _required_text(payload, "profile_id")
@@ -325,7 +418,7 @@ def _runtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
     profile_hash = supplied_profile_hash or _local_profile_hash(subject_mode, profile)
     return {
         "run_id": run_id,
-        "action_id": _required_text(payload, "action_id"),
+        "action_id": action_id,
         "prompt": _required_text(payload, "prompt"),
         "subject_mode": subject_mode,
         "trust_boundary_id": trust_boundary_id,
@@ -684,7 +777,11 @@ def _execute_container_runtime(payload: dict[str, Any]) -> dict[str, Any]:
         session.baseline_sha256 = before_sha256
 
     command = _container_runtime_command(profile, payload, canary)
-    result = _run(command, input_text=json.dumps(payload, ensure_ascii=False))
+    _capture_state(payload, "before")
+    try:
+        result = _run(command, input_text=json.dumps(payload, ensure_ascii=False))
+    finally:
+        _capture_state(payload, "after")
     body = _parse_runtime_result(result)
     application_checks = _runtime_profile_checks("container", profile, body)
     _require_applied_profile(application_checks)
@@ -874,10 +971,14 @@ def _execute_host_runtime(payload: dict[str, Any]) -> dict[str, Any]:
     )
     profile = payload["permission_profile"]
     command = _host_runtime_command(profile, payload, canary, service_url)
-    result = _run(
-        command,
-        input_text=json.dumps(payload, ensure_ascii=False),
-    )
+    _capture_state(payload, "before")
+    try:
+        result = _run(
+            command,
+            input_text=json.dumps(payload, ensure_ascii=False),
+        )
+    finally:
+        _capture_state(payload, "after")
     body = _parse_runtime_result(result)
     application_checks = _runtime_profile_checks("host", profile, body)
     _require_applied_profile(application_checks)
@@ -901,10 +1002,28 @@ def _execute_host_runtime(payload: dict[str, Any]) -> dict[str, Any]:
 
 def execute_runtime_run(payload: dict[str, Any]) -> dict[str, Any]:
     request = _runtime_payload(payload)
-    with PROFILE_LOCK:
-        if request["subject_mode"] == "container":
-            return _execute_container_runtime(request)
-        return _execute_host_runtime(request)
+    started_at = _utc_now()
+    try:
+        with PROFILE_LOCK:
+            if request["subject_mode"] == "container":
+                result = _execute_container_runtime(request)
+            else:
+                result = _execute_host_runtime(request)
+    except Exception as exc:
+        _append_executor_event(
+            request,
+            started_at=started_at,
+            completed_at=_utc_now(),
+            error=str(exc),
+        )
+        raise
+    _append_executor_event(
+        request,
+        started_at=started_at,
+        completed_at=_utc_now(),
+        result=result,
+    )
+    return result
 
 
 def reset_harness_run(payload: dict[str, Any]) -> dict[str, Any]:

@@ -8,8 +8,12 @@ raw_message = if exists(.message) && is_string(.message) {
 if exists(.message) && is_string(.message) {
   parsed, err = parse_json(.message)
   if err == null && is_object(parsed) {
+    parsed_message = parsed.message
     . = merge!(., parsed)
     del(.message)
+    if parsed_message != null {
+      .message = parsed_message
+    }
   }
 }
 

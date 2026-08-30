@@ -413,13 +413,13 @@ Vector가 Supabase에 직접 연결하지 않는다. Vector가 아는 비밀은 
 |---|---|---|
 | 모델 요청/응답 | Model Gateway/FastAPI 애플리케이션 | 직접 기록하지 않음 |
 | FastAPI tool 요청 | FastAPI | 직접 기록하지 않음 |
-| executor 실제 명령 | U1/C1 runtime | NDJSON 저장 경로와 Vector source만 준비 |
-| stdout/stderr/exit code | U1/C1 runtime | runtime이 executor NDJSON으로 반드시 기록해야 함 |
+| executor 실제 명령 | Host Supervisor | `/v2/runs` 결과를 executor NDJSON으로 기록 |
+| stdout/stderr/exit code | Host Supervisor | runtime 결과를 공통 executor event로 기록 |
 | Host exec/identity/경계 변경 | kernel + auditd | rules 설치 후 자동 수집 |
 | systemd service 로그 | journald | 보존 설정과 Vector source 구성 |
 | Docker lifecycle | Docker API + relay | custom service로 자동 NDJSON 변환 |
 | 컨테이너 stdout/stderr | json-file + relay | custom service로 자동 NDJSON 변환 |
-| Before/After state | capture script | 설치만 함. Supervisor가 호출해야 함 |
+| Before/After state | capture script | Supervisor가 action 실행 직전·직후 자동 호출 |
 | 통합·정규화·전송 | Vector | Terraform이 설치·설정·서비스화 |
 | Supabase 적재 | FastAPI Evidence API | Terraform 범위 밖 |
 
@@ -762,28 +762,26 @@ staging 수정안에서 통과한 검사:
 
 ---
 
-## 17. 최종 반영 전에 고쳐야 할 발견 사항
+## 17. 정적 리뷰에서 발견해 반영한 사항
 
-정적 검증은 통과했지만 문서화 과정의 추가 리뷰에서 다음 runtime 위험을 발견했다.
+정적 리뷰에서 발견한 다음 runtime 위험은 코드에 반영했으며 실제 EC2 검증은 별도로 수행한다.
 
-### 1) JSON 형식 Docker 로그의 `message` 유실 가능성
+### 1) JSON 형식 Docker 로그의 `message` 보존
 
-`normalize.vrl.tpl`은 `.message`가 JSON object이면 object를 event에 merge한 뒤 원본 `.message`를 삭제한다. JSON 로그 안에도 `message` 필드가 있으면 merge 후 같이 삭제되어 실제 stdout/stderr payload가 사라질 수 있다.
+`normalize.vrl.tpl`은 파싱된 NDJSON object의 `message`를 병합 후 최종 event에 복원한다.
 
-권장 수정:
+반영 내용:
 
-- raw payload를 별도 `raw_message`/`log_message` 필드에 보존
-- parse한 JSON의 `message`를 삭제하지 않도록 순서 조정
-- JSON/non-JSON Docker 로그 샘플로 Vector unit test 추가
+- parse한 JSON의 `message`를 최종 event에 복원
+- 배포 검증에서 self-test message의 sink 도착을 확인
 
-### 2) Vector archive에서 잘못된 `vector` 파일 선택 가능성
+### 2) Vector archive의 실행 파일 식별
 
-현재 bootstrap은 archive를 푼 뒤 `find ... -name vector -print -quit`로 첫 파일을 고른다. archive에는 실행 binary 외 init script도 `vector`라는 이름으로 존재할 수 있어 탐색 순서에 따라 잘못 설치할 가능성이 있다.
+bootstrap은 archive의 executable 후보마다 `--version`을 실행해 고정한 Vector 버전과 일치하는 파일만 설치한다.
 
-권장 수정:
+반영 내용:
 
-- archive 구조를 확인해 정확한 binary 경로를 지정
-- 또는 ELF executable 여부를 검사
+- executable 후보의 exact version 확인
 - 설치 직후 exact version 검사를 유지
 
 ### 3) ECR destroy 절차와 pinned digest 조회 충돌

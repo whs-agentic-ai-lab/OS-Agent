@@ -45,7 +45,8 @@ Linux 계정명은 `user1`, `user2`다. `os-agent`는 서비스와 디렉터리 
 Terraform은 이미지를 build하지 않는다. ECR repository만 만들고 immutable digest를 받는다.
 
 - `runtime`: `/app/RUNTIME_CONTRACT` 값이 `action-path-runtime-v1`이어야 하며
-  `/app/host_runtime/host_supervisor.py`와 `/app/runtime_agent/runtime.py`를 포함해야 한다.
+  `/app/host_runtime/host_supervisor.py`, `/app/runtime_agent/runtime.py`,
+  `/app/runtime_agent/recon_tools.py`를 포함해야 한다.
 - `container1`: Container1 Target과 C1 executor를 함께 시작해야 한다.
   `/app/RUNTIME_CONTRACT` 값은 `container1-executor-target-v1`이어야 한다.
 - `target`: Container2/Container3 target service를 기본 entrypoint로 시작하고 C1의
@@ -160,11 +161,11 @@ sudo /opt/os-agent/scripts/capture_state.sh \
   <run_id> <action_id> <path_id> <before|after> <U1|U2|C1|C2|C3>
 ```
 
-Terraform은 이 스크립트를 설치하지만 action lifecycle에서 호출하는 것은 Supervisor
-애플리케이션의 책임이다.
+Terraform은 이 스크립트를 설치하고 Host Supervisor는 `/v2/runs` action lifecycle에서
+실행 직전과 직후에 각각 `before`/`after` 캡처를 호출한다.
 
 Supervisor/runtime은 모든 tool 요청에 동일한 `run_id`, `action_id`, `path_id`를 싣고,
-실제 명령, stdout, stderr, 종료 코드를 NDJSON event로 남겨야 한다. 원격 sink를 켜면
+Host Supervisor가 실제 실행 결과, stdout/stderr, 종료 코드를 executor NDJSON event로 남긴다. 원격 sink를 켜면
 FastAPI가 이 event를 검증해 Supabase Evidence Store에 idempotent하게 적재해야 한다.
 NDJSON writer는 rotation 후 새 파일을 따르도록 event마다 append-open해야 한다.
 

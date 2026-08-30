@@ -21,6 +21,7 @@ emit_line() {
   local occurred_at
   local message
   local event_hash
+  local event_id_file
   local record
 
   if [[ ! "$line" =~ ^([^[:space:]]+)[[:space:]](.*)$ ]]; then
@@ -39,6 +40,12 @@ emit_line() {
     printf '%s\0%s\0%s\0%s' "$container_id" "$stream" "$occurred_at" "$message" |
       sha256sum | awk '{print $1}'
   )"
+  event_id_file="$cursor_file.event-id"
+  if [[ -f "$event_id_file" && "$(cat "$event_id_file")" == "docker-log-$event_hash" ]]; then
+    printf '%s\n' "$occurred_at" >"$cursor_file.tmp"
+    mv -f "$cursor_file.tmp" "$cursor_file"
+    return 0
+  fi
   record="$(jq -cn \
     --arg event_id "docker-log-$event_hash" \
     --arg occurred_at "$occurred_at" \
@@ -61,6 +68,8 @@ emit_line() {
     printf '%s\n' "$record" >>"$OUTPUT"
   } 9>"$LOCK_FILE"
 
+  printf '%s\n' "docker-log-$event_hash" >"$event_id_file.tmp"
+  mv -f "$event_id_file.tmp" "$event_id_file"
   printf '%s\n' "$occurred_at" >"$cursor_file.tmp"
   mv -f "$cursor_file.tmp" "$cursor_file"
 }

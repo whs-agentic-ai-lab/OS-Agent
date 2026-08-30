@@ -14,6 +14,18 @@ from pathlib import Path
 from typing import Any
 
 from runtime_agent.validated_actions import validated_action_names
+try:
+    from runtime_agent.recon_tools import (
+        RECON_TOOL_BY_NAME,
+        execute_recon,
+        validate_recon_call,
+    )
+except ModuleNotFoundError:  # Standalone Host copy beside runtime-agent.py.
+    from recon_tools import (  # type: ignore[no-redef]
+        RECON_TOOL_BY_NAME,
+        execute_recon,
+        validate_recon_call,
+    )
 
 
 CONTAINER_DEFAULTS = {
@@ -228,6 +240,9 @@ def _validate_tool_call(decision: Any) -> tuple[str, str, str, dict[str, Any]]:
         raise ValueError("Tool Call arguments는 JSON 객체여야 합니다.")
     if any(key in arguments for key in ("command", "shell", "path", "absolute_path")):
         raise ValueError("Raw command나 임의 경로는 허용되지 않습니다.")
+    if tool in RECON_TOOL_BY_NAME:
+        validate_recon_call(tool, action, resource_ref, arguments)
+        return tool, action, resource_ref, arguments
     rule = SUPPORTED_RULES.get(tool)
     if rule is None or action not in rule["actions"] or resource_ref not in rule["resources"]:
         raise LookupError("구현되었거나 등록된 Agent Attack Tool 호출이 아닙니다.")
@@ -651,6 +666,90 @@ def _policy_blocked(message: str) -> dict[str, Any]:
     }
 
 
+def _run_recon_tool(
+    payload: dict[str, Any],
+    *,
+    tool: str,
+    action: str,
+    resource_ref: str,
+    arguments: dict[str, Any],
+    validation_error: str | None,
+    subject_mode: str,
+    permission_profile: dict[str, bool],
+) -> dict[str, Any]:
+    events = [
+        _event(
+            "tool_runner",
+            "RECON_TOOL_RECEIVED",
+            f"Backend에서 {tool}:{action} 구조화 Tool Call을 받았습니다.",
+            {"tool": tool, "action": action, "resource_ref": resource_ref},
+        )
+    ]
+    if validation_error:
+        raw = _policy_blocked(validation_error)
+        events.append(
+            _event("tool_runner", "RECON_TOOL_POLICY_BLOCKED", validation_error)
+        )
+    else:
+        events.append(
+            _event(
+                "tool_runner",
+                "RECON_TOOL_ALLOWED",
+                "Recon Tool allowlist와 구조화 인수를 검증했습니다.",
+            )
+        )
+        raw = execute_recon(
+            tool,
+            action,
+            resource_ref,
+            arguments,
+            {
+                "run_id": payload["run_id"],
+                "action_id": payload["action_id"],
+                "subject_mode": subject_mode,
+                "trust_boundary_id": payload["trust_boundary_id"],
+                "source_environment": payload["source_environment"],
+                "target_environment": payload["target_environment"],
+                "permission_profile": permission_profile,
+                "profile_id": payload["profile_id"],
+            },
+        )
+    events.append(
+        _event(
+            "runtime_agent",
+            "RECON_TOOL_EXECUTED",
+            "선택 환경 내부 Executor가 실제 Recon Tool 시도를 완료했습니다.",
+            {"outcome": raw["outcome"], "exit_code": raw["exit_code"]},
+        )
+    )
+    source = payload["source_environment"]
+    target = payload["target_environment"]
+    return {
+        "run_id": payload["run_id"],
+        "action_id": payload["action_id"],
+        "subject_mode": subject_mode,
+        "executor_mode": subject_mode,
+        "trust_boundary_id": payload["trust_boundary_id"],
+        "source_environment": source,
+        "target_environment": target,
+        "source": source,
+        "target": target,
+        "applied_profile": payload["profile_id"],
+        "applied_profile_state": {},
+        "runtime_agent": f"{source}-executor-v5",
+        "planner_mode": payload.get("planner_mode", "local"),
+        "tool": tool,
+        "action": action,
+        "resource_ref": resource_ref,
+        "tool_arguments": arguments,
+        "policy_decision": "denied" if raw["outcome"] == "POLICY_BLOCKED" else "allowed",
+        "runtime_result": _runtime_result(raw["outcome"]),
+        "evidence_refs": [f"action:{payload['action_id']}:runtime"],
+        **raw,
+        "events": events,
+    }
+
+
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     required_text = (
         "run_id", "action_id", "prompt", "profile_id", "trust_boundary_id",
@@ -682,6 +781,18 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         resource_ref = decision.get("resource_ref", "unknown") if isinstance(decision, dict) else "unknown"
         arguments = decision.get("arguments", {}) if isinstance(decision, dict) else {}
         validation_error = str(exc)
+
+    if tool in RECON_TOOL_BY_NAME:
+        return _run_recon_tool(
+            payload,
+            tool=tool,
+            action=action,
+            resource_ref=resource_ref,
+            arguments=arguments,
+            validation_error=validation_error,
+            subject_mode=subject_mode,
+            permission_profile=permission_profile,
+        )
 
     events = [
         _event(
