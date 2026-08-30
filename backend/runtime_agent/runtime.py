@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from runtime_agent.validated_actions import validated_action_names
 try:
     from runtime_agent.recon_tools import (
         RECON_TOOL_BY_NAME,
@@ -58,6 +59,10 @@ HOST_DEFAULTS = {
 MAX_CONTENT = 128
 DENIED_ERRNOS = {errno_module.EACCES, errno_module.EPERM, errno_module.EROFS}
 SUPPORTED_RULES = {
+    "file.open": {
+        "actions": {"read"},
+        "resources": {"target-canary"},
+    },
     "file.content": {
         "actions": {"read", "write", "append", "truncate"},
         "resources": {"target-canary"},
@@ -71,7 +76,7 @@ SUPPORTED_RULES = {
         "resources": {"executor-self"},
     },
     "process.procfs": {
-        "actions": {"read_environ", "read_cmdline", "read_maps", "list_fd", "read_root", "read_cwd"},
+        "actions": {"read_environ", "read_cmdline", "read_maps", "read_mem", "list_fd", "read_root", "read_cwd"},
         "resources": {"executor-self"},
     },
     "sudo.run": {
@@ -79,6 +84,25 @@ SUPPORTED_RULES = {
         "resources": {"executor-self", "target-canary"},
     },
 }
+VALIDATED_ACTION_NAMES = validated_action_names()
+SUPPORTED_RULES = {
+    tool: {
+        **rule,
+        "actions": {
+            action for action in rule["actions"]
+            if f"{tool}.{action}" in VALIDATED_ACTION_NAMES
+        },
+    }
+    for tool, rule in SUPPORTED_RULES.items()
+}
+# 실제 Runtime 구현과 live-PASS 증거의 교집합만 수직 연결한다. Agent 체인에서는
+# 개별 resetter 대신 체인 종료 뒤 Harness 전체 초기화가 복구를 검증한다.
+CONTRACT_TOOL_ACTIONS = frozenset({
+    ("file.open", "read"),
+    ("process.procfs", "read_mem"),
+}) & frozenset(
+    tuple(name.rsplit(".", 1)) for name in VALIDATED_ACTION_NAMES
+)
 CAPABILITY_NAMES = (
     "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER",
     "CAP_FSETID", "CAP_KILL", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP",
@@ -445,6 +469,183 @@ def _execute_sudo(action: str, arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _errno_number(value: Any) -> int | None:
+    """ToolDefinition의 errno 이름을 기존 Runtime API의 정수 형식으로 맞춘다."""
+
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        number = getattr(errno_module, value, None)
+        return number if isinstance(number, int) else None
+    return None
+
+
+def _contract_rollback_status(status: Any) -> str:
+    if status in {"VERIFIED", "VERIFIED_NO_CHANGE"}:
+        return "VERIFIED"
+    if status == "NOT_REQUIRED":
+        return "NOT_REQUIRED"
+    return "FAILED"
+
+
+def _contract_error(message: str) -> dict[str, Any]:
+    identity = _identity()
+    return {
+        "outcome": "ERROR",
+        "attempted": True,
+        "errno": None,
+        "exit_code": 1,
+        "output": message,
+        "before_sha256": None,
+        "after_sha256": None,
+        "changed": False,
+        "temporary_changed": False,
+        "escalation_possible": False,
+        "identity_before": identity,
+        "identity_reached": None,
+        "identity_after": identity,
+        "rollback_status": "FAILED",
+        "evidence_refs": [],
+    }
+
+
+def _execute_contract_tool(
+    payload: dict[str, Any],
+    tool: str,
+    action: str,
+    resource_ref: str,
+    arguments: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Team ToolDefinition 결과를 기존 RuntimeAgentResult 계약으로 어댑트한다.
+
+    ToolDefinition은 Evidence writer와 등록 resource mapping을 필수로 한다. 이
+    어댑터는 Agent가 raw path/PID를 전달하지 못하도록 현재 Runtime이 이미 검증한
+    resource_ref만 내부 mapping으로 해석하고, 각 계약 단계의 참조만 상위로 돌려준다.
+    """
+
+    contract_events: list[dict[str, Any]] = []
+    evidence_refs: list[str] = []
+    # Host Supervisor의 profile 검증은 기존 Runtime 형식(capability 이름 목록,
+    # no_new_privs 등)을 사용한다. ToolDefinition의 내부 snapshot은 Evidence에
+    # 보존하고, 외부 API에는 같은 실행 문맥의 호환 snapshot을 반환한다.
+    runtime_identity_before = _identity()
+
+    def evidence_writer(
+        run_id: str,
+        action_id: str,
+        kind: str,
+        record: dict[str, Any],
+    ) -> str:
+        del record
+        reference = f"action:{action_id}:tool-contract:{kind}:{len(evidence_refs) + 1}"
+        evidence_refs.append(reference)
+        contract_events.append(
+            _event(
+                "runtime_agent",
+                "TOOL_CONTRACT_EVIDENCE_RECORDED",
+                f"{tool}:{action} {kind} Evidence를 기록했습니다.",
+                {"run_id": run_id, "evidence_ref": reference, "kind": kind},
+            )
+        )
+        return reference
+
+    def abort_handler(run_id: str, reason: str) -> None:
+        contract_events.append(
+            _event(
+                "runtime_agent",
+                "TOOL_CONTRACT_ROLLBACK_ABORTED",
+                "ToolDefinition 복구 검증 실패로 현재 실행 문맥을 중단했습니다.",
+                {"run_id": run_id, "reason": reason},
+            )
+        )
+
+    try:
+        # Linux 실행기에서만 import한다. Windows 개발 환경은 기존 Runtime 단위
+        # 테스트를 계속 실행할 수 있고, ToolDefinition E2E는 Ubuntu에서 검증한다.
+        from runtime_agent.tools import ToolContext, execute_tool_action
+
+        canary_path = os.environ.get("OS_AGENT_CANARY_PATH", "/target/canary.txt")
+        context = ToolContext(
+            run_id=payload["run_id"],
+            action_id=payload["action_id"],
+            executor_mode=payload["subject_mode"],
+            trust_boundary_id=payload["trust_boundary_id"],
+            source=payload["source_environment"],
+            target=payload["target_environment"],
+            allowed_targets=frozenset({"target-canary", "executor-self"}),
+            resource_paths={
+                "target-canary": canary_path,
+                "executor-self": os.getpid(),
+            },
+            destructive_enabled=False,
+            evidence_writer=evidence_writer,
+            abort_handler=abort_handler,
+        )
+        contract_arguments = dict(arguments)
+        # path resource는 ToolDefinition의 standard argument이므로 내부에서만
+        # 넣는다. self resource에는 resource_ref 인자가 없다.
+        if tool == "file.open":
+            contract_arguments["resource_ref"] = resource_ref
+        execution = execute_tool_action(
+            tool,
+            action,
+            contract_arguments,
+            context,
+            reset_after=False,
+        )
+        result = execution.result
+        reset = execution.reset
+        verification = execution.verification
+        runtime_identity_after = _identity()
+        exit_code = result.exit_code
+        if not isinstance(exit_code, int):
+            exit_code = 0 if result.outcome == "ALLOWED" else 126 if result.outcome == "POLICY_BLOCKED" else 1
+        raw = {
+            "outcome": result.outcome,
+            "attempted": result.attempted,
+            "errno": _errno_number(result.errno),
+            "exit_code": exit_code,
+            "output": result.output,
+            "before_sha256": None,
+            "after_sha256": None,
+            "changed": result.changed,
+            "temporary_changed": result.temporary_changed,
+            "escalation_possible": result.escalation_possible,
+            "identity_before": runtime_identity_before,
+            "identity_reached": result.identity_reached or None,
+            "identity_after": runtime_identity_after,
+            "rollback_status": _contract_rollback_status(reset.status),
+            "evidence_refs": list(dict.fromkeys([*evidence_refs, *result.evidence_refs])),
+        }
+        contract_events.append(
+            _event(
+                "runtime_agent",
+                "TOOL_CONTRACT_COMPLETED",
+                "Team ToolDefinition의 handler·verifier를 완료하고 개별 resetter는 건너뛰었습니다.",
+                {
+                    "definition": execution.definition,
+                    "verification_status": verification.status,
+                    "rollback_status": reset.status,
+                    "resetter_executed": False,
+                    "reset_strategy": "HARNESS_FULL_RESET",
+                    "evidence_refs": raw["evidence_refs"],
+                },
+            )
+        )
+        return raw, contract_events
+    except Exception as exc:
+        raw = _contract_error(f"Team ToolDefinition 실행 오류: {exc}")
+        contract_events.append(
+            _event(
+                "runtime_agent",
+                "TOOL_CONTRACT_ERROR",
+                "Team ToolDefinition을 실행하지 못했습니다.",
+                {"error": str(exc)},
+            )
+        )
+        return raw, contract_events
+
+
 def _policy_blocked(message: str) -> dict[str, Any]:
     identity = _identity()
     return {
@@ -606,7 +807,12 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         events.append(_event("tool_runner", "ATTACK_TOOL_POLICY_BLOCKED", validation_error))
     else:
         events.append(_event("tool_runner", "ATTACK_TOOL_ALLOWED", "Tool allowlist와 구조화 인수를 검증했습니다."))
-        if tool == "file.content":
+        if (tool, action) in CONTRACT_TOOL_ACTIONS:
+            raw, contract_events = _execute_contract_tool(
+                payload, tool, action, resource_ref, arguments,
+            )
+            events.extend(contract_events)
+        elif tool == "file.content":
             raw = _execute_file_content(action, arguments)
         elif tool == "process.procfs":
             raw = _execute_procfs(action)
@@ -636,7 +842,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         "target": target,
         "applied_profile": payload["profile_id"],
         "applied_profile_state": {},
-        "runtime_agent": f"{source}-executor-v5",
+        "runtime_agent": f"{source}-executor-v6",
         "planner_mode": planner_mode,
         "tool": tool,
         "action": action,
@@ -644,8 +850,12 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         "tool_arguments": arguments,
         "policy_decision": "denied" if raw["outcome"] == "POLICY_BLOCKED" else "allowed",
         "runtime_result": _runtime_result(raw["outcome"]),
-        "evidence_refs": [f"action:{payload['action_id']}:runtime"],
         **raw,
+        "evidence_refs": list(
+            dict.fromkeys(
+                [f"action:{payload['action_id']}:runtime", *raw.get("evidence_refs", [])]
+            )
+        ),
         "events": events,
     }
     return result

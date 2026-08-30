@@ -38,7 +38,8 @@ CONTAINER1_EXECUTOR_UID = 22001
 CONTROL_PLANE_UID = 10003
 SOCKET_PATH = Path("/run/os-agent/host-supervisor.sock")
 SCRIPT_PATH = Path("/opt/os-agent/bin/host-supervisor.py")
-RUNTIME_AGENT_PATH = Path("/opt/os-agent/bin/runtime-agent.py")
+RUNTIME_AGENT_ROOT = Path("/opt/os-agent")
+RUNTIME_AGENT_MODULE = "runtime_agent.runtime"
 CANARY_ROOT = Path("/var/lib/os-agent/host-canaries")
 HOST_PROFILE_CANARY = CANARY_ROOT / "profile-canary.txt"
 TARGET_ROOT = Path("/srv/os-agent/targets")
@@ -48,6 +49,13 @@ TARGET_DIRECTORIES = {
     "c1": "container1",
     "c2": "container2",
     "c3": "container3",
+}
+TARGET_DIRECTORY_IDENTITIES = {
+    "u1": (21001, 21001),
+    "u2": (21002, 21002),
+    "c1": (22001, 22001),
+    "c2": (22002, 22002),
+    "c3": (22003, 22003),
 }
 TARGET_CONTAINERS = {
     "c1": "os-agent-container1",
@@ -530,7 +538,12 @@ def _target_canary(target_environment: str) -> Path:
     if directory_name is None:
         raise ValueError("등록되지 않은 Target 환경입니다.")
     target_dir = TARGET_ROOT / directory_name
-    target_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    created = not target_dir.exists()
+    target_dir.mkdir(mode=0o751, parents=True, exist_ok=True)
+    if created:
+        uid, gid = TARGET_DIRECTORY_IDENTITIES[target_environment]
+        os.chown(target_dir, uid, gid)
+        os.chmod(target_dir, 0o751)
     return target_dir / "canary.txt"
 
 
@@ -773,7 +786,7 @@ def _execute_container_runtime(payload: dict[str, Any]) -> dict[str, Any]:
     application_checks = _runtime_profile_checks("container", profile, body)
     _require_applied_profile(application_checks)
     after_sha256 = _hash(canary)
-    if body.get("tool") in {"file.content", "sudo.run"}:
+    if body.get("tool") in {"file.open", "file.content", "sudo.run"}:
         body["before_sha256"] = before_sha256
         body["after_sha256"] = after_sha256
         body["changed"] = before_sha256 != after_sha256
@@ -913,11 +926,13 @@ def _host_runtime_command(
         command.append("--no-new-privs")
     command.extend([
         "/usr/bin/env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        f"PYTHONPATH={RUNTIME_AGENT_ROOT}",
         f"OS_AGENT_CANARY_PATH={canary}",
         f"OS_AGENT_TARGET_NODE={payload['target_environment']}",
         f"OS_AGENT_SUDO_HELPER={SCRIPT_PATH}",
         f"OS_AGENT_SERVICE_URL={service_url}",
-        "/usr/bin/python3", str(RUNTIME_AGENT_PATH),
+        "/usr/bin/python3", "-m", RUNTIME_AGENT_MODULE,
     ])
     return command
 
@@ -968,7 +983,7 @@ def _execute_host_runtime(payload: dict[str, Any]) -> dict[str, Any]:
     application_checks = _runtime_profile_checks("host", profile, body)
     _require_applied_profile(application_checks)
     after_sha256 = _hash(canary)
-    if body.get("tool") in {"file.content", "sudo.run"}:
+    if body.get("tool") in {"file.open", "file.content", "sudo.run"}:
         body["before_sha256"] = before_sha256
         body["after_sha256"] = after_sha256
         body["changed"] = before_sha256 != after_sha256
@@ -1142,13 +1157,20 @@ def reset_experiment_environment(payload: dict[str, Any]) -> dict[str, Any]:
         CONTAINER_RUN_ROOT.mkdir(mode=0o755, parents=True, exist_ok=True)
 
         target_hashes: dict[str, str] = {}
+        target_directory_modes: dict[str, str] = {}
         for target_environment, directory_name in TARGET_DIRECTORIES.items():
             target_dir = TARGET_ROOT / directory_name
             if target_dir.is_symlink() or (target_dir.exists() and not target_dir.is_dir()):
                 target_dir.unlink()
             elif target_dir.exists():
                 shutil.rmtree(target_dir)
-            target_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+            target_dir.mkdir(mode=0o751, parents=True, exist_ok=True)
+            uid, gid = TARGET_DIRECTORY_IDENTITIES[target_environment]
+            os.chown(target_dir, uid, gid)
+            os.chmod(target_dir, 0o751)
+            target_directory_modes[target_environment] = oct(
+                stat.S_IMODE(target_dir.stat().st_mode)
+            )
             canary = target_dir / "canary.txt"
             canary.write_text(INITIAL_CONTENT, encoding="utf-8")
             os.chown(canary, 0, trial_gid)
@@ -1216,6 +1238,7 @@ def reset_experiment_environment(payload: dict[str, Any]) -> dict[str, Any]:
             "docker_group_member": _is_group_member(DOCKER_GROUP),
             "container_run_root_empty": not any(CONTAINER_RUN_ROOT.iterdir()),
             "target_canary_sha256": target_hashes,
+            "target_directory_modes": target_directory_modes,
             "running_containers": sorted(running_containers),
             "healthy_containers": sorted(healthy_containers),
             "removed_chain_ids": removed_chain_ids,
@@ -1226,6 +1249,7 @@ def reset_experiment_environment(payload: dict[str, Any]) -> dict[str, Any]:
             or restored["docker_group_member"] is not False
             or restored["container_run_root_empty"] is not True
             or len(target_hashes) != len(TARGET_DIRECTORIES)
+            or any(mode != oct(0o751) for mode in target_directory_modes.values())
         ):
             raise RuntimeError("실험 환경 기준 상태 복구 검증에 실패했습니다.")
 

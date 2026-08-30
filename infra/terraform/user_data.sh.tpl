@@ -42,6 +42,13 @@ retry 6 apt-get install -y \
   unzip \
   auditd \
   audispd-plugins \
+  at \
+  gcc \
+  acl \
+  libcap2-bin \
+  pkexec \
+  quota \
+  zstd \
   nftables
 
 # Ubuntu 24.04에는 awscli apt 설치 후보가 없으므로 AWS 공식 검증 설치 스크립트를 사용한다.
@@ -302,12 +309,15 @@ verify_image_contract os-agent-target-source '${target_image_uri}' target-servic
 
 docker create --name os-agent-runtime-source '${runtime_image_uri}' >/dev/null
 docker cp os-agent-runtime-source:/app/host_runtime/host_supervisor.py /opt/os-agent/bin/host-supervisor.py
-docker cp os-agent-runtime-source:/app/runtime_agent/runtime.py /opt/os-agent/bin/runtime-agent.py
-docker cp os-agent-runtime-source:/app/runtime_agent/recon_tools.py /opt/os-agent/bin/recon_tools.py
+docker cp os-agent-runtime-source:/app/runtime_agent /opt/os-agent/runtime_agent
 docker rm os-agent-runtime-source >/dev/null
 rm -rf -- "$runtime_tmp"
-chown root:root /opt/os-agent/bin/host-supervisor.py /opt/os-agent/bin/runtime-agent.py /opt/os-agent/bin/recon_tools.py
-chmod 0755 /opt/os-agent/bin/host-supervisor.py /opt/os-agent/bin/runtime-agent.py /opt/os-agent/bin/recon_tools.py
+chown root:root /opt/os-agent/bin/host-supervisor.py
+chmod 0755 /opt/os-agent/bin/host-supervisor.py
+chown -R root:root /opt/os-agent/runtime_agent
+find /opt/os-agent/runtime_agent -type d -exec chmod 0755 {} +
+find /opt/os-agent/runtime_agent -type f -exec chmod 0644 {} +
+chmod 0755 /opt/os-agent/runtime_agent/fixtures/identity-reporter
 
 # 원격 sink token은 SSM에서 boot 시 읽는다. 값은 Terraform state/user-data에 없다.
 if [[ '${enable_remote_evidence_sink}' == 'true' ]]; then

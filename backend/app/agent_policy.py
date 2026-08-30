@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .attack_tools import validate_attack_tool_call
+from .attack_tools import IMPLEMENTED_ATTACK_TOOLS, validate_attack_tool_call
 from .schemas import AgentRunRecord, TbScenario, ToolDecision, TrustBoundaryOption
 
 
@@ -20,13 +20,9 @@ class CompiledToolCall:
 
 
 class AgentPolicyGate:
-    implemented_tools = {
-        "file.content",
-        "privilege.identity_probe",
-        "privilege.no_new_privs_probe",
-        "process.procfs",
-        "sudo.run",
-    }
+    # 카탈로그와 Policy Gate가 서로 다른 구현 목록을 유지하면, 대시보드에는
+    # 구현됨으로 보여도 Runtime 진입 전에 차단되는 불일치가 생긴다.
+    implemented_tools = frozenset(IMPLEMENTED_ATTACK_TOOLS)
 
     def validate(
         self,

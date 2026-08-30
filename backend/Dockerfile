@@ -1,3 +1,10 @@
+FROM gcc:14-bookworm AS fixture-builder
+
+COPY runtime_agent/fixtures/identity_reporter.c /src/identity_reporter.c
+RUN gcc -O2 -Wall -Wextra -Werror -s \
+    -o /identity-reporter /src/identity_reporter.c \
+    && chmod 0755 /identity-reporter
+
 FROM python:3.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -11,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY host_runtime ./host_runtime
 COPY runtime_agent ./runtime_agent
+COPY --from=fixture-builder /identity-reporter ./runtime_agent/fixtures/identity-reporter
 
 RUN printf '%s\n' 'action-path-runtime-v1' > /app/RUNTIME_CONTRACT
 

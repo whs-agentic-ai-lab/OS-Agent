@@ -210,6 +210,7 @@ def test_options_have_two_executors_eight_boundaries_and_attack_tool_catalog(tmp
     assert body["permission_catalog_summary"]["independent_permission_count"] is None
     assert len(body["tools"]) == 129
     assert {item["id"] for item in body["tools"] if item["implemented"]} == {
+        "file.open",
         "file.content",
         "privilege.identity_probe",
         "privilege.no_new_privs_probe",

@@ -1,0 +1,120 @@
+{
+  "schema_version": "tool-validation-v1",
+  "generated_at": "2026-08-29T14:37:26.552127+00:00",
+  "exact_tool_action_duplicates": [],
+  "exact_duplicate_decision": "PASS",
+  "semantic_reviews": [
+    {
+      "candidate": [
+        "process.procfs:read_mem",
+        "process.memory:read"
+      ],
+      "decision": "KEEP_SEPARATE",
+      "mechanism": [
+        "/proc/<pid>/mem file interface",
+        "process_vm_readv syscall"
+      ],
+      "reason": "The target memory overlaps, but kernel interface and independent verifier observations differ."
+    },
+    {
+      "candidate": [
+        "process.pidfd:getfd",
+        "fd.transfer:pidfd_getfd"
+      ],
+      "decision": "KEEP_SEPARATE",
+      "mechanism": [
+        "process lifecycle/pidfd control",
+        "FD transfer/object identity"
+      ],
+      "reason": "Both reach pidfd_getfd, while one verifies process/pidfd lifecycle and the other verifies transferred FD identity and repeatability."
+    },
+    {
+      "candidate": [
+        "fd.transfer:scm_send/scm_receive",
+        "unix_socket.fd_transfer:send_fd/receive_fd"
+      ],
+      "decision": "KEEP_SEPARATE",
+      "mechanism": [
+        "generic FD transfer catalogue",
+        "Unix socket ancillary-data control plane"
+      ],
+      "reason": "SCM_RIGHTS overlaps, but the Unix-socket family additionally owns socket/credential semantics and a different verifier scope."
+    },
+    {
+      "candidate": [
+        "file.open",
+        "file.content",
+        "fd.operate"
+      ],
+      "decision": "KEEP_SEPARATE",
+      "mechanism": [
+        "open/openat semantics",
+        "path content operations",
+        "already-open descriptor operations"
+      ],
+      "reason": "They operate at different lifecycle layers and verify different kernel objects."
+    },
+    {
+      "candidate": [
+        "filecap.manage",
+        "persist.filecap"
+      ],
+      "decision": "KEEP_SEPARATE",
+      "mechanism": [
+        "capability execution probe",
+        "persistent filesystem capability installation"
+      ],
+      "reason": "The xattr mechanism overlaps, but target lifecycle and persistence verifier intent differ."
+    },
+    {
+      "candidate": [
+        "systemd.unit_*",
+        "persist.systemd_*"
+      ],
+      "decision": "KEEP_SEPARATE",
+      "mechanism": [
+        "systemd runtime/unit control plane",
+        "persistence installation and activation"
+      ],
+      "reason": "Runtime management and persistence establishment have distinct targets, reset scopes, and verification goals."
+    },
+    {
+      "candidate": [
+        "kernel.sysctl",
+        "persist.sysctl"
+      ],
+      "decision": "KEEP_SEPARATE",
+      "mechanism": [
+        "live kernel sysctl interface",
+        "persistent sysctl configuration plus reload"
+      ],
+      "reason": "One validates the live kernel control and the other validates boot-persistent configuration."
+    },
+    {
+      "candidate": [
+        "general file tools",
+        "audit/journal mutation tools"
+      ],
+      "decision": "KEEP_SEPARATE",
+      "mechanism": [
+        "generic registered path",
+        "audit/journal control and evidence plane"
+      ],
+      "reason": "Logging tools require subsystem-specific policy, evidence correlation, and terminal reset handling."
+    },
+    {
+      "candidate": [
+        "docker.*",
+        "containerd.*",
+        "oci.*"
+      ],
+      "decision": "KEEP_SEPARATE",
+      "mechanism": [
+        "Docker Engine API/CLI",
+        "containerd task API",
+        "OCI runtime invocation"
+      ],
+      "reason": "They target different control planes even when the resulting container effect is similar."
+    }
+  ]
+}

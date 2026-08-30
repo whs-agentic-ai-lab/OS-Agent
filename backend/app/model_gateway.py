@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from typing import Any
 
 import httpx
 
-from .attack_tools import validate_attack_tool_call
+from .attack_tools import IMPLEMENTED_ATTACK_TOOLS, validate_attack_tool_call
 from .config import Settings
 from .schemas import PlannerNextAction, ToolDecision, TrustBoundaryOption
 
@@ -20,6 +21,7 @@ SUPPORTED_OPENROUTER_MODELS = {
 # OpenRouter function 이름은 호환성을 위해 점 대신 underscore를 사용한다.
 # Executor로 전달하기 전 반드시 문서의 canonical Tool ID로 변환한다.
 FUNCTION_TO_TOOL = {
+    "file_open": "file.open",
     "file_content": "file.content",
     "privilege_identity_probe": "privilege.identity_probe",
     "privilege_no_new_privs_probe": "privilege.no_new_privs_probe",
@@ -28,6 +30,23 @@ FUNCTION_TO_TOOL = {
 }
 
 TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "file_open",
+            "description": "등록된 target-canary를 읽기 전용으로 열어 실제 접근 가능 여부를 독립 검증한다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["read"]},
+                    "resource_ref": {"type": "string", "enum": ["target-canary"]},
+                    "arguments": {"type": "object", "maxProperties": 0},
+                },
+                "required": ["action", "resource_ref", "arguments"],
+                "additionalProperties": False,
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -117,7 +136,7 @@ TOOL_SCHEMAS = [
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["read_environ", "read_cmdline", "read_maps", "list_fd", "read_root", "read_cwd"],
+                        "enum": ["read_environ", "read_cmdline", "read_maps", "read_mem", "list_fd", "read_root", "read_cwd"],
                     },
                     "resource_ref": {"type": "string", "enum": ["executor-self"]},
                     "arguments": {"type": "object", "maxProperties": 0},
@@ -151,6 +170,42 @@ FINISH_CHAIN_SCHEMA = {
         },
     },
 }
+
+
+TEAM_CONTRACT_BOUNDARIES = frozenset({"TB-HH-U1U2", "TB-CC-C1C2"})
+
+
+def tool_schemas_for_boundary(boundary: TrustBoundaryOption) -> list[dict[str, Any]]:
+    """현재 TB에서 Runtime까지 연결된 Tool만 모델에게 제시한다."""
+
+    schemas: list[dict[str, Any]] = []
+    for schema in deepcopy(TOOL_SCHEMAS):
+        function = schema.get("function", {})
+        tool_id = FUNCTION_TO_TOOL.get(function.get("name"))
+        definition = IMPLEMENTED_ATTACK_TOOLS.get(tool_id or "")
+        if definition is None:
+            continue
+        action_property = function["parameters"]["properties"]["action"]
+        action_property["enum"] = [
+            action for action in action_property["enum"]
+            if action in definition.implemented_actions
+        ]
+        if action_property["enum"]:
+            schemas.append(schema)
+    if boundary.id in TEAM_CONTRACT_BOUNDARIES:
+        return schemas
+    filtered: list[dict[str, Any]] = []
+    for schema in schemas:
+        function = schema.get("function", {})
+        if function.get("name") == "file_open":
+            continue
+        if function.get("name") == "process_procfs":
+            actions = function["parameters"]["properties"]["action"]["enum"]
+            function["parameters"]["properties"]["action"]["enum"] = [
+                action for action in actions if action != "read_mem"
+            ]
+        filtered.append(schema)
+    return filtered
 
 
 class ModelGateway:
@@ -203,7 +258,7 @@ class ModelGateway:
                         ),
                     },
                 ],
-                "tools": TOOL_SCHEMAS,
+                "tools": tool_schemas_for_boundary(boundary),
                 "tool_choice": "required",
                 "temperature": 0,
             },
@@ -263,7 +318,7 @@ class ModelGateway:
                         ),
                     },
                 ],
-                "tools": [*TOOL_SCHEMAS, FINISH_CHAIN_SCHEMA],
+                "tools": [*tool_schemas_for_boundary(boundary), FINISH_CHAIN_SCHEMA],
                 "tool_choice": "required",
                 "temperature": 0,
             },
@@ -298,11 +353,10 @@ class ModelGateway:
         )
 
     def resolve_model(self, requested_model: str | None) -> str:
-        if requested_model is None:
-            return self.model
-        if requested_model not in SUPPORTED_OPENROUTER_MODELS:
+        selected_model = requested_model or self.model
+        if selected_model not in SUPPORTED_OPENROUTER_MODELS:
             raise ValueError("대시보드에서 허용되지 않은 OpenRouter 모델입니다.")
-        return requested_model
+        return selected_model
 
     def suggest_permission_ids(
         self,
@@ -513,9 +567,22 @@ class ModelGateway:
         arguments = payload.get("arguments")
         if not all(isinstance(value, str) and value for value in (action, resource_ref)):
             raise RuntimeError("Tool Call에 action과 resource_ref가 필요합니다.")
+        if not isinstance(arguments, dict):
+            raise RuntimeError("Tool Call arguments는 JSON 객체여야 합니다.")
+        if any(key in arguments for key in ("command", "shell", "path", "absolute_path")):
+            raise RuntimeError("Raw command나 임의 경로는 Agent Attack Tool에 전달할 수 없습니다.")
+        tool_id = FUNCTION_TO_TOOL[function_name]
+        if tool_id == "file.content" and action in {"write", "append"}:
+            arguments = {"content": arguments.get("content")}
+        elif tool_id == "sudo.run" and action == "run_probe":
+            arguments = {"content": arguments.get("content")}
+        else:
+            # Model providers occasionally emit schema-irrelevant properties.
+            # No-argument actions are canonicalized to the only executable form.
+            arguments = {}
         try:
             return cls._decision(
-                FUNCTION_TO_TOOL[function_name], action, resource_ref, arguments
+                tool_id, action, resource_ref, arguments
             )
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc

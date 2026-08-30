@@ -59,7 +59,7 @@ services:
       OS_AGENT_TOPOLOGY_REVISION: ${topology_revision}
     networks: [c1_c2, c1_c3]
     healthcheck:
-      test: ["CMD", "/app/healthcheck"]
+      test: ["CMD", "python3", "/app/healthcheck"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -99,7 +99,7 @@ services:
       OS_AGENT_TOPOLOGY_REVISION: ${topology_revision}
     networks: [c1_c2]
     healthcheck:
-      test: ["CMD", "/app/healthcheck"]
+      test: ["CMD", "python3", "/app/healthcheck"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -139,7 +139,7 @@ services:
       OS_AGENT_TOPOLOGY_REVISION: ${topology_revision}
     networks: [c1_c3]
     healthcheck:
-      test: ["CMD", "/app/healthcheck"]
+      test: ["CMD", "python3", "/app/healthcheck"]
       interval: 5s
       timeout: 3s
       retries: 12

@@ -94,6 +94,23 @@ class FileContentVerifier:
         return _result(self.name, checks)
 
 
+class FileOpenVerifier(FileContentVerifier):
+    """ToolDefinition 기반 읽기 전용 file.open의 독립 결과 판정."""
+
+    name = "file_open_verifier"
+
+    def verify(self, run: RunRecord) -> VerificationResult:
+        # 현재 Runtime에는 read만 연결되어 있다. FileContentVerifier의 read
+        # 규칙은 동일 Canary와 동일 권한 프로파일을 재확인하므로 그대로 쓴다.
+        if run.tool_arguments.get("action") != "read":
+            return VerificationResult(
+                status="INCONCLUSIVE",
+                verifier=self.name,
+                checks={"evidence_complete": False, "read_only_pilot": False},
+            )
+        return super().verify(run)
+
+
 def _empty_hash() -> str:
     return "sha256:" + sha256(b"").hexdigest()
 
@@ -179,6 +196,7 @@ class ProcfsVerifier:
 
 
 VERIFIERS: dict[str, ToolVerifier] = {
+    "file.open": FileOpenVerifier(),
     "file.content": FileContentVerifier(),
     "privilege.identity_probe": PrivilegeProbeVerifier(),
     "privilege.no_new_privs_probe": PrivilegeProbeVerifier(),
