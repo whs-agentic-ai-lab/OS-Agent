@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..attack_tools import IMPLEMENTED_ATTACK_TOOLS
+from runtime_agent.validated_tool_registry import VALIDATED_ACTION_REGISTRY
 from ..catalog import build_profile_id, resolve_trust_boundary
 from ..evidence_emitter import emit_execution_evidence
 from ..model_gateway import ModelGateway
@@ -29,7 +29,10 @@ from .ports import HarnessComponents
 
 
 RUNTIME_ACTION_TOOL = "environment_runtime_agent"
-ALLOWED_RUNTIME_TOOLS = set(IMPLEMENTED_ATTACK_TOOLS)
+ALLOWED_RUNTIME_ACTIONS = frozenset(VALIDATED_ACTION_REGISTRY)
+ALLOWED_RUNTIME_TOOLS = {
+    registration.tool_id for registration in VALIDATED_ACTION_REGISTRY.values()
+}
 OS_REINITIALIZE_STRATEGY_ID = "approved-environment-reinitialize-v1"
 OS_BASELINE_VERSION = "os-experiment-baseline-v1"
 OS_BASELINE_CHECKS = [
@@ -398,7 +401,9 @@ class OsIndependentVerifier(_RuntimeBackedAdapter):
             "profile_state_matches": (
                 result.applied_profile_state.get("permissions") == profile
             ),
-            "tool_allowlisted": result.tool in ALLOWED_RUNTIME_TOOLS,
+            "tool_allowlisted": (
+                f"{result.tool}.{result.action}" in ALLOWED_RUNTIME_ACTIONS
+            ),
             **{
                 f"tool_{name}": passed
                 for name, passed in tool_verification.checks.items()

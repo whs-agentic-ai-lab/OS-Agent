@@ -28,7 +28,7 @@ MAX_IMPACT = ToolDecision(
     name="sudo.run",
     action="run_probe",
     resource_ref="target-canary",
-    arguments={"content": "chain-impact"},
+    arguments={},
 )
 NO_EFFECT_WRITE = ToolDecision(
     name="file.content",

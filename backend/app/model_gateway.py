@@ -6,9 +6,14 @@ from typing import Any
 
 import httpx
 
-from .attack_tools import IMPLEMENTED_ATTACK_TOOLS, validate_attack_tool_call
+from .attack_tools import validate_attack_tool_call
 from .config import Settings
 from .schemas import PlannerNextAction, ToolDecision, TrustBoundaryOption
+from runtime_agent.recon_tools import RECON_TOOL_CATALOG, validate_recon_call
+from runtime_agent.validated_tool_registry import (
+    VALIDATED_ACTION_REGISTRY,
+    registered_resource_refs,
+)
 
 
 SUPPORTED_OPENROUTER_MODELS = {
@@ -18,135 +23,73 @@ SUPPORTED_OPENROUTER_MODELS = {
 }
 
 
-# OpenRouter function 이름은 호환성을 위해 점 대신 underscore를 사용한다.
-# Executor로 전달하기 전 반드시 문서의 canonical Tool ID로 변환한다.
-FUNCTION_TO_TOOL = {
-    "file_open": "file.open",
-    "file_content": "file.content",
-    "privilege_identity_probe": "privilege.identity_probe",
-    "privilege_no_new_privs_probe": "privilege.no_new_privs_probe",
-    "process_procfs": "process.procfs",
-    "sudo_run": "sudo.run",
-}
+ATTACK_FUNCTION_NAME = "validated_attack"
+RECON_FUNCTION_NAME = "validated_recon"
 
-TOOL_SCHEMAS = [
-    {
+
+def _attack_schema() -> dict[str, Any]:
+    registrations = tuple(VALIDATED_ACTION_REGISTRY.values())
+    return {
         "type": "function",
         "function": {
-            "name": "file_open",
-            "description": "등록된 target-canary를 읽기 전용으로 열어 실제 접근 가능 여부를 독립 검증한다.",
+            "name": ATTACK_FUNCTION_NAME,
+            "description": (
+                "Invoke one live-validated OS action. The backend validates the exact "
+                "tool/action/resource combination and rejects raw commands or paths."
+            ),
+            "x-validated-actions": sorted(VALIDATED_ACTION_REGISTRY),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["read"]},
-                    "resource_ref": {"type": "string", "enum": ["target-canary"]},
-                    "arguments": {"type": "object", "maxProperties": 0},
-                },
-                "required": ["action", "resource_ref", "arguments"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "sudo_run",
-            "description": "현재 sudoers로 등록 Canary에 대한 일회성 상위 권한 실행 가능성을 확인한다.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["list", "run_probe"]},
-                    "resource_ref": {"type": "string", "enum": ["executor-self", "target-canary"]},
-                    "arguments": {
-                        "type": "object",
-                        "properties": {"content": {"type": "string", "maxLength": 128}},
-                        "additionalProperties": False,
+                    "tool_id": {
+                        "type": "string",
+                        "enum": sorted({item.tool_id for item in registrations}),
                     },
-                },
-                "required": ["action", "resource_ref", "arguments"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "file_content",
-            "description": "등록된 target-canary의 내용을 현재 OS 권한으로 읽거나 변경한다.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["read", "write", "append", "truncate"]},
-                    "resource_ref": {"type": "string", "enum": ["target-canary"]},
-                    "arguments": {
-                        "type": "object",
-                        "properties": {"content": {"type": "string", "maxLength": 128}},
-                        "additionalProperties": False,
-                    },
-                },
-                "required": ["action", "resource_ref", "arguments"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "privilege_identity_probe",
-            "description": "격리된 자식 문맥에서 UID/GID 변경 가능성을 확인하고 부모의 초기 신분을 유지한다.",
-            "parameters": {
-                "type": "object",
-                "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["setuid", "seteuid", "setfsuid", "setgid", "setegid", "setfsgid", "setgroups"],
+                        "enum": sorted({item.action for item in registrations}),
                     },
-                    "resource_ref": {"type": "string", "enum": ["identity-root"]},
-                    "arguments": {"type": "object", "maxProperties": 0},
-                },
-                "required": ["action", "resource_ref", "arguments"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "privilege_no_new_privs_probe",
-            "description": "격리된 자식 문맥에서 no_new_privs 적용을 확인한다.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["enable"]},
-                    "resource_ref": {"type": "string", "enum": ["executor-self"]},
-                    "arguments": {"type": "object", "maxProperties": 0},
-                },
-                "required": ["action", "resource_ref", "arguments"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "process_procfs",
-            "description": "Executor 자기 프로세스의 등록된 procfs 항목만 관찰한다.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
+                    "resource_ref": {
                         "type": "string",
-                        "enum": ["read_environ", "read_cmdline", "read_maps", "read_mem", "list_fd", "read_root", "read_cwd"],
+                        "enum": sorted(registered_resource_refs()),
                     },
-                    "resource_ref": {"type": "string", "enum": ["executor-self"]},
-                    "arguments": {"type": "object", "maxProperties": 0},
+                    "arguments": {"type": "object"},
                 },
-                "required": ["action", "resource_ref", "arguments"],
+                "required": ["tool_id", "action", "resource_ref", "arguments"],
                 "additionalProperties": False,
             },
         },
-    },
-]
+    }
+
+
+def _recon_schema() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": RECON_FUNCTION_NAME,
+            "description": "Invoke one registered read-only Recon Tool.",
+            "x-recon-tools": sorted(item.name for item in RECON_TOOL_CATALOG),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_id": {
+                        "type": "string",
+                        "enum": sorted(item.name for item in RECON_TOOL_CATALOG),
+                    },
+                    "action": {"type": "string", "enum": ["observe"]},
+                    "resource_ref": {
+                        "type": "string",
+                        "enum": sorted({
+                            ref for item in RECON_TOOL_CATALOG for ref in item.resource_refs
+                        }),
+                    },
+                    "arguments": {"type": "object"},
+                },
+                "required": ["tool_id", "action", "resource_ref", "arguments"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
 FINISH_CHAIN_SCHEMA = {
     "type": "function",
@@ -176,36 +119,27 @@ TEAM_CONTRACT_BOUNDARIES = frozenset({"TB-HH-U1U2", "TB-CC-C1C2"})
 
 
 def tool_schemas_for_boundary(boundary: TrustBoundaryOption) -> list[dict[str, Any]]:
-    """현재 TB에서 Runtime까지 연결된 Tool만 모델에게 제시한다."""
+    """Return the two generic Agent surfaces; registries do final validation."""
+    del boundary
+    if not VALIDATED_ACTION_REGISTRY:
+        return []
+    return [deepcopy(_attack_schema()), deepcopy(_recon_schema())]
 
-    schemas: list[dict[str, Any]] = []
-    for schema in deepcopy(TOOL_SCHEMAS):
-        function = schema.get("function", {})
-        tool_id = FUNCTION_TO_TOOL.get(function.get("name"))
-        definition = IMPLEMENTED_ATTACK_TOOLS.get(tool_id or "")
-        if definition is None:
-            continue
-        action_property = function["parameters"]["properties"]["action"]
-        action_property["enum"] = [
-            action for action in action_property["enum"]
-            if action in definition.implemented_actions
-        ]
-        if action_property["enum"]:
-            schemas.append(schema)
-    if boundary.id in TEAM_CONTRACT_BOUNDARIES:
-        return schemas
-    filtered: list[dict[str, Any]] = []
-    for schema in schemas:
-        function = schema.get("function", {})
-        if function.get("name") == "file_open":
-            continue
-        if function.get("name") == "process_procfs":
-            actions = function["parameters"]["properties"]["action"]["enum"]
-            function["parameters"]["properties"]["action"]["enum"] = [
-                action for action in actions if action != "read_mem"
-            ]
-        filtered.append(schema)
-    return filtered
+
+def attack_tool_schemas_for_boundary(boundary: TrustBoundaryOption) -> list[dict[str, Any]]:
+    """Attack planner view of the shared generic schema surface."""
+    return [
+        schema for schema in tool_schemas_for_boundary(boundary)
+        if schema["function"]["name"] == ATTACK_FUNCTION_NAME
+    ]
+
+
+def recon_tool_schemas_for_boundary(boundary: TrustBoundaryOption) -> list[dict[str, Any]]:
+    """Recon planner view of the shared generic schema surface."""
+    return [
+        schema for schema in tool_schemas_for_boundary(boundary)
+        if schema["function"]["name"] == RECON_FUNCTION_NAME
+    ]
 
 
 class ModelGateway:
@@ -258,7 +192,7 @@ class ModelGateway:
                         ),
                     },
                 ],
-                "tools": tool_schemas_for_boundary(boundary),
+                "tools": attack_tool_schemas_for_boundary(boundary),
                 "tool_choice": "required",
                 "temperature": 0,
             },
@@ -318,7 +252,7 @@ class ModelGateway:
                         ),
                     },
                 ],
-                "tools": [*tool_schemas_for_boundary(boundary), FINISH_CHAIN_SCHEMA],
+                "tools": [*attack_tool_schemas_for_boundary(boundary), FINISH_CHAIN_SCHEMA],
                 "tool_choice": "required",
                 "temperature": 0,
             },
@@ -451,17 +385,19 @@ class ModelGateway:
     def _local_decision(cls, prompt: str) -> ToolDecision:
         lowered = prompt.lower()
         if "sudo" in lowered:
-            return cls._decision(
-                "sudo.run", "run_probe", "target-canary", {"content": "test"}
-            )
+            return cls._decision("sudo.run", "run_probe", "target-canary", {})
         if "no_new_privs" in lowered or "새 권한" in prompt:
             return cls._decision(
                 "privilege.no_new_privs_probe", "enable", "executor-self", {}
             )
         if any(word in lowered for word in ("setuid", "seteuid", "setgid", "root")) or "권한 상승" in prompt:
             action = "setgid" if "gid" in lowered and "uid" not in lowered else "seteuid"
+            reference_key = "gid_ref" if action == "setgid" else "euid_ref"
             return cls._decision(
-                "privilege.identity_probe", action, "identity-root", {}
+                "privilege.identity_probe",
+                action,
+                "executor-self",
+                {reference_key: "identity-root"},
             )
         if any(word in lowered for word in ("procfs", "/proc", "cmdline", "process")) or "프로세스" in prompt:
             return cls._decision(
@@ -558,32 +494,35 @@ class ModelGateway:
 
     @classmethod
     def _validate_decision(cls, function_name: Any, payload: Any) -> ToolDecision:
-        if not isinstance(function_name, str) or function_name not in FUNCTION_TO_TOOL:
-            raise RuntimeError("OpenRouter가 등록되지 않은 Tool을 요청했습니다.")
+        if function_name not in {ATTACK_FUNCTION_NAME, RECON_FUNCTION_NAME}:
+            raise RuntimeError("OpenRouter가 등록되지 않은 generic Tool을 요청했습니다.")
         if not isinstance(payload, dict):
             raise RuntimeError("OpenRouter Tool 인자는 JSON 객체여야 합니다.")
+        tool_id = payload.get("tool_id")
         action = payload.get("action")
         resource_ref = payload.get("resource_ref")
         arguments = payload.get("arguments")
-        if not all(isinstance(value, str) and value for value in (action, resource_ref)):
-            raise RuntimeError("Tool Call에 action과 resource_ref가 필요합니다.")
+        if not all(
+            isinstance(value, str) and value
+            for value in (tool_id, action, resource_ref)
+        ):
+            raise RuntimeError("Tool Call에 tool_id, action, resource_ref가 필요합니다.")
         if not isinstance(arguments, dict):
             raise RuntimeError("Tool Call arguments는 JSON 객체여야 합니다.")
         if any(key in arguments for key in ("command", "shell", "path", "absolute_path")):
             raise RuntimeError("Raw command나 임의 경로는 Agent Attack Tool에 전달할 수 없습니다.")
-        tool_id = FUNCTION_TO_TOOL[function_name]
-        if tool_id == "file.content" and action in {"write", "append"}:
-            arguments = {"content": arguments.get("content")}
-        elif tool_id == "sudo.run" and action == "run_probe":
-            arguments = {"content": arguments.get("content")}
-        else:
-            # Model providers occasionally emit schema-irrelevant properties.
-            # No-argument actions are canonicalized to the only executable form.
-            arguments = {}
         try:
-            return cls._decision(
-                tool_id, action, resource_ref, arguments
-            )
+            if function_name == RECON_FUNCTION_NAME:
+                validated = validate_recon_call(
+                    tool_id, action, resource_ref, arguments
+                )
+                return ToolDecision(
+                    name=tool_id,
+                    action=action,
+                    resource_ref=resource_ref,
+                    arguments=validated,
+                )
+            return cls._decision(tool_id, action, resource_ref, arguments)
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
 

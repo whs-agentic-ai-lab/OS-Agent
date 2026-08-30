@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import json
-import subprocess
-
 import pytest
 
 from app.attack_tools import (
@@ -14,6 +11,7 @@ from app.attack_tools import (
 from app.catalog import TRUST_BOUNDARIES
 from app.config import Settings
 from app.model_gateway import ModelGateway, tool_schemas_for_boundary
+from app.model_gateway import ATTACK_FUNCTION_NAME, RECON_FUNCTION_NAME
 from runtime_agent import runtime
 from runtime_agent import validated_actions
 
@@ -52,21 +50,20 @@ def identity() -> dict:
     }
 
 
-def test_catalog_matches_129_family_design_and_marks_vertical_slice() -> None:
+def test_catalog_matches_129_383_design_and_connects_live_pass_registry() -> None:
     assert len(ATTACK_TOOL_CATALOG) == 129
     assert len(ATTACK_TOOL_BY_ID) == 129
-    assert set(IMPLEMENTED_ATTACK_TOOLS) == {
-        "file.open",
-        "file.content",
-        "privilege.identity_probe",
-        "privilege.no_new_privs_probe",
-        "process.procfs",
-        "sudo.run",
+    assert len(IMPLEMENTED_ATTACK_TOOLS) == 129
+    assert sum(
+        len(definition.implemented_actions)
+        for definition in IMPLEMENTED_ATTACK_TOOLS.values()
+    ) == 378
+    assert set(ATTACK_TOOL_BY_ID["file.content"].implemented_actions) == {
+        "read", "write", "append", "truncate", "copy",
     }
-    assert ATTACK_TOOL_BY_ID["file.content"].implemented_actions == (
-        "read", "write", "append", "truncate"
-    )
-    assert ATTACK_TOOL_BY_ID["file.open"].implemented_actions == ("read",)
+    assert set(ATTACK_TOOL_BY_ID["file.open"].implemented_actions) == {
+        "read", "write", "append", "execute", "opath",
+    }
     assert "read_mem" in ATTACK_TOOL_BY_ID["process.procfs"].implemented_actions
 
 
@@ -95,7 +92,7 @@ def test_validation_provenance_fails_closed_on_source_drift(monkeypatch) -> None
     assert validated_actions.validated_action_names() == frozenset()
 
 
-def test_tool_policy_rejects_raw_command_and_unimplemented_action() -> None:
+def test_tool_policy_rejects_raw_command_and_non_pass_action() -> None:
     with pytest.raises(ValueError, match="Raw command"):
         validate_attack_tool_call(
             "file.content",
@@ -103,9 +100,9 @@ def test_tool_policy_rejects_raw_command_and_unimplemented_action() -> None:
             "target-canary",
             {"content": "test", "command": "id"},
         )
-    with pytest.raises(ValueError, match="구현되지 않은"):
+    with pytest.raises(ValueError, match="validated Agent registry"):
         validate_attack_tool_call(
-            "file.content", "copy", "target-canary", {}
+            "memory.lock", "hugepage", "executor-self", {}
         )
 
 
@@ -120,16 +117,20 @@ def test_model_only_receives_team_contract_actions_for_matching_boundary() -> No
     allowed = tool_schemas_for_boundary(TRUST_BOUNDARIES[0])
     disallowed = tool_schemas_for_boundary(TRUST_BOUNDARIES[1])
 
-    assert "file_open" in {item["function"]["name"] for item in allowed}
-    assert "file_open" not in {item["function"]["name"] for item in disallowed}
-    allowed_procfs = next(
-        item for item in allowed if item["function"]["name"] == "process_procfs"
+    assert {item["function"]["name"] for item in allowed} == {
+        ATTACK_FUNCTION_NAME, RECON_FUNCTION_NAME,
+    }
+    assert {item["function"]["name"] for item in disallowed} == {
+        ATTACK_FUNCTION_NAME, RECON_FUNCTION_NAME,
+    }
+    attack = next(
+        item for item in allowed if item["function"]["name"] == ATTACK_FUNCTION_NAME
     )
-    disallowed_procfs = next(
-        item for item in disallowed if item["function"]["name"] == "process_procfs"
+    recon = next(
+        item for item in allowed if item["function"]["name"] == RECON_FUNCTION_NAME
     )
-    assert "read_mem" in allowed_procfs["function"]["parameters"]["properties"]["action"]["enum"]
-    assert "read_mem" not in disallowed_procfs["function"]["parameters"]["properties"]["action"]["enum"]
+    assert len(attack["function"]["x-validated-actions"]) == 378
+    assert len(recon["function"]["x-recon-tools"]) == 113
 
 
 def test_local_model_gateway_returns_canonical_structured_call() -> None:
@@ -166,10 +167,11 @@ def test_openrouter_gateway_uses_the_requested_dashboard_model(monkeypatch, tmp_
                         "message": {
                             "tool_calls": [
                                 {
-                                    "function": {
-                                        "name": "file_content",
-                                        "arguments": {
-                                            "action": "read",
+                                        "function": {
+                                            "name": ATTACK_FUNCTION_NAME,
+                                            "arguments": {
+                                                "tool_id": "file.content",
+                                                "action": "read",
                                             "resource_ref": "target-canary",
                                             "arguments": {},
                                         },
@@ -214,24 +216,25 @@ def test_openrouter_gateway_rejects_models_outside_the_dashboard_allowlist(tmp_p
         gateway.resolve_model(None)
 
 
-def test_model_decision_canonicalizes_non_executable_extra_arguments() -> None:
-    decision = ModelGateway._validate_decision(
-        "file_content",
-        {
-            "action": "read",
-            "resource_ref": "target-canary",
-            "arguments": {"content": "ignored", "reason": "model note"},
-        },
-    )
-
-    assert decision.arguments == {}
+def test_model_decision_rejects_schema_bypass_arguments() -> None:
+    with pytest.raises(RuntimeError, match="outside the ToolDefinition schema"):
+        ModelGateway._validate_decision(
+            ATTACK_FUNCTION_NAME,
+            {
+                "tool_id": "file.content",
+                "action": "read",
+                "resource_ref": "target-canary",
+                "arguments": {"content": "ignored", "reason": "model note"},
+            },
+        )
 
 
 def test_model_decision_never_canonicalizes_raw_command_fields() -> None:
     with pytest.raises(RuntimeError, match="Raw command"):
         ModelGateway._validate_decision(
-            "process_procfs",
+            ATTACK_FUNCTION_NAME,
             {
+                "tool_id": "process.procfs",
                 "action": "read_cmdline",
                 "resource_ref": "executor-self",
                 "arguments": {"command": "id"},
@@ -279,36 +282,14 @@ def test_runtime_policy_block_does_not_attempt_unknown_tool(monkeypatch) -> None
     assert result["policy_decision"] == "denied"
 
 
-def test_identity_probe_uses_child_context_and_verifies_parent_identity(monkeypatch) -> None:
-    monkeypatch.setattr(runtime, "_identity", identity)
-    reached = {**identity(), "euid": 0}
-    monkeypatch.setattr(
-        runtime.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args[0],
-            0,
-            stdout=json.dumps({
-                "success": True,
-                "errno": None,
-                "output": "probe success",
-                "identity_reached": reached,
-            }),
-            stderr="",
-        ),
-    )
-
-    result = runtime.run(
-        payload({
-            "name": "privilege.identity_probe",
-            "action": "seteuid",
-            "resource_ref": "identity-root",
-            "arguments": {},
-        })
-    )
-
-    assert result["outcome"] == "ALLOWED"
-    assert result["identity_reached"]["euid"] == 0
-    assert result["identity_before"] == result["identity_after"]
-    assert result["rollback_status"] == "VERIFIED"
-    assert "session_handle" not in result
+def test_identity_probe_requires_registered_structured_identity_reference() -> None:
+    with pytest.raises(ValueError, match="Required structured"):
+        validate_attack_tool_call(
+            "privilege.identity_probe", "seteuid", "executor-self", {}
+        )
+    assert validate_attack_tool_call(
+        "privilege.identity_probe",
+        "seteuid",
+        "executor-self",
+        {"euid_ref": "identity-root"},
+    ) == {"euid_ref": "identity-root"}

@@ -7,6 +7,11 @@ from collections import Counter
 from uuid import uuid4
 
 from .attack_tools import IMPLEMENTED_ATTACK_TOOLS
+from runtime_agent.validated_tool_registry import (
+    VALIDATED_ACTION_REGISTRY,
+    candidate_arguments,
+    registered_resource_refs,
+)
 from .catalog import TRUST_BOUNDARIES, build_profile_id
 from .agent_policy import AgentPolicyGate, CommandCompiler
 from .model_gateway import ModelGateway
@@ -326,8 +331,8 @@ class AgentOrchestrator:
                     run,
                     boundary,
                     ToolDecision(
-                        name="process.procfs",
-                        action="read_cmdline",
+                        name="os_identity_snapshot",
+                        action="observe",
                         resource_ref="executor-self",
                         arguments={},
                     ),
@@ -403,7 +408,7 @@ class AgentOrchestrator:
                 }
                 for boundary in TRUST_BOUNDARIES
             ],
-            "registered_resources": ["target-canary", "executor-self", "identity-root"],
+            "registered_resources": sorted(registered_resource_refs()),
             "implemented_tools": sorted(IMPLEMENTED_ATTACK_TOOLS),
         }
         self._event(run, "recon", "INFRASTRUCTURE_COLLECTED", "EC2 내부 8개 Action Path를 정규화했습니다.")
@@ -1033,40 +1038,19 @@ class AgentOrchestrator:
 
     @staticmethod
     def _candidate_decisions(boundary: TrustBoundaryOption) -> list[ToolDecision]:
-        marker = f"os-agent-{boundary.id}"
-        candidates = [
-            ToolDecision(name="process.procfs", action="read_cmdline", resource_ref="executor-self", arguments={}),
-            ToolDecision(name="process.procfs", action="read_environ", resource_ref="executor-self", arguments={}),
-            ToolDecision(name="process.procfs", action="read_maps", resource_ref="executor-self", arguments={}),
-            ToolDecision(name="process.procfs", action="list_fd", resource_ref="executor-self", arguments={}),
-            ToolDecision(name="process.procfs", action="read_root", resource_ref="executor-self", arguments={}),
-            ToolDecision(name="process.procfs", action="read_cwd", resource_ref="executor-self", arguments={}),
-            ToolDecision(name="file.content", action="read", resource_ref="target-canary", arguments={}),
-            ToolDecision(name="file.content", action="write", resource_ref="target-canary", arguments={"content": marker}),
-            ToolDecision(name="file.content", action="append", resource_ref="target-canary", arguments={"content": marker}),
-            ToolDecision(name="file.content", action="truncate", resource_ref="target-canary", arguments={}),
-            ToolDecision(name="sudo.run", action="list", resource_ref="executor-self", arguments={}),
-            ToolDecision(name="sudo.run", action="run_probe", resource_ref="target-canary", arguments={"content": marker}),
-            ToolDecision(name="privilege.identity_probe", action="seteuid", resource_ref="identity-root", arguments={}),
-            ToolDecision(name="privilege.identity_probe", action="setuid", resource_ref="identity-root", arguments={}),
-            ToolDecision(name="privilege.identity_probe", action="setfsuid", resource_ref="identity-root", arguments={}),
-            ToolDecision(name="privilege.identity_probe", action="setegid", resource_ref="identity-root", arguments={}),
-            ToolDecision(name="privilege.identity_probe", action="setgid", resource_ref="identity-root", arguments={}),
-            ToolDecision(name="privilege.identity_probe", action="setfsgid", resource_ref="identity-root", arguments={}),
-            ToolDecision(name="privilege.identity_probe", action="setgroups", resource_ref="identity-root", arguments={}),
-            ToolDecision(name="privilege.no_new_privs_probe", action="enable", resource_ref="executor-self", arguments={}),
-        ]
-        # Team ToolDefinition의 첫 수직 연결은 상태를 남기지 않는 observation
-        # action만 선택적으로 연다. 이 두 TB는 path/procfs fixture 계약이 맞는
-        # 실행 환경이며, 다른 경계에서는 후보 자체를 만들지 않는다.
-        if boundary.id in {"TB-HH-U1U2", "TB-CC-C1C2"}:
-            candidates.insert(
-                3,
-                ToolDecision(name="process.procfs", action="read_mem", resource_ref="executor-self", arguments={}),
-            )
-            candidates.insert(
-                8,
-                ToolDecision(name="file.open", action="read", resource_ref="target-canary", arguments={}),
+        candidates: list[ToolDecision] = []
+        for registration in VALIDATED_ACTION_REGISTRY.values():
+            if boundary.source_mode.value not in registration.allowed_executors:
+                continue
+            if registration.allowed_tbs and boundary.id not in registration.allowed_tbs:
+                continue
+            candidates.append(
+                ToolDecision(
+                    name=registration.tool_id,
+                    action=registration.action,
+                    resource_ref=sorted(registration.resource_refs)[0],
+                    arguments=candidate_arguments(registration),
+                )
             )
         return candidates
 

@@ -4,6 +4,11 @@
 - Generated: `2026-08-29T14:37:26.551833+00:00`
 - Coverage: **129 Tools / 383 Actions**
 - Certification: **DEFINED** (code presence only)
+- Legacy validation hash: `sha256:42c76ab03421f7ff79b9e992bbc2b59e9ea2f290882b0c0b87c77d6b5eb14246`
+- Canonical source hash: `sha256:70b4e9e62ce442f539e04675c02fc2c6bf5c9401eab478b4e510fa7ffd8f170f`
+- Manifest inventory hash: `sha256:e9ca963cb31a3b0bbaf67d3fa56716428058f8ccc9ba1e3dc7fc1496b51ee22d`
+- Provenance: validation commit `07358c1f45579e6acb79961061d9c9fb67f33a99`; Recon commit `9a00cfc10b4faf0c637c54b8f9ac36d18fcae0b9`; migration main `fab08a414f372674238693665b5ae5b68b4fc260`; Tool/Recon source diff **none**
+- Migration note: canonical hashing normalizes CRLF/LF and Git-style paths; no live validation was rerun.
 
 | Tool ID | Family | Actions | Status |
 | --- | --- | ---: | --- |

@@ -436,8 +436,8 @@ def test_runtime_packaging_includes_recon_module() -> None:
     assert "runtime_agent/recon_tools.py /app/recon_tools.py" in dockerfile
     for package in ("acl", "e2fsprogs", "libcap2-bin"):
         assert package in dockerfile
-    assert "runtime_agent/recon_tools.py" in user_data
-    assert "/opt/os-agent/bin/recon_tools.py" in user_data
+    assert "docker cp os-agent-runtime-source:/app/runtime_agent" in user_data
+    assert "/opt/os-agent/runtime_agent" in user_data
     for fixture in (
         "/etc/cron.d/os-agent-recon",
         "/etc/sudoers.d/os-agent-recon",
