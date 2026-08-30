@@ -1,11 +1,6 @@
 # OS-Agent 0826 Terraform 전면 변경사항
 
 작성 기준: 2026-08-27
-
-> 비교 대상
->
-> - 기존판: `C:\Users\oeseo\Desktop\OS-Agent\infra\terraform`
-> - 0826 수정안: `C:\Users\oeseo\Documents\ChatGPT\OS Local\terraform-staging\infra\terraform`
 >
 > **중요:** 쓰기 권한이 승인되지 않아 Desktop의 실제 저장소는 아직 기존판 그대로다. 이 문서는 검증이 끝난 staging 수정안을 기준으로 한 변경 설계서다. Git commit/push와 AWS plan/apply도 실행하지 않았다.
 
