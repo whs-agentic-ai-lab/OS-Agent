@@ -60,6 +60,26 @@ def test_syscall_argument_registers_are_not_execve_strings():
     assert redact_text("ordinary a2=42 a2_len=8192") == "ordinary a2=42 a2_len=8192"
 
 
+@pytest.mark.parametrize("prefix", ["", "Aug 31 10:00:00 fixture audit: "])
+def test_mixed_audit_records_mask_execve_only_and_are_idempotent(prefix):
+    execve = prefix + 'type=EXECVE msg=audit(1788051601.123:42): a0="curl" a2_len=42 a2[0]="private fragment"'
+    syscall = prefix + "type=SYSCALL msg=audit(1788051601.123:42): syscall=59 a0=7ffd1234 a1=0 a2=3 uid=1000"
+    sanitized = redact_text(execve + "\n" + syscall)
+    assert sanitized == (
+        prefix + "type=EXECVE msg=audit(1788051601.123:42): a0=[REDACTED] a2_len=42 a2[0]=[REDACTED]\n"
+        + syscall
+    )
+    assert redact_text(sanitized) == sanitized
+
+
+def test_structured_audit_context_covers_nested_fields_but_not_nested_syscalls():
+    source = {"type": "EXECVE", "fields": {"a2[1]": "secret fragment", "a2_len": 42},
+              "related": {"type": "SYSCALL", "a0": "7ffd1234", "a1": 0}}
+    assert redact(source) == {
+        **source, "fields": {"a2[1]": REDACTED, "a2_len": 42},
+    }
+
+
 def test_nul_obfuscated_sensitive_keys_are_masked_before_any_encoding():
     source = {"pass\x00word": "nul-key-credential", "nested": [{"to\x00ken": "nested-credential"}],
               "benign\x00name": 42, "benign\\u0000name": 43}

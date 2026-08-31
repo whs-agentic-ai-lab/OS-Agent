@@ -52,11 +52,18 @@ if structured_file_event {
   }
 }
 
-# audit EXECVE/PROCTITLE argv는 hex 또는 별도 aN 값에 비밀값을 담을 수 있다.
-# 레코드/주체/대상/결과는 남기고 인자 본문만 보수적으로 생략한다.
-if channel == "auditd" && match(raw_message, r'\b(?:proctitle|a[0-9]+)=') {
-  payload.message = replace(raw_message, r'\b(?:proctitle|a[0-9]+)=(?:"(?:\\.|[^"\\])*"|[^\s]+)', "[REDACTED_AUDIT_ARGUMENT]")
-  payload.audit_arguments_omitted = true
+# EXECVE aN/indexed aN[index]는 문자열/hex argv다. SYSCALL의 숫자 aN,
+# argc 및 aN_len은 검증에 필요한 메타데이터이므로 그대로 남긴다.
+if channel == "auditd" {
+  audit_message = raw_message
+  if match(raw_message, r'\btype=EXECVE\b') {
+    audit_message = replace(audit_message, r'\ba[0-9]+(?:\[[0-9]+\])?=(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?\z)|\x27(?:\\[\s\S]|[^\x27\\])*(?:\x27|\\?\z)|[^\s"\x27]+)', "[REDACTED_AUDIT_ARGUMENT]")
+  }
+  audit_message = replace(audit_message, r'\bproctitle=(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?\z)|\x27(?:\\[\s\S]|[^\x27\\])*(?:\x27|\\?\z)|[^\s"\x27]+)', "[REDACTED_AUDIT_ARGUMENT]")
+  if audit_message != raw_message {
+    payload.message = audit_message
+    payload.audit_arguments_omitted = true
+  }
 }
 
 # 실제 backend의 구조화 stdout만 executor 증거로 승격한다.
@@ -244,10 +251,32 @@ if is_empty(event_id) {
 nul_escaped = false
 safe_events = map_values([.], recursive: true) -> |value| {
   if is_object(value) {
+    execve_object = value.type == "EXECVE" || value.record_type == "EXECVE" || value.audit_type == "EXECVE"
+    has_nul_key = false
     for_each(object(value)) -> |key, _item| {
-      if match(key, r'(?i)^(?:[a-z0-9_-]*(?:api[_-]?key|password|passwd|token|secret(?:[_-]?key)?)|authorization|proxy[_-]?authorization|cookie|set-cookie|pwd|aws_access_key_id|aws_secret_access_key|env|environment)$') {
+      # 이름을 복구하기 전에 검사한다. 실제 NUL/여러 번 escape된 NUL 모두
+      # pa<NUL>ssword 같은 민감 키를 숨기는 수단으로 사용할 수 없다.
+      checked_key = replace(key, r'(?i)\x00|\\+(?:u0000|x00)', "")
+      if match(checked_key, r'(?i)^(?:[a-z0-9_-]*(?:api[_-]?key|password|passwd|token|secret(?:[_-]?key)?)|authorization|proxy[_-]?authorization|cookie|set-cookie|pwd|aws_access_key_id|aws_secret_access_key|env|environment)$') ||
+        checked_key == "proctitle" ||
+        (execve_object && match(checked_key, r'^a[0-9]+(?:\[[0-9]+\])?$')) {
         value = set!(value, [key], "[REDACTED]")
       }
+      if match(key, r'\x00') {
+        has_nul_key = true
+        nul_escaped = true
+      }
+    }
+    if has_nul_key {
+      # 먼저 기존 backslash를 escape해야 bad<NUL>key와 bad\u0000key가
+      # 같은 JSONB 키로 덮어써지지 않는다. 일반 키의 이름/값은 보존한다.
+      repaired_object = {}
+      for_each(object(value)) -> |key, item| {
+        escaped_key = replace(key, "\\", "\\\\")
+        repaired_key = replace(escaped_key, r'\x00', "\\u0000")
+        repaired_object = set!(repaired_object, [repaired_key], item)
+      }
+      value = repaired_object
     }
   } else if is_array(value) {
     redact_next = false
