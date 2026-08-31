@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from app.evidence_security import REDACTED, redact, redact_artifact, redact_text, validate_json_value
+from app.evidence_security import REDACTED, redact, redact_artifact, redact_text, redact_with_count, validate_json_value
 
 
 @pytest.mark.parametrize("argument", [
@@ -101,3 +101,73 @@ def test_escaped_nul_sensitive_keys_cannot_bypass_repeated_redaction(key):
 def test_api_jsonb_boundary_still_rejects_actual_nul(value):
     with pytest.raises(ValueError, match="Unsupported JSON string"):
         validate_json_value(value, reject_nul=True)
+
+
+@pytest.mark.parametrize("prefix,credential", [
+    ("--authorization ", "Bearer SYNTHETIC_AUTH_SECRET"),
+    ("--authorization=", "Bearer SYNTHETIC_AUTH_SECRET"),
+    ("--authorization ", "Basic SYNTHETIC_AUTH_SECRET"),
+    ("--authorization=", "Basic SYNTHETIC_AUTH_SECRET"),
+    ("--proxy-authorization\t", "bEaReR SYNTHETIC_AUTH_SECRET"),
+    ("--proxy-authorization=", "Basic SYNTHETIC_AUTH_SECRET"),
+    ("--authorization ", '"Bearer SYNTHETIC_AUTH_SECRET"'),
+    ("--proxy-authorization=", "'Basic SYNTHETIC_AUTH_SECRET'"),
+])
+def test_cli_authorization_masks_the_entire_scheme_and_credential(prefix, credential):
+    suffix = " --retry 3 status=ok"
+    source = "curl " + prefix + credential + suffix
+    expected = "curl " + prefix + REDACTED + suffix
+
+    assert redact_text(source) == expected
+    assert redact(source) == expected
+    assert redact_with_count(source) == (expected, 1)
+    assert redact_artifact(source.encode(), "processes.txt").decode() == expected
+    assert redact_with_count(expected) == (expected, 0)
+
+
+@pytest.mark.parametrize("prefix,credential", [
+    ("Authorization: ", "Bearer SYNTHETIC_HEADER_SECRET"),
+    ("Proxy-Authorization: ", "Basic SYNTHETIC_HEADER_SECRET"),
+    ('"Authorization": ', '"Bearer SYNTHETIC_HEADER_SECRET"'),
+    ("authorization=", "'Basic SYNTHETIC_HEADER_SECRET'"),
+])
+def test_authorization_headers_keep_unrelated_suffix_and_count_once(prefix, credential):
+    suffix = " status=ok request_id=17"
+    source = prefix + credential + suffix
+    expected = prefix + REDACTED + suffix
+
+    assert redact_with_count(source) == (expected, 1)
+    assert redact_text(source) == expected
+    assert redact_with_count(expected) == (expected, 0)
+
+
+@pytest.mark.parametrize("scheme", ["Bearer", "Basic"])
+def test_nested_json_cli_authorization_has_no_leak_or_double_count(scheme):
+    command = f"curl --authorization {scheme} SYNTHETIC_NESTED_AUTH_SECRET --retry 3"
+    safe_command = "curl --authorization [REDACTED] --retry 3"
+    source = {"plain": command, "nested": [{"message": json.dumps({"command": command, "status": "ok"})}],
+              "checks": {"success": True}, "attempt": 2}
+    original = copy.deepcopy(source)
+
+    result, count = redact_with_count(source)
+
+    assert result["plain"] == safe_command
+    assert json.loads(result["nested"][0]["message"]) == {"command": safe_command, "status": "ok"}
+    assert result["checks"] == {"success": True}
+    assert result["attempt"] == 2
+    assert "SYNTHETIC_NESTED_AUTH_SECRET" not in json.dumps(result)
+    assert count == 2  # Two credential occurrences, not formatting or regex passes.
+    assert redact(source) == result
+    assert redact_with_count(result) == (result, 0)
+    assert json.loads(redact_artifact(json.dumps(source).encode(), "manifest.json")) == result
+    assert source == original
+
+
+@pytest.mark.parametrize("key,value", [("authorization", True), ("api_token", False), ("environment", True)])
+def test_common_sensitive_key_booleans_keep_the_existing_masking_contract(key, value):
+    source = {key: value, "success": True}
+    expected = {key: REDACTED, "success": True}
+
+    assert redact_with_count(source) == (expected, 1)
+    assert redact(source) == expected
+    assert redact_with_count(expected) == (expected, 0)

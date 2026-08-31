@@ -30,6 +30,12 @@ _HARNESS_SENSITIVE_KEY = re.compile(
     r"^[a-z0-9_-]{0,96}(?:credentials?|private[-_]?key|access[-_]?key)$",
     re.IGNORECASE,
 )
+# Preserve Harness's original substring coverage for credential-bearing fields.
+# Only actual booleans matched by this broader rule are treated as status flags.
+_HARNESS_SENSITIVE_KEY_FRAGMENT = re.compile(
+    r"(?:authorization|api[_-]?key|access[_-]?key|secret|password|token|credential|private[_-]?key)",
+    re.IGNORECASE,
+)
 _NUL_IN_KEY = re.compile(r"\x00|\\+(?:u0000|x00)", re.IGNORECASE)
 _AUTH = re.compile(r"\b(Bearer|Basic)\s+[^\s\"'<>;,]+", re.IGNORECASE)
 _ASSIGNMENT = re.compile(
@@ -41,7 +47,10 @@ _ASSIGNMENT = re.compile(
 )
 _CLI = re.compile(
     r"(?P<prefix>--" + _KEY + r"(?:=|\s+))"
-    + r"(?:\"(?:\\.|[^\"\\])*(?:\"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s]+)",
+    # Consume the auth scheme and credential together, before the single token
+    # fallback removes the scheme that the later _AUTH pass needs to recognize.
+    + r"(?:\"(?:\\.|[^\"\\])*(?:\"|$)|'(?:\\.|[^'\\])*(?:'|$)|"
+    + r"(?:Bearer|Basic)\s+[^\s\"'<>;,]+|[^\s]+)",
     re.IGNORECASE,
 )
 _CLI_FLAG = re.compile(r"^--" + _KEY + r"$", re.IGNORECASE)
@@ -178,7 +187,10 @@ def _redact_value(
                 _SENSITIVE_KEY.fullmatch(normalized_key)
                 or normalized_key == "proctitle"
                 or (audit_arguments and _AUDIT_ARGUMENT_KEY.fullmatch(normalized_key))
-                or (harness_compat and _HARNESS_SENSITIVE_KEY.fullmatch(normalized_key))
+                or (harness_compat and (
+                    _HARNESS_SENSITIVE_KEY.fullmatch(normalized_key)
+                    or (not isinstance(item, bool) and _HARNESS_SENSITIVE_KEY_FRAGMENT.search(normalized_key))
+                ))
             )
             if sensitive:
                 result[key] = REDACTED

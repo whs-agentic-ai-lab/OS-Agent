@@ -117,3 +117,119 @@ def test_harness_mixed_audit_and_json_records_count_only_sensitive_arguments():
     assert sanitized["output"].splitlines()[1] == syscall
     assert json.loads(sanitized["message"])["a0"] == "[REDACTED]"
     assert redact(sanitized) == (sanitized, 0)
+
+
+@pytest.mark.parametrize("prefix,credential", [
+    ("--authorization ", "Bearer SYNTHETIC_HARNESS_AUTH_SECRET"),
+    ("--authorization=", "Basic SYNTHETIC_HARNESS_AUTH_SECRET"),
+    ("--proxy-authorization=", "Bearer SYNTHETIC_HARNESS_AUTH_SECRET"),
+    ("--authorization ", '"Bearer SYNTHETIC_HARNESS_AUTH_SECRET"'),
+    ("--proxy-authorization ", "Basic SYNTHETIC_HARNESS_AUTH_SECRET"),
+])
+def test_harness_cli_authorization_consumes_both_scheme_and_secret(prefix, credential):
+    suffix = " --retry 3 status=ok"
+    command = "curl " + prefix + credential + suffix
+    safe_command = "curl " + prefix + "[REDACTED]" + suffix
+    source = {"command": command,
+              "message": json.dumps({"command": command, "exit_code": 0}),
+              "checks": {"success": True}}
+    original = deepcopy(source)
+
+    result, count = redact(source)
+
+    assert result["command"] == safe_command
+    assert json.loads(result["message"]) == {"command": safe_command, "exit_code": 0}
+    assert result["checks"] == {"success": True}
+    assert "SYNTHETIC_HARNESS_AUTH_SECRET" not in json.dumps(result)
+    assert count == 2
+    assert redact(result) == (result, 0)
+    assert source == original
+
+
+@pytest.mark.parametrize("key", [
+    "authorization_header", "api_key_value", "access_key_id", "secret_value",
+    "password_hash", "token_payload", "credential_blob", "private_key_pem",
+    "prefixCREDENTIALsuffix",
+])
+def test_harness_retains_legacy_sensitive_key_substring_coverage(key):
+    source = {"nested": [{key: "SYNTHETIC_SUFFIX_KEY_SECRET", "safe_label": "visible"}]}
+    original = deepcopy(source)
+    expected = {"nested": [{key: "[REDACTED]", "safe_label": "visible"}]}
+
+    assert redact(source) == (expected, 1)
+    assert redact(expected) == (expected, 0)
+    assert source == original
+
+
+@pytest.mark.parametrize("key,boolean", [
+    ("credential_changed", True), ("credentials_verified", False),
+    ("private_key_present", True), ("api_token_present", False),
+    ("authorization_applied", True), ("secret_matches", False),
+    ("handler_token_is_read_only", True), ("credentials_requeried", False),
+])
+def test_harness_preserves_boolean_checks_but_masks_strings_under_the_same_key(key, boolean):
+    source = {"checks": {key: boolean}, "diagnostic": {key: "SYNTHETIC_CHECK_NAME_SECRET"}}
+    original = deepcopy(source)
+    expected = {"checks": {key: boolean}, "diagnostic": {key: "[REDACTED]"}}
+
+    assert redact(source) == (expected, 1)
+    assert redact(expected) == (expected, 0)
+    assert source == original
+
+
+@pytest.mark.parametrize("value", [None, "false", 0, 1, 17, ["SYNTHETIC_LIST_CREDENTIAL"],
+                                   {"first": "SYNTHETIC_FIRST_CREDENTIAL", "second": "SYNTHETIC_SECOND_CREDENTIAL"}])
+def test_harness_suffix_credentials_mask_nonboolean_values_as_one_field(value):
+    source = {"credential_blob": value, "success": False}
+    original = deepcopy(source)
+    expected = {"credential_blob": "[REDACTED]", "success": False}
+
+    assert redact(source) == (expected, 1)
+    assert redact(expected) == (expected, 0)
+    assert source == original
+
+
+@pytest.mark.parametrize("key", ["cred\x00ential_blob", "private\\u0000_key_pem", "sec\\\\x00ret_value"])
+def test_harness_nul_suffix_keys_are_masked_in_nested_values_and_json_strings(key):
+    source = {"nested": [{key: "SYNTHETIC_NUL_SUFFIX_SECRET", "safe": 41}],
+              "message": json.dumps({key: "SYNTHETIC_JSON_SUFFIX_SECRET", "safe": 42})}
+    original = deepcopy(source)
+
+    result, count = redact(source)
+
+    assert result["nested"] == [{key: "[REDACTED]", "safe": 41}]
+    assert json.loads(result["message"]) == {key: "[REDACTED]", "safe": 42}
+    assert count == 2
+    assert redact(result) == (result, 0)
+    assert "SYNTHETIC_NUL_SUFFIX_SECRET" not in json.dumps(result)
+    assert "SYNTHETIC_JSON_SUFFIX_SECRET" not in json.dumps(result)
+    assert source == original
+
+
+def test_harness_json_suffix_credentials_and_semantic_flags_preserve_count_meaning():
+    source = {"nested": [{"private_key_pem": "SYNTHETIC_PRIVATE_PEM", "safe": "visible"}],
+              "message": json.dumps({"credential_blob": "SYNTHETIC_JSON_CREDENTIAL",
+                                     "checks": {"handler_token_is_read_only": True}, "attempt": 3}),
+              "already": {"secret_value": "[REDACTED]"}}
+    original = deepcopy(source)
+
+    result, count = redact(source)
+
+    assert result["nested"] == [{"private_key_pem": "[REDACTED]", "safe": "visible"}]
+    assert json.loads(result["message"]) == {"credential_blob": "[REDACTED]",
+                                             "checks": {"handler_token_is_read_only": True}, "attempt": 3}
+    assert result["already"] == {"secret_value": "[REDACTED]"}
+    assert count == 2  # Existing markers and JSON formatting are not new masking.
+    assert redact(result) == (result, 0)
+    assert source == original
+
+
+def test_harness_exact_sensitive_key_booleans_are_still_redacted():
+    keys = ["password", "token", "env", "credential", "private_key", "access_key", "authorization"]
+    source = {key: index % 2 == 0 for index, key in enumerate(keys)}
+    source["success"] = True
+    expected = {key: "[REDACTED]" for key in keys}
+    expected["success"] = True
+
+    assert redact(source) == (expected, len(keys))
+    assert redact(expected) == (expected, 0)
