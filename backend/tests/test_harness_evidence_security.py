@@ -92,3 +92,28 @@ def test_harness_json_formatting_does_not_count_as_secret_redaction():
     result, count = redact(source)
     assert json.loads(result["message"]) == json.loads(source["message"])
     assert count == 0
+
+
+def test_harness_preserves_semantic_booleans_and_counts_masked_values_once():
+    source = {"credential_changed": True, "credentials_verified": False,
+              "private_key_present": True, "api_token_present": False,
+              "checks": {"authorization_applied": True, "secret_matches": False},
+              "credential": "sensitive-credential"}
+    original = deepcopy(source)
+    expected = {**source, "credential": "[REDACTED]"}
+    assert redact(source) == (expected, 1)
+    assert source == original
+    assert redact(expected) == (expected, 0)
+
+
+def test_harness_mixed_audit_and_json_records_count_only_sensitive_arguments():
+    syscall = "type=SYSCALL syscall=59 a0=7ffd1234 a1=0 a2=3 uid=1000"
+    source = {
+        "output": 'type=EXECVE a0="curl" a2_len=42 a2[0]="secret fragment"\n' + syscall,
+        "message": json.dumps({"type": "EXECVE", "argc": 1, "a0": "secret"}),
+    }
+    sanitized, count = redact(source)
+    assert count == 3
+    assert sanitized["output"].splitlines()[1] == syscall
+    assert json.loads(sanitized["message"])["a0"] == "[REDACTED]"
+    assert redact(sanitized) == (sanitized, 0)

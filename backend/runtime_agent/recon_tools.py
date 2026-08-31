@@ -46,6 +46,7 @@ except ImportError:  # Windows control plane: handlers execute on Linux only.
 MAX_TEXT_BYTES = 4096
 MAX_DOCKER_BYTES = 65536
 MAX_RESULTS_DEFAULT = 32
+EVIDENCE_SCAN_WINDOW_BYTES = 1024 * 1024
 DENIED_ERRNOS = {errno_module.EACCES, errno_module.EPERM, errno_module.EROFS}
 EXECUTORS = frozenset({"host", "container"})
 RAW_ARGUMENT_NAMES = frozenset(
@@ -1662,6 +1663,7 @@ def _audit_data(tool_name: str, arguments: dict[str, Any], context: dict[str, An
             "match_count": evidence["match_count"],
             "correlated": evidence["match_count"] > 0,
             "raw_records_exposed": False,
+            "scan": evidence.get("scan", {}),
         }
     return {"available": result["available"], "returncode": result["returncode"], "record_count": len(result["stdout"].splitlines()[:maximum]), "records_sha256": _text_hash(result["stdout"]), "raw_records_exposed": False}
 
@@ -1700,23 +1702,84 @@ def _evidence_file_query(
         Path("/var/log/os-agent/docker-logs.ndjson"),
     )
     matches: list[str] = []
+    scan = {
+        "mode": "recent_window",
+        "window_bytes_per_file": EVIDENCE_SCAN_WINDOW_BYTES,
+        "files_scanned": 0,
+        "bytes_read": 0,
+        "history_truncated": False,
+        "partial_lines_skipped": 0,
+        "result_limit_reached": False,
+    }
     for path in paths:
         if not path.is_file():
             continue
-        for line in _bounded_lines(path, 1000):
+        try:
+            lines, window = _recent_evidence_lines(path, EVIDENCE_SCAN_WINDOW_BYTES)
+        except (FileNotFoundError, NotADirectoryError):
+            # Rotation can remove a file after the existence check. Continue
+            # with the other fixed sources as the previous optional read did.
+            continue
+        scan["files_scanned"] += 1
+        scan["bytes_read"] += window["bytes_read"]
+        scan["history_truncated"] |= window["history_truncated"]
+        scan["partial_lines_skipped"] += window["partial_lines_skipped"]
+        for line in lines:
             if _evidence_record_matches(line, run_id, action_id):
                 matches.append(_text_hash(line))
                 if len(matches) >= maximum:
                     break
         if len(matches) >= maximum:
             break
+    scan["result_limit_reached"] = len(matches) >= maximum
     return {
         "run_id": run_id,
         "action_id": action_id,
         "match_count": len(matches),
         "record_sha256": matches,
         "raw_records_exposed": False,
+        "scan": scan,
     }
+
+
+def _recent_evidence_lines(
+    path: Path,
+    window_bytes: int,
+) -> tuple[list[str], dict[str, Any]]:
+    """Read complete recent NDJSON lines, newest first, within a byte window.
+
+    One preceding byte distinguishes an exact line boundary from a partial
+    first line. The read is capped at window_bytes + 1 even if the log grows.
+    An unterminated last line may still be being written and is not evidence.
+    """
+    with path.open("rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        start = max(0, size - window_bytes)
+        read_start = max(0, start - 1)
+        stream.seek(read_start)
+        data = stream.read(size - read_start)
+    metadata = {
+        "bytes_read": len(data),
+        "history_truncated": start > 0,
+        "partial_lines_skipped": 0,
+    }
+    if start > 0 and data:
+        previous, data = data[:1], data[1:]
+        if previous != b"\n":
+            _, separator, data = data.partition(b"\n")
+            metadata["partial_lines_skipped"] += 1
+            if not separator:
+                return [], metadata
+    if data and not data.endswith(b"\n"):
+        final_newline = data.rfind(b"\n")
+        data = data[: final_newline + 1]
+        metadata["partial_lines_skipped"] += 1
+    lines = [
+        line.rstrip(b"\r").decode("utf-8", errors="replace")
+        for line in reversed(data.split(b"\n")[:-1])
+        if line
+    ]
+    return lines, metadata
 
 
 def _evidence_record_matches(
@@ -1732,9 +1795,15 @@ def _evidence_record_matches(
         if record.get("run_id") != run_id:
             return False
         return action_id is None or record.get("action_id") == action_id
-    if f"run_id={run_id}" not in line:
+    if re.search(
+        rf"(?<![A-Za-z0-9._-])run_id={re.escape(run_id)}(?![A-Za-z0-9._-])",
+        line,
+    ) is None:
         return False
-    return action_id is None or f"action_id={action_id}" in line
+    return action_id is None or re.search(
+        rf"(?<![A-Za-z0-9._-])action_id={re.escape(action_id)}(?![A-Za-z0-9._-])",
+        line,
+    ) is not None
 
 
 def _mountinfo(maximum: int) -> list[dict[str, Any]]:

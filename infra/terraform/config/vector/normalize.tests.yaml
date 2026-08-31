@@ -367,3 +367,146 @@ tests:
             source: |
               assert!(!contains(encode_json(.), "first-cookie"))
               assert!(!contains(encode_json(.), "second-cookie"))
+
+  - name: indexed_execve_arguments_preserve_length_and_subject_metadata
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {"collector_channel": "auditd", "message": "type=EXECVE msg=audit(1788051601.123:42): argc=3 a0=6375726c a1=\"--token\" a2_len=8192 a2[0]=66697273742d686578 a2[107]=unquoted-audit-secret uid=1000"}
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.payload.audit_arguments_omitted, true)
+              assert_eq!(.message, .payload.message)
+              assert!(contains(string!(.message), "argc=3"))
+              assert!(contains(string!(.message), "a2_len=8192"))
+              assert!(contains(string!(.message), "uid=1000"))
+              assert!(!contains(encode_json(.), "66697273742d686578"))
+              assert!(!contains(encode_json(.), "unquoted-audit-secret"))
+
+  - name: audit_escaped_double_and_single_quotes_do_not_leave_secret_suffixes
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {"collector_channel": "auditd", "message": "type=EXECVE msg=audit(1788051601.123:42): argc=2 a0=\"escaped \\\" double-quote-secret\" a1[107]='escaped \\' single-quote-secret' uid=1000"}
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.payload.audit_arguments_omitted, true)
+              assert!(contains(string!(.message), "argc=2"))
+              assert!(contains(string!(.message), "uid=1000"))
+              assert!(!contains(encode_json(.), "double-quote-secret"))
+              assert!(!contains(encode_json(.), "single-quote-secret"))
+
+  - name: audit_truncated_double_quote_and_dangling_escape_are_fully_masked
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {"collector_channel": "auditd", "message": "type=EXECVE msg=audit(1788051601.123:42): argc=3 a2_len=8192 a2[107]=\"truncated secret suffix" + "\\"}
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.message, "type=EXECVE msg=audit(1788051601.123:42): argc=3 a2_len=8192 [REDACTED_AUDIT_ARGUMENT]")
+              assert_eq!(.payload.message, .message)
+              assert_eq!(.status, "ok")
+
+  - name: audit_truncated_single_quote_with_escaped_newline_is_fully_masked
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {"collector_channel": "auditd", "message": "type=EXECVE msg=audit(1788051601.123:42): argc=3 a2_len=8192 a2[107]='multiline" + "\\" + "\n" + "secret suffix"}
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.message, "type=EXECVE msg=audit(1788051601.123:42): argc=3 a2_len=8192 [REDACTED_AUDIT_ARGUMENT]")
+              assert_eq!(.payload.audit_arguments_omitted, true)
+              assert_eq!(.payload.message, .message)
+
+  - name: syscall_numeric_argument_registers_are_not_argv
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          . = {"collector_channel": "auditd", "message": "type=SYSCALL msg=audit(1788051601.123:42): syscall=59 a0=7ffd1234 a1=0 a2=3 uid=1000"}
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.message, "type=SYSCALL msg=audit(1788051601.123:42): syscall=59 a0=7ffd1234 a1=0 a2=3 uid=1000")
+              assert_eq!(.payload.message, .message)
+              assert!(!exists(.payload.audit_arguments_omitted))
+              assert_eq!(.event_type, "audit.syscall")
+
+  - name: structured_execve_arguments_are_masked_without_changing_syscall_metadata
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          .collector_channel = "executor"
+          .message = encode_json({"payload": {
+            "execve": {"type": "EXECVE", "argc": 3, "a2_len": 8192, "uid": 1000, "a0": "curl", "a2[107]": "structured-audit-secret"},
+            "record_alias": {"record_type": "EXECVE", "a1[0]": "record-type-audit-secret", "a1_len": 64},
+            "syscall": {"type": "SYSCALL", "syscall": 59, "a0": "7ffd1234", "a1": 0, "a2": 3},
+            "ordinary": {"a2": 42, "a2_len": 8192},
+          }})
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.payload.payload.execve, {"type": "EXECVE", "argc": 3, "a2_len": 8192, "uid": 1000, "a0": "[REDACTED]", "a2[107]": "[REDACTED]"})
+              assert_eq!(.payload.payload.record_alias, {"record_type": "EXECVE", "a1[0]": "[REDACTED]", "a1_len": 64})
+              assert_eq!(.payload.payload.syscall, {"type": "SYSCALL", "syscall": 59, "a0": "7ffd1234", "a1": 0, "a2": 3})
+              assert_eq!(.payload.payload.ordinary, {"a2": 42, "a2_len": 8192})
+              assert!(!contains(encode_json(.), "structured-audit-secret"))
+
+  - name: nul_keys_are_masked_before_repair_and_benign_collisions_are_preserved
+    inputs:
+      - insert_at: normalize
+        type: vrl
+        source: |
+          nul = decode_base16!("00")
+          nested = {"bad\\u0000key": "literal-value", "unchanged": 42}
+          nested = set!(nested, ["bad" + nul + "key"], "nul-value")
+          secrets = {"pass\\u0000word": "escaped-key-secret", "to\\\\u0000ken": "double-escaped-key-secret", "pass\\x00word": "escaped-x00-key-secret"}
+          secrets = set!(secrets, ["pa" + nul + "ssword"], "nul-key-secret")
+          array_item = set!({}, ["nested" + nul + "key"], "array-value")
+          .collector_channel = "executor"
+          .message = encode_json({"payload": {"nested": nested, "secrets": secrets, "array": [array_item]}})
+    outputs:
+      - extract_from: normalize
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.payload.payload.nested, {"bad\\u0000key": "nul-value", "bad\\\\u0000key": "literal-value", "unchanged": 42})
+              assert_eq!(.payload.payload.array, [{"nested\\u0000key": "array-value"}])
+              assert_eq!(length!(.payload.payload.secrets), 4)
+              assert!(!contains(encode_json(.), "escaped-key-secret"))
+              assert!(!contains(encode_json(.), "double-escaped-key-secret"))
+              assert!(!contains(encode_json(.), "nul-key-secret"))
+              assert!(!contains(encode_json(.), "escaped-x00-key-secret"))
+              assert_eq!(.payload.nul_byte_escaped, true)
+              assert_eq!(.status, "collection_error")
+              # Decode the wire representation before checking: JSON escaping
+              # alone does not make an actual NUL acceptable to PostgreSQL.
+              decoded = parse_json!(encode_json(.))
+              invalid_nul = false
+              checked = map_keys(object!(decoded), recursive: true) -> |key| {
+                if match(key, r'\x00') { invalid_nul = true }
+                key
+              }
+              assert_eq!(checked, decoded)
+              assert!(!invalid_nul)

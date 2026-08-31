@@ -26,11 +26,17 @@ _KEY = (
     r"aws[-_]?(?:access[-_]?key[-_]?id|secret[-_]?access[-_]?key|session[-_]?token))"
 )
 _SENSITIVE_KEY = re.compile(r"^(?:" + _KEY + r"|env|environment)$", re.IGNORECASE)
+_HARNESS_SENSITIVE_KEY = re.compile(
+    r"^[a-z0-9_-]{0,96}(?:credentials?|private[-_]?key|access[-_]?key)$",
+    re.IGNORECASE,
+)
+_NUL_IN_KEY = re.compile(r"\x00|\\+(?:u0000|x00)", re.IGNORECASE)
 _AUTH = re.compile(r"\b(Bearer|Basic)\s+[^\s\"'<>;,]+", re.IGNORECASE)
 _ASSIGNMENT = re.compile(
     r"(?P<prefix>(?<![a-z0-9_-])[\"']?" + _KEY
     + r"[\"']?\s*(?:=|:)\s*)"
-    + r"(?:\"(?:\\.|[^\"\\])*(?:\"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,;&]+)",
+    + r"(?:\"(?:\\.|[^\"\\])*(?:\"|$)|'(?:\\.|[^'\\])*(?:'|$)|"
+    + r"(?:Bearer|Basic)\s+[^\s\"'<>;,]+|[^\s,;&]+)",
     re.IGNORECASE,
 )
 _CLI = re.compile(
@@ -50,11 +56,24 @@ _PROVIDER_TOKEN = re.compile(
     r"github_pat_[A-Za-z0-9_]{12,}|AKIA[A-Z0-9]{16}|"
     r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b"
 )
+_HARNESS_PROVIDER_TOKEN = re.compile(r"\b(?:ASIA[A-Z0-9]{16}|pk-[A-Za-z0-9_-]{16,})\b")
 _URL_CREDENTIALS = re.compile(r"(https?://)[^\s/@:]+:[^\s/@]+@", re.IGNORECASE)
 _COOKIE_HEADER = re.compile(r"(?P<prefix>\b(?:set-cookie|cookie)\s*[:=]\s*)[^\r\n]+", re.IGNORECASE)
-_AUDIT_EXEC = re.compile(r"\btype=(?:EXECVE|PROCTITLE)\b")
-_AUDIT_ARGUMENT = re.compile(r"\b(?P<key>proctitle|a[0-9]+)=(?:\"[^\"]*\"|'[^']*'|[^\s]+)")
-_AUDIT_PROCTITLE = re.compile(r"\bproctitle=(?:\"[^\"]*\"|'[^']*'|[^\s]+)")
+# Restrict aN masking to the matching audit record. A capture can contain both
+# EXECVE strings and SYSCALL numeric registers, including on adjacent lines.
+_AUDIT_EXEC_RECORD = re.compile(
+    r"\btype=(?:EXECVE|PROCTITLE)\b[\s\S]*?"
+    r"(?=^[^\r\n]*\btype=[A-Z][A-Z0-9_]*\b|\Z)",
+    re.MULTILINE,
+)
+_AUDIT_ARGUMENT_KEY = re.compile(r"^(?:proctitle|a[0-9]+(?:\[[0-9]+\])?)$")
+# Audit fragments may contain escaped quotes/newlines, or end in an incomplete
+# quoted value. Consume the entire fragment, including a dangling backslash.
+_AUDIT_VALUE = r'''(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$)|[^\s]+)'''
+_AUDIT_ARGUMENT = re.compile(
+    r"\b(?P<key>proctitle|a[0-9]+(?:\[[0-9]+\])?)=" + _AUDIT_VALUE,
+)
+_AUDIT_PROCTITLE = re.compile(r"\bproctitle=" + _AUDIT_VALUE)
 _LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 
@@ -86,8 +105,7 @@ def validate_json_value(value: Any, *, reject_nul: bool = False) -> None:
             validate_json_value(item, reject_nul=reject_nul)
 
 
-def redact_text(text: str) -> str:
-    """Mask representative credentials in raw messages, errors and command lines."""
+def _redact_text(text: str, *, harness_compat: bool) -> tuple[str, int]:
     # A Docker message may itself contain JSON. Preserve that string's structure
     # while applying the same nested-key rules used for an ordinary payload.
     if text.lstrip().startswith(("{", "[")):
@@ -98,41 +116,118 @@ def redact_text(text: str) -> str:
             pass
         else:
             if isinstance(value, (dict, list)):
-                return json.dumps(redact(value), ensure_ascii=False, separators=(",", ":"))
-    text = _COOKIE_HEADER.sub(lambda match: match.group("prefix") + REDACTED, text)
-    text = _AUTH.sub(lambda match: match.group(1) + " " + REDACTED, text)
-    text = _URL_CREDENTIALS.sub(lambda match: match.group(1) + REDACTED + "@", text)
+                sanitized, count = _redact_value(value, harness_compat=harness_compat)
+                return json.dumps(sanitized, ensure_ascii=False, separators=(",", ":")), count
+
+    count = 0
+
+    def replace(pattern: re.Pattern[str], replacement: Any, source: str) -> str:
+        def substitute(match: re.Match[str]) -> str:
+            nonlocal count
+            sanitized = replacement(match)
+            if sanitized != match.group(0):
+                count += 1
+            return sanitized
+
+        return pattern.sub(substitute, source)
+
+    # Mask audit values before generic CLI patterns can interpret a quoted
+    # argument flag and accidentally consume a following audit field.
+    text = _AUDIT_EXEC_RECORD.sub(
+        lambda record: replace(
+            _AUDIT_ARGUMENT,
+            lambda match: match.group("key") + "=" + REDACTED,
+            record.group(0),
+        ),
+        text,
+    )
+    text = replace(_AUDIT_PROCTITLE, lambda _match: "proctitle=" + REDACTED, text)
+    text = replace(_COOKIE_HEADER, lambda match: match.group("prefix") + REDACTED, text)
+    text = replace(_URL_CREDENTIALS, lambda match: match.group(1) + REDACTED + "@", text)
     # Invalid/truncated JSON and Python repr messages can still contain a
     # literal argv pair. Do not require a successful JSON parse to redact it.
-    text = _CLI_QUOTED_ARGV.sub(lambda match: match.group("prefix") + '"' + REDACTED + '"', text)
-    text = _CLI.sub(lambda match: match.group("prefix") + REDACTED, text)
-    text = _ASSIGNMENT.sub(lambda match: match.group("prefix") + REDACTED, text)
-    # EXECVE arguments can be quoted, split across aN fields or hex encoded.
-    # Omit these argument values instead of pretending encoded text is safe;
-    # retain the audit record identity, operation, uid and other metadata.
-    if _AUDIT_EXEC.search(text):
-        text = _AUDIT_ARGUMENT.sub(lambda match: match.group("key") + "=" + REDACTED, text)
-    text = _AUDIT_PROCTITLE.sub("proctitle=" + REDACTED, text)
-    return _PROVIDER_TOKEN.sub(REDACTED, text)
+    text = replace(_CLI_QUOTED_ARGV, lambda match: match.group("prefix") + '"' + REDACTED + '"', text)
+    text = replace(_CLI, lambda match: match.group("prefix") + REDACTED, text)
+    text = replace(_ASSIGNMENT, lambda match: match.group("prefix") + REDACTED, text)
+    text = replace(
+        _AUTH,
+        lambda match: REDACTED if harness_compat and match.group(1).lower() == "bearer"
+        else match.group(1) + " " + REDACTED,
+        text,
+    )
+    text = replace(_PROVIDER_TOKEN, lambda _match: REDACTED, text)
+    if harness_compat:
+        text = replace(_HARNESS_PROVIDER_TOKEN, lambda _match: REDACTED, text)
+    return text, count
+
+
+def _redact_value(
+    value: Any, *, harness_compat: bool, audit_arguments: bool = False,
+) -> tuple[Any, int]:
+    if isinstance(value, dict):
+        record_type = value.get("type", value.get("record_type", value.get("audit_type")))
+        if isinstance(record_type, str):
+            audit_arguments = record_type.upper() in {"EXECVE", "PROCTITLE"}
+        result = {}
+        count = 0
+        for key, item in value.items():
+            # Normalize only for classification: stored keys, including benign
+            # NUL-containing keys, must not be renamed by the redaction pass.
+            normalized_key = _NUL_IN_KEY.sub("", str(key))
+            sensitive = (
+                _SENSITIVE_KEY.fullmatch(normalized_key)
+                or normalized_key == "proctitle"
+                or (audit_arguments and _AUDIT_ARGUMENT_KEY.fullmatch(normalized_key))
+                or (harness_compat and _HARNESS_SENSITIVE_KEY.fullmatch(normalized_key))
+            )
+            if sensitive:
+                result[key] = REDACTED
+                count += int(item != REDACTED)
+            else:
+                result[key], child_count = _redact_value(
+                    item, harness_compat=harness_compat, audit_arguments=audit_arguments,
+                )
+                count += child_count
+        return result, count
+    if isinstance(value, (list, tuple)):
+        result = []
+        count = 0
+        previous_secret_flag = False
+        for item in value:
+            if previous_secret_flag:
+                sanitized, child_count = REDACTED, int(item != REDACTED)
+            else:
+                sanitized, child_count = _redact_value(
+                    item, harness_compat=harness_compat, audit_arguments=audit_arguments,
+                )
+            result.append(sanitized)
+            count += child_count
+            previous_secret_flag = isinstance(item, str) and bool(
+                _CLI_FLAG.fullmatch(_NUL_IN_KEY.sub("", item))
+            )
+        return result, count
+    if isinstance(value, str):
+        return _redact_text(value, harness_compat=harness_compat)
+    return value, 0
+
+
+def redact_with_count(value: Any, *, harness_compat: bool = False) -> tuple[Any, int]:
+    """Mask independent values and count replacements, not JSON formatting.
+
+    Harness compatibility preserves its additional credential patterns and
+    whole-Bearer replacement while sharing the collector's recursive rules.
+    """
+    return _redact_value(value, harness_compat=harness_compat)
+
+
+def redact_text(text: str) -> str:
+    """Mask representative credentials in raw messages, errors and command lines."""
+    return _redact_text(text, harness_compat=False)[0]
 
 
 def redact(value: Any) -> Any:
     """Return an independent JSON-like value with nested credentials masked."""
-    if isinstance(value, dict):
-        return {
-            key: REDACTED if _SENSITIVE_KEY.fullmatch(str(key)) or key == "proctitle" else redact(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        result = []
-        previous_secret_flag = False
-        for item in value:
-            result.append(REDACTED if previous_secret_flag else redact(item))
-            previous_secret_flag = isinstance(item, str) and bool(_CLI_FLAG.fullmatch(item))
-        return result
-    if isinstance(value, str):
-        return redact_text(value)
-    return value
+    return redact_with_count(value)[0]
 
 
 def redact_artifact(data: bytes, filename: str) -> bytes:

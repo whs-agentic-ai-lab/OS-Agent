@@ -3,51 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 from pathlib import Path
 from typing import Any
 
+from ..evidence_security import redact_with_count
 from .models import HarnessRunRecord, canonical_hash
 
 
-SECRET_KEY_PATTERN = re.compile(
-    r"(?:authorization|api[_-]?key|access[_-]?key|secret|password|token|credential|private[_-]?key)",
-    re.IGNORECASE,
-)
-SECRET_VALUE_PATTERNS = (
-    re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{8,}"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\bASIA[0-9A-Z]{16}\b"),
-    re.compile(r"\b(?:sk|pk)-[A-Za-z0-9_-]{16,}\b"),
-)
-
-
 def redact(value: Any) -> tuple[Any, int]:
-    count = 0
-    if isinstance(value, dict):
-        result: dict[str, Any] = {}
-        for key, item in value.items():
-            if SECRET_KEY_PATTERN.search(str(key)):
-                result[str(key)] = "[REDACTED]"
-                count += 1
-            else:
-                result[str(key)], child_count = redact(item)
-                count += child_count
-        return result, count
-    if isinstance(value, list):
-        result = []
-        for item in value:
-            redacted, child_count = redact(item)
-            result.append(redacted)
-            count += child_count
-        return result, count
-    if isinstance(value, str):
-        redacted = value
-        for pattern in SECRET_VALUE_PATTERNS:
-            redacted, replacements = pattern.subn("[REDACTED]", redacted)
-            count += replacements
-        return redacted, count
-    return value, 0
+    return redact_with_count(value, harness_compat=True)
 
 
 def _sha256(path: Path) -> str:
