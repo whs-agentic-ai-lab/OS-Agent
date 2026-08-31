@@ -6,6 +6,8 @@ import httpx
 from .schemas import (
     ExperimentEnvironmentResetResult,
     RuntimeAgentResult,
+    RuntimeBacktrackRequest,
+    RuntimeBacktrackResult,
     RuntimeDispatchRequest,
     RuntimeResetRequest,
     RuntimeResetResult,
@@ -21,6 +23,8 @@ class EnvironmentRuntime(Protocol):
     def execute(self, request: RuntimeDispatchRequest) -> RuntimeAgentResult: ...
 
     def reset_harness(self, request: RuntimeResetRequest) -> RuntimeResetResult: ...
+
+    def backtrack(self, request: RuntimeBacktrackRequest) -> RuntimeBacktrackResult: ...
 
     def reset_environment(self) -> ExperimentEnvironmentResetResult: ...
 
@@ -93,6 +97,35 @@ class SupervisorRuntimeClient:
             suffix = f": {detail}" if detail else ""
             raise RuntimeError(f"환경 Runtime Reset 요청에 실패했습니다{suffix}") from exc
         return RuntimeResetResult.model_validate(payload)
+
+    def backtrack(self, request: RuntimeBacktrackRequest) -> RuntimeBacktrackResult:
+        if not self.socket_path.exists():
+            raise RuntimeError(
+                "환경 Runtime Supervisor 소켓이 없습니다. SSM으로 EC2 Runtime에 연결하세요."
+            )
+        transport = httpx.HTTPTransport(uds=str(self.socket_path))
+        try:
+            with httpx.Client(
+                transport=transport,
+                base_url="http://environment-runtime",
+                timeout=self.timeout,
+            ) as client:
+                response = client.post(
+                    "/v2/campaign/backtrack",
+                    json=request.model_dump(mode="json"),
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            detail = ""
+            if isinstance(exc, httpx.HTTPStatusError):
+                try:
+                    detail = str(exc.response.json().get("detail", ""))
+                except (ValueError, AttributeError):
+                    detail = exc.response.text
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(f"Campaign 부모 상태 복구 요청에 실패했습니다{suffix}") from exc
+        return RuntimeBacktrackResult.model_validate(payload)
 
     def reset_environment(self) -> ExperimentEnvironmentResetResult:
         if not self.socket_path.exists():

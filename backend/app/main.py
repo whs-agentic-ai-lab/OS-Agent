@@ -40,6 +40,7 @@ from .runtime_client import EnvironmentRuntime, SupervisorRuntimeClient
 from .schemas import (
     AgentFinding,
     AttackContract,
+    CampaignSearchState,
     AgentRunRecord,
     AgentRunRequest,
     ExperimentEnvironmentResetRequest,
@@ -54,7 +55,6 @@ from .schemas import (
     RunRecord,
     RunRequest,
     SubjectMode,
-    TbScenario,
 )
 from .tunnel import SsmTunnelManager, TunnelRequest, TunnelStatus, TunnelStopRequest
 
@@ -597,9 +597,13 @@ def create_app(
     def get_agent_run_findings(run_id: str) -> list[AgentFinding]:
         return get_agent_record(run_id).findings
 
-    @application.get("/api/agent-runs/{run_id}/plan", response_model=list[TbScenario])
-    def get_agent_run_plan(run_id: str) -> list[TbScenario]:
-        return get_agent_record(run_id).tb_scenarios
+    @application.get("/api/agent-runs/{run_id}/plan", response_model=CampaignSearchState)
+    def get_agent_run_plan(run_id: str) -> CampaignSearchState:
+        return get_agent_record(run_id).campaign_search
+
+    @application.get("/api/agent-runs/{run_id}/search-graph")
+    def get_agent_run_search_graph(run_id: str) -> dict:
+        return get_agent_record(run_id).campaign_search.model_dump(mode="json")
 
     @application.get("/api/agent-runs/{run_id}/attack-contract", response_model=AttackContract | None)
     def get_agent_run_attack_contract(run_id: str) -> AttackContract | None:

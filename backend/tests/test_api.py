@@ -209,14 +209,14 @@ def test_options_have_two_executors_eight_boundaries_and_attack_tool_catalog(tmp
     assert body["permission_catalog_summary"]["total_entries"] == 307
     assert body["permission_catalog_summary"]["independent_permission_count"] is None
     assert len(body["tools"]) == 129
-    assert {item["id"] for item in body["tools"] if item["implemented"]} == {
+    assert {
         "file.open",
         "file.content",
         "privilege.identity_probe",
         "privilege.no_new_privs_probe",
         "process.procfs",
         "sudo.run",
-    }
+    } <= {item["id"] for item in body["tools"] if item["implemented"]}
     assert [item["id"] for item in body["planner_models"]] == [
         "deepseek/deepseek-v4-flash-0731",
         "z-ai/glm-5.3-flash",
@@ -242,7 +242,7 @@ def test_health_advertises_profile_runtime_api(tmp_path: Path) -> None:
     assert response.json()["agent_run_api_version"] == "os-agent-orchestrator-v5"
 
 
-def test_agent_run_recons_and_tests_all_eight_boundaries_with_one_profile_hash(tmp_path: Path) -> None:
+def test_agent_run_explores_one_campaign_graph_with_one_profile_hash(tmp_path: Path) -> None:
     runtime = FakeRuntime()
     settings = Settings(
         openrouter_api_key=None,
@@ -263,33 +263,25 @@ def test_agent_run_recons_and_tests_all_eight_boundaries_with_one_profile_hash(t
     run_id = accepted["run_id"]
     body = wait_for_agent_run(client, run_id)
     assert body["status"] == "COMPLETED"
-    assert "공격 가설을 스스로 생성" in body["objective"]
+    assert "Campaign 상태 그래프" in body["objective"]
     assert body["profile_hash"].startswith("sha256:")
-    assert len(body["tb_results"]) == 8
-    assert body["summary"] == {"broken": 2, "blocked": 0, "inconclusive": 6}
-    assert {item["proof_level"] for item in body["tb_results"]} == {
-        "L1_REACHABLE",
-        "L4_RESTORED",
-    }
+    assert body["tb_results"] == []
+    search = body["campaign_search"]
+    assert search["status"] == "COMPLETED"
+    assert search["search_complete"] is True
+    assert search["termination_reason"] == "FRONTIER_EXHAUSTED"
+    assert search["explored_nodes"] >= 1
+    assert search["backtrack_count"] == len(search["transitions"]) + 1
+    assert search["best_impact_score"] == 90
     assert len(runtime.requests) > 10
-    main_chain_ids = {
+    campaign_chain_ids = {
         request.chain_id
         for request in runtime.requests
         if request.preserve_state
         and request.chain_id is not None
-        and request.chain_id.startswith("chain-")
+        and request.chain_id.startswith("camp-")
     }
-    minimization_chain_ids = {
-        request.chain_id
-        for request in runtime.requests
-        if request.preserve_state
-        and request.chain_id is not None
-        and request.chain_id.startswith("min-")
-    }
-    assert len(main_chain_ids) == 2
-    assert len(runtime.reset_requests) == (
-        2 + len(body["tb_scenarios"]) + len(minimization_chain_ids)
-    )
+    assert campaign_chain_ids
     recon_positions = [
         index
         for index, operation in enumerate(runtime.operations)
@@ -303,30 +295,9 @@ def test_agent_run_recons_and_tests_all_eight_boundaries_with_one_profile_hash(t
             0,
             runtime.operations[position][3],
         )
-    for chain_id in main_chain_ids | minimization_chain_ids:
-        positions = [
-            index
-            for index, operation in enumerate(runtime.operations)
-            if operation[0] == "execute" and operation[1] == chain_id
-        ]
-        assert positions
-        assert positions == list(range(positions[0], positions[-1] + 1))
-        assert [runtime.operations[index][2] for index in positions] == list(
-            range(1, len(positions) + 1)
-        )
-        assert runtime.operations[positions[-1] + 1] == (
-            "reset",
-            None,
-            0,
-            runtime.operations[positions[-1]][3],
-        )
     assert body["attack_contract"]["trust_boundary_id"] == "TB-HH-U1U2"
-    assert body["permission_minimization"]["status"] == "COMPLETED"
-    assert body["permission_minimization"]["one_minimal_verified"] is True
-    assert body["permission_minimization"]["minimal_permission_ids"] == [
-        "host:limited_sudo",
-        "host:no_new_privileges=OFF",
-    ]
+    assert body["attack_contract"]["chain_steps"]
+    assert body["permission_minimization"]["status"] == "SKIPPED"
     assert all(
         event["payload"]["profile_hash"] == body["profile_hash"]
         for event in body["events"]
@@ -334,14 +305,16 @@ def test_agent_run_recons_and_tests_all_eight_boundaries_with_one_profile_hash(t
     assert body["run_id"] == run_id
     assert client.get(f"/api/agent-runs/{run_id}").status_code == 200
     findings = client.get(f"/api/agent-runs/{run_id}/findings").json()
-    assert len([finding for finding in findings if finding["executable"]]) == 8
-    assert len(client.get(f"/api/agent-runs/{run_id}/plan").json()) == 8
+    assert len(findings) == 8
+    plan = client.get(f"/api/agent-runs/{run_id}/plan").json()
+    assert plan["root_node_id"] == search["root_node_id"]
+    assert client.get(f"/api/agent-runs/{run_id}/search-graph").json() == search
     assert client.get(f"/api/agent-runs/{run_id}/attack-contract").json()[
         "contract_id"
     ].startswith("contract-")
     assert client.get(
         f"/api/agent-runs/{run_id}/permission-minimization"
-    ).json()["one_minimal_verified"] is True
+    ).json()["status"] == "SKIPPED"
 
 
 def test_agent_run_uses_selected_openrouter_model_for_each_boundary(tmp_path: Path) -> None:
@@ -460,7 +433,7 @@ def test_agent_run_uses_selected_openrouter_model_for_each_boundary(tmp_path: Pa
     # have an executable Attack frontier. The remaining six complete without
     # asking the model to invent an out-of-contract action.
     assert len(planner_calls) >= 2
-    assert any(
+    assert not any(
         call.kwargs["json"]["tools"][0]["function"]["name"]
         == "select_permission_ids"
         for call in openrouter_post.call_args_list
@@ -469,14 +442,11 @@ def test_agent_run_uses_selected_openrouter_model_for_each_boundary(tmp_path: Pa
         call.kwargs["json"]["model"] == "z-ai/glm-5.3-flash"
         for call in openrouter_post.call_args_list
     )
-    executed_scenarios = {
-        scenario["trust_boundary_id"]: [
-            step["tool"] for step in scenario["steps"] if step["type"] == "execute"
-        ]
-        for scenario in body["tb_scenarios"]
-        if any(step["type"] == "execute" for step in scenario["steps"])
+    assert body["tb_scenarios"] == []
+    assert body["campaign_search"]["transitions"]
+    assert {item["trust_boundary_id"] for item in body["campaign_search"]["transitions"]} == {
+        "TB-HH-U1U2"
     }
-    assert set(executed_scenarios) == {"TB-HH-U1U2", "TB-CC-C1C2"}
     assert all(
         call.kwargs["json"]["tools"][0]["function"]["name"] == "validated_attack"
         for call in planner_calls

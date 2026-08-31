@@ -210,6 +210,7 @@ create table if not exists public.agent_runs (
   findings jsonb not null default '[]'::jsonb,
   tb_scenarios jsonb not null default '[]'::jsonb,
   tb_results jsonb not null default '[]'::jsonb,
+  campaign_search jsonb not null default '{}'::jsonb,
   worst_case_scenario jsonb,
   attack_contract jsonb,
   permission_minimization jsonb not null default '{}'::jsonb,
@@ -224,6 +225,7 @@ create table if not exists public.agent_runs (
   completed_at timestamptz
 );
 alter table public.agent_runs add column if not exists objective text;
+alter table public.agent_runs add column if not exists campaign_search jsonb not null default '{}'::jsonb;
 update public.agent_runs
 set objective = '고정 권한과 Recon 증거를 기반으로 8개 Trust Boundary를 자율 검증한다.'
 where objective is null;

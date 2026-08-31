@@ -1,13 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 
-import type {
-  AgentPlanStep,
-  AgentRunRecord,
-  AgentSearchState,
-  TbScenario,
-  TrustBoundaryOption,
-} from "../types";
+import type { AgentRunRecord, TrustBoundaryOption } from "../types";
 import { AgentRunResult } from "./AgentRunResult";
+import { CampaignSearchTree } from "./CampaignSearchTree";
 
 interface AgentRunMonitorPageProps {
   run: AgentRunRecord | null;
@@ -24,67 +19,35 @@ interface AgentRunMonitorPageProps {
 }
 
 const stageOrder: AgentRunRecord["agent_stage"][] = [
-  "profile",
-  "maximize",
-  "recon",
-  "analyze",
-  "plan",
-  "execute",
-  "compare",
-  "contract",
-  "minimize",
-  "reverify",
-  "finished",
+  "profile", "maximize", "recon", "analyze", "plan", "execute", "compare",
+  "contract", "minimize", "reverify", "finished",
 ];
 
 const stageLabels: Record<AgentRunRecord["agent_stage"], string> = {
-  profile: "프로필 고정",
-  maximize: "권한 최대화",
-  recon: "Recon",
-  analyze: "분석",
-  plan: "계획",
-  execute: "체인 실행",
-  compare: "TB 비교",
-  contract: "경로 고정",
-  minimize: "권한 축소",
-  reverify: "재검증",
-  finished: "종료",
+  profile: "프로필 고정", maximize: "권한 적용", recon: "Recon",
+  analyze: "그래프 분석", plan: "Campaign 루트", execute: "그래프 탐색",
+  compare: "최고 경로 선택", contract: "경로 고정", minimize: "권한 축소",
+  reverify: "재검증", finished: "종료",
 };
 
 const statusLabels: Record<AgentRunRecord["status"], string> = {
-  RECEIVED: "실행 대기",
-  RUNNING: "실시간 실행 중",
-  PAUSED: "체크포인트 일시중지",
-  COMPLETED: "완료",
-  FAILED: "실패",
-  CANCELLED: "취소",
+  RECEIVED: "실행 대기", RUNNING: "실시간 실행 중", PAUSED: "Frontier 보존",
+  COMPLETED: "완료", FAILED: "실패", CANCELLED: "취소",
 };
 
 const sourceLabels: Record<string, string> = {
-  profile: "Profile",
-  model: "Model",
-  tool_runner: "Tool runner",
-  executor: "Executor",
-  runtime_agent: "Runtime Agent",
-  supervisor: "Supervisor",
-  verifier: "Verifier",
-  orchestrator: "Orchestrator",
-  recon: "Recon",
-  analyzer: "Analyzer",
-  planner: "Planner",
-  policy: "Policy Gate",
-  rollback: "Rollback",
+  profile: "Profile", model: "Model", tool_runner: "Tool runner", executor: "Executor",
+  runtime_agent: "Runtime Agent", supervisor: "Supervisor", verifier: "Verifier",
+  orchestrator: "Orchestrator", recon: "Recon", analyzer: "Analyzer", planner: "Planner",
+  policy: "Policy Gate", rollback: "Resetter",
 };
 
 const eventTimeFormatter = new Intl.DateTimeFormat("ko-KR", {
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
 });
 
 function isLiveRun(run: AgentRunRecord): boolean {
-  return run.status === "RECEIVED"
-    || run.status === "RUNNING"
+  return run.status === "RECEIVED" || run.status === "RUNNING"
     || (run.status === "CANCELLED" && run.completed_at === null);
 }
 
@@ -106,65 +69,10 @@ function shortFingerprint(value?: string): string {
   return value.length > 22 ? `${value.slice(0, 11)}…${value.slice(-8)}` : value;
 }
 
-function searchTotals(scenarios: TbScenario[]): AgentSearchState {
-  return scenarios.reduce<AgentSearchState>((total, scenario) => {
-    const search = scenario.search;
-    if (!search) return total;
-    return {
-      ...total,
-      discovered_states: total.discovered_states + search.discovered_states,
-      explored_states: total.explored_states + search.explored_states,
-      unique_transitions: total.unique_transitions + search.unique_transitions,
-      repeated_states: total.repeated_states + search.repeated_states,
-      frontier_candidates: total.frontier_candidates + search.frontier_candidates,
-      policy_pruned_candidates: total.policy_pruned_candidates + search.policy_pruned_candidates,
-      tool_calls_used: total.tool_calls_used + search.tool_calls_used,
-      planner_calls_used: (total.planner_calls_used ?? 0) + (search.planner_calls_used ?? 0),
-      automatic_extensions: total.automatic_extensions + search.automatic_extensions,
-    };
-  }, {
-    status: "PENDING",
-    discovered_states: 0,
-    explored_states: 0,
-    unique_transitions: 0,
-    repeated_states: 0,
-    frontier_candidates: 0,
-    policy_pruned_candidates: 0,
-    tool_calls_used: 0,
-    planner_calls_used: 0,
-    automatic_extensions: 0,
-    termination_reason: null,
-    termination_explanation: null,
-    search_complete: false,
-    budget_exhausted: false,
-    resume_available: false,
-    checkpoint_id: null,
-  });
-}
-
-function stepState(step: AgentPlanStep | undefined): { version: number | null; fingerprint: string } {
-  const state = step?.state_after ?? step?.state_before;
-  return {
-    version: typeof state?.version === "number" ? state.version : null,
-    fingerprint: typeof state?.fingerprint === "string" ? state.fingerprint : "",
-  };
-}
-
-export function AgentRunMonitorPage({
-  run,
-  runId,
-  remote,
-  boundaries,
-  monitorError,
-  lastRefreshAt,
-  onBack,
-  onCancel,
-  onResume,
-  isCancelling = false,
-  isResuming = false,
-}: AgentRunMonitorPageProps) {
+export function AgentRunMonitorPage(props: AgentRunMonitorPageProps) {
+  const { run, runId, remote, monitorError, lastRefreshAt, onBack, onCancel, isCancelling = false } = props;
   const [now, setNow] = useState(() => Date.now());
-  const [selectedBoundaryId, setSelectedBoundaryId] = useState<string | null>(null);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!run || !isLiveRun(run)) return;
@@ -172,46 +80,33 @@ export function AgentRunMonitorPage({
     return () => window.clearInterval(timer);
   }, [run]);
 
-  const currentScenario = useMemo(() => {
-    if (!run) return null;
-    return run.tb_scenarios.find((scenario) => scenario.chain_status === "RUNNING")
-      ?? [...run.tb_scenarios].reverse().find((scenario) => scenario.chain_status !== "PENDING")
-      ?? run.tb_scenarios[0]
-      ?? null;
-  }, [run]);
+  const search = run?.campaign_search;
+  const activeSelectedNodeId = selectedNodeId ?? search?.current_node_id ?? search?.root_node_id ?? null;
+  const selectedNode = useMemo(
+    () => search?.nodes.find((node) => node.node_id === activeSelectedNodeId) ?? null,
+    [activeSelectedNodeId, search?.nodes],
+  );
+  const selectedTransition = useMemo(
+    () => search?.transitions.find((item) => item.to_node_id === selectedNode?.node_id) ?? null,
+    [search?.transitions, selectedNode?.node_id],
+  );
+  const recentTransitions = useMemo(
+    () => [...(search?.transitions ?? [])].reverse().slice(0, 16),
+    [search?.transitions],
+  );
+  const latestEvents = useMemo(
+    () => [...(run?.events ?? [])].reverse().slice(0, 120),
+    [run?.events],
+  );
 
-  const selectedScenario = useMemo(() => {
-    if (!run) return null;
-    return run.tb_scenarios.find((scenario) => scenario.trust_boundary_id === selectedBoundaryId)
-      ?? currentScenario;
-  }, [currentScenario, run, selectedBoundaryId]);
-
-  const decisions = useMemo(() => {
-    if (!run) return [];
-    return run.tb_scenarios
-      .flatMap((scenario) => scenario.steps
-        .filter((step) => step.type === "execute")
-        .map((step) => ({ boundaryId: scenario.trust_boundary_id, step })))
-      .reverse()
-      .slice(0, 12);
-  }, [run]);
-
-  const totals = useMemo(() => searchTotals(run?.tb_scenarios ?? []), [run]);
-  const latestEvents = useMemo(() => [...(run?.events ?? [])].reverse().slice(0, 120), [run]);
-  const currentStep = currentScenario
-    ? [...currentScenario.steps].reverse().find((step) => step.type === "execute") ?? currentScenario.steps.at(-1)
-    : undefined;
-  const currentState = stepState(currentStep);
-  const currentStageIndex = run ? stageOrder.indexOf(run.agent_stage) : -1;
-
-  if (!run) {
+  if (!run || !search) {
     return (
       <main className="agent-monitor-page">
         <section className="agent-monitor-loading" aria-live="polite">
           <span className="live-pulse" aria-hidden="true" />
           <div>
             <h1>실험 상태 연결 중</h1>
-            <p><code>{runId}</code>의 첫 상태 스냅샷을 기다리고 있습니다.</p>
+            <p><code>{runId}</code>의 첫 Campaign 스냅샷을 기다리고 있습니다.</p>
             {monitorError ? <p className="error-message">{monitorError} · 자동으로 다시 시도합니다.</p> : null}
           </div>
           <button type="button" onClick={onBack}>컨트롤 패널로</button>
@@ -220,28 +115,19 @@ export function AgentRunMonitorPage({
     );
   }
 
-  const completedCount = Math.min(8, run.tb_results.length);
   const live = isLiveRun(run);
-  const availableBoundaries = boundaries.length > 0
-    ? boundaries
-    : run.tb_scenarios.map((scenario) => ({
-        id: scenario.trust_boundary_id,
-        label: scenario.trust_boundary_id,
-        boundary_type: "HH" as const,
-        source_mode: "host" as const,
-        source_environment: "u1" as const,
-        target_environment: "u2" as const,
-        description: scenario.objective,
-      }));
+  const currentStageIndex = stageOrder.indexOf(run.agent_stage);
+  const nodeBudget = run.budget.max_campaign_nodes || 1;
+  const budgetProgress = Math.min(100, Math.round((search.nodes.length / nodeBudget) * 100));
 
   return (
     <main className="agent-monitor-page">
       <section className="agent-monitor-hero" aria-labelledby="agent-monitor-title">
         <div className="agent-monitor-hero-copy">
           <button className="monitor-back-button" type="button" onClick={onBack}>← 컨트롤 패널</button>
-          <span>Experiment live trace</span>
+          <span>Campaign graph live trace</span>
           <h1 id="agent-monitor-title">에이전트 실시간 모니터</h1>
-          <p>공격 Agent가 지금 무엇을 보고, 어떤 Tool을 왜 선택하고, 상태를 어떻게 누적하는지 한 실험 단위로 추적합니다.</p>
+          <p>환경 상태를 노드로 만들고 Trust Boundary를 연쇄 통과하면서, 실패 경로를 가지치기하고 부모 노드로 복귀하는 전 과정을 추적합니다.</p>
           <code>{run.run_id}</code>
           {(run.status === "RECEIVED" || run.status === "RUNNING") && onCancel ? (
             <button className="monitor-cancel-button" disabled={isCancelling} type="button" onClick={onCancel}>
@@ -250,14 +136,8 @@ export function AgentRunMonitorPage({
           ) : null}
         </div>
         <dl className="agent-monitor-headline">
-          <div>
-            <dt>상태</dt>
-            <dd className={`is-${run.status.toLowerCase()}`}>
-              {live ? <span className="live-pulse" aria-hidden="true" /> : null}
-              {run.status === "CANCELLED" && run.completed_at === null ? "취소·복구 처리 중" : statusLabels[run.status]}
-            </dd>
-          </div>
-          <div><dt>현재 단계</dt><dd>{stageLabels[run.agent_stage]}</dd></div>
+          <div><dt>상태</dt><dd className={`is-${run.status.toLowerCase()}`}>{live ? <span className="live-pulse" aria-hidden="true" /> : null}{statusLabels[run.status]}</dd></div>
+          <div><dt>탐색 단계</dt><dd>{stageLabels[run.agent_stage]}</dd></div>
           <div><dt>경과 시간</dt><dd>{formatElapsed(run.created_at, run.completed_at, now)}</dd></div>
           <div><dt>실행 위치</dt><dd>{remote ? "EC2 · SSM" : "로컬 Runtime"}</dd></div>
         </dl>
@@ -277,160 +157,94 @@ export function AgentRunMonitorPage({
         <ol className="agent-stage-track">
           {stageOrder.map((stage, index) => (
             <li className={index < currentStageIndex ? "is-complete" : index === currentStageIndex ? "is-current" : "is-pending"} key={stage}>
-              <span>{String(index + 1).padStart(2, "0")}</span>
-              <strong>{stageLabels[stage]}</strong>
+              <span>{String(index + 1).padStart(2, "0")}</span><strong>{stageLabels[stage]}</strong>
             </li>
           ))}
         </ol>
       </section>
 
-      <section className="agent-tb-panel" aria-labelledby="agent-tb-title">
+      <section className="campaign-graph-panel" aria-labelledby="campaign-graph-title">
         <div className="monitor-section-heading">
-          <div><span>8 Trust Boundaries</span><h2 id="agent-tb-title">경계별 진행 상황</h2></div>
-          <strong>{completedCount}/8 판정 완료</strong>
+          <div><span>Live state graph</span><h2 id="campaign-graph-title">Campaign 탐색 노드 트리</h2></div>
+          <strong>{search.nodes.length} nodes · {search.frontier_node_ids.length} frontier</strong>
         </div>
-        <div className="agent-tb-progress" role="progressbar" aria-valuemin={0} aria-valuemax={8} aria-valuenow={completedCount}>
-          <span style={{ width: `${(completedCount / 8) * 100}%` }} />
+        <div className="campaign-legend" aria-label="노드 상태 범례">
+          <span className="is-current">현재 위치</span><span className="is-best-path">최고 위험 경로</span>
+          <span className="is-pruned">가지치기</span><span className="is-rolled-back">부모 복귀</span>
         </div>
-        <div className="agent-tb-grid">
-          {availableBoundaries.map((boundary, index) => {
-            const scenario = run.tb_scenarios.find((item) => item.trust_boundary_id === boundary.id);
-            const result = run.tb_results.find((item) => item.trust_boundary_id === boundary.id);
-            const status = result?.verdict ?? scenario?.chain_status ?? "PENDING";
-            const active = scenario?.trust_boundary_id === currentScenario?.trust_boundary_id;
-            const selected = scenario?.trust_boundary_id === selectedScenario?.trust_boundary_id;
-            return (
-              <button
-                className={`agent-tb-tile is-${status.toLowerCase()}${active ? " is-active" : ""}${selected ? " is-selected" : ""}`}
-                disabled={!scenario}
-                key={boundary.id}
-                onClick={() => setSelectedBoundaryId(boundary.id)}
-                type="button"
-              >
-                <span>{String(index + 1).padStart(2, "0")}</span>
-                <strong>{boundary.id}</strong>
-                <small>{boundary.label}</small>
-                <b>{active ? "NOW · " : ""}{status}</b>
-              </button>
-            );
-          })}
-        </div>
+        <CampaignSearchTree onSelectNode={setSelectedNodeId} search={search} selectedNodeId={activeSelectedNodeId} />
       </section>
 
       <div className="agent-monitor-grid">
         <section className="agent-current-panel" aria-labelledby="agent-current-title">
           <div className="monitor-section-heading compact">
-            <div><span>Current decision</span><h2 id="agent-current-title">현재 공격 판단</h2></div>
-            <strong>{currentScenario?.trust_boundary_id ?? "준비 중"}</strong>
+            <div><span>Selected state</span><h2 id="agent-current-title">선택 노드 상세</h2></div>
+            <strong>{selectedNode?.status ?? "준비 중"}</strong>
           </div>
-          {currentScenario ? (
+          {selectedNode ? (
             <>
-              <div className="current-objective">
-                <span>Agent 목표</span>
-                <strong>{currentScenario.objective}</strong>
-                <p>{currentScenario.impact}</p>
-              </div>
+              <div className="current-objective"><span>현재 활성 환경</span><strong>{selectedNode.active_environment.toUpperCase()}</strong><p>제어 확보: {selectedNode.controlled_environments.map((item) => item.toUpperCase()).join(" → ")}</p></div>
               <dl className="current-decision-grid">
-                <div><dt>선택 Tool</dt><dd><code>{currentStep ? `${currentStep.tool}:${currentStep.action}` : "Planner 선택 대기"}</code></dd></div>
-                <div><dt>대상</dt><dd><code>{currentStep?.resource_ref ?? "—"}</code></dd></div>
-                <div><dt>정책 판정</dt><dd>{currentStep?.policy_decision ?? "검사 전"}</dd></div>
-                <div><dt>실행/검증</dt><dd>{currentStep?.execution_status ?? "대기"} · {currentStep?.verification_status ?? "대기"}</dd></div>
+                <div><dt>진입 경계</dt><dd><code>{selectedTransition?.trust_boundary_id ?? "ROOT"}</code></dd></div>
+                <div><dt>실행 Tool</dt><dd><code>{selectedTransition ? `${selectedTransition.tool}:${selectedTransition.action}` : "초기 foothold"}</code></dd></div>
+                <div><dt>누적 영향</dt><dd>{selectedNode.highest_impact} · {selectedNode.highest_impact_score}</dd></div>
+                <div><dt>복구 판정</dt><dd>{selectedTransition?.rollback_status ?? "NOT_REQUIRED"}</dd></div>
               </dl>
-              <div className="decision-rationale">
-                <span>Planner 선택 이유</span>
-                <p>{currentStep?.selection_rationale || "Recon과 현재 누적 상태를 바탕으로 다음 Tool을 선택하고 있습니다."}</p>
-              </div>
               <div className="current-state-card">
-                <div><span>누적 상태 버전</span><strong>v{currentState.version ?? 0}</strong></div>
-                <div><span>State fingerprint</span><code title={currentState.fingerprint}>{shortFingerprint(currentState.fingerprint)}</code></div>
-                <div><span>상태 변화</span><strong>{currentStep?.state_changes?.length ?? 0}개</strong></div>
+                <div><span>깊이</span><strong>D{selectedNode.depth}</strong></div>
+                <div><span>State fingerprint</span><code title={selectedNode.state_fingerprint}>{shortFingerprint(selectedNode.state_fingerprint)}</code></div>
+                <div><span>우선순위</span><strong>{selectedNode.priority_score.toFixed(1)}</strong></div>
               </div>
-              {currentStep?.state_changes && currentStep.state_changes.length > 0 ? (
-                <ul className="current-state-changes">
-                  {currentStep.state_changes.map((change, index) => (
-                    <li key={`${change.key}-${index}`}><code>{change.key}</code><span>{String(change.before)} → {String(change.after)}</span></li>
-                  ))}
-                </ul>
-              ) : null}
+              <div className="decision-rationale"><span>누적 Boundary 경로</span><p>{selectedNode.boundary_path.length > 0 ? selectedNode.boundary_path.join(" → ") : "Campaign root"}</p></div>
             </>
-          ) : <p className="monitor-empty">Recon 및 TB 시나리오 생성을 기다리고 있습니다.</p>}
+          ) : <p className="monitor-empty">Campaign 루트 노드 생성을 기다리고 있습니다.</p>}
         </section>
 
         <section className="agent-search-panel" aria-labelledby="agent-search-title">
-          <div className="monitor-section-heading compact">
-            <div><span>Search & watchdog</span><h2 id="agent-search-title">탐색 상태</h2></div>
-            <strong>{selectedScenario?.search?.status ?? "PENDING"}</strong>
-          </div>
+          <div className="monitor-section-heading compact"><div><span>Best-first search</span><h2 id="agent-search-title">탐색 상태</h2></div><strong>{search.status}</strong></div>
           <dl className="agent-search-metrics">
-            <div><dt>Tool 호출</dt><dd>{totals.tool_calls_used}</dd></div>
-            <div><dt>Planner 호출</dt><dd>{totals.planner_calls_used ?? 0}</dd></div>
-            <div><dt>발견 상태</dt><dd>{totals.discovered_states}</dd></div>
-            <div><dt>고유 전이</dt><dd>{totals.unique_transitions}</dd></div>
-            <div><dt>현재 Frontier</dt><dd>{totals.frontier_candidates}</dd></div>
-            <div><dt>중복 제거</dt><dd>{totals.repeated_states}</dd></div>
-            <div><dt>Policy 제외</dt><dd>{totals.policy_pruned_candidates}</dd></div>
-            <div><dt>자동 확장</dt><dd>{totals.automatic_extensions}</dd></div>
+            <div><dt>발견 노드</dt><dd>{search.nodes.length}</dd></div><div><dt>탐색 완료</dt><dd>{search.explored_nodes}</dd></div>
+            <div><dt>현재 Frontier</dt><dd>{search.frontier_node_ids.length}</dd></div><div><dt>가지치기</dt><dd>{search.pruned_nodes}</dd></div>
+            <div><dt>Tool 호출</dt><dd>{search.tool_calls_used}</dd></div><div><dt>Planner 호출</dt><dd>{search.planner_calls_used}</dd></div>
+            <div><dt>부모 복귀</dt><dd>{search.backtrack_count}</dd></div><div><dt>최고 영향</dt><dd>{search.best_impact_score}</dd></div>
           </dl>
-          <div className="watchdog-state">
-            <span>선택 TB 탐색 판단</span>
-            <strong>{selectedScenario?.search?.termination_reason ?? (selectedScenario?.chain_status === "RUNNING" ? "최악 영향 탐색 중" : "종료 판단 대기")}</strong>
-            <p>{selectedScenario?.search?.termination_explanation ?? "Agent가 현재 상태에서 실행할 최적 후보를 계속 비교합니다."}</p>
-            {selectedScenario?.search?.checkpoint_id ? <code>{selectedScenario.search.checkpoint_id}</code> : null}
-          </div>
+          <div className="live-run-progress" role="progressbar" aria-label="Campaign 노드 예산 사용률" aria-valuemin={0} aria-valuemax={nodeBudget} aria-valuenow={search.nodes.length}><span style={{ width: `${budgetProgress}%` }} /></div>
+          <div className="watchdog-state"><span>탐색 종료 조건</span><strong>{search.termination_reason ?? "Frontier 평가 중"}</strong><p>{search.termination_explanation ?? "위험도 우선순위가 가장 높은 상태를 선택해 다음 전이를 실행합니다."}</p></div>
         </section>
       </div>
 
       <section className="agent-decision-panel" aria-labelledby="agent-decisions-title">
-        <div className="monitor-section-heading">
-          <div><span>Planner trace</span><h2 id="agent-decisions-title">최근 Tool 선택과 상태 전이</h2></div>
-          <strong>{decisions.length} recent decisions</strong>
-        </div>
-        {decisions.length > 0 ? (
+        <div className="monitor-section-heading"><div><span>Transition trace</span><h2 id="agent-decisions-title">최근 경계 전이와 복구</h2></div><strong>{recentTransitions.length} recent transitions</strong></div>
+        {recentTransitions.length > 0 ? (
           <ol className="agent-decision-list">
-            {decisions.map(({ boundaryId, step }) => {
-              const state = stepState(step);
-              return (
-                <li key={`${boundaryId}-${step.step_id}`}>
-                  <span className="decision-sequence">{step.sequence ?? "—"}</span>
-                  <div className="decision-tool"><small>{boundaryId}</small><strong>{step.tool}:{step.action}</strong><code>{step.resource_ref}</code></div>
-                  <p>{step.selection_rationale || "선택 근거 기록 대기"}</p>
-                  <div className="decision-state"><span>{step.status}</span><code>v{state.version ?? 0} · {shortFingerprint(state.fingerprint)}</code></div>
-                </li>
-              );
-            })}
+            {recentTransitions.map((transition) => (
+              <li key={transition.transition_id}>
+                <span className="decision-sequence">{transition.sequence}</span>
+                <div className="decision-tool"><small>{transition.trust_boundary_id}</small><strong>{transition.tool}:{transition.action}</strong><code>{transition.source_environment.toUpperCase()} → {transition.target_environment.toUpperCase()}</code></div>
+                <p>{transition.prune_reason ?? `${transition.impact} 영향 ${transition.impact_score} · ${transition.outcome ?? "실행 대기"}`}</p>
+                <div className="decision-state"><span>{transition.status}</span><code>Rollback · {transition.rollback_status}</code></div>
+              </li>
+            ))}
           </ol>
-        ) : <p className="monitor-empty">Planner의 첫 실행 Tool 선택을 기다리고 있습니다.</p>}
+        ) : <p className="monitor-empty">첫 Trust Boundary 전이 실행을 기다리고 있습니다.</p>}
       </section>
 
       <section className="agent-event-panel" aria-labelledby="agent-events-title">
-        <div className="monitor-section-heading">
-          <div><span>Live event stream</span><h2 id="agent-events-title">최신 Agent 이벤트</h2></div>
-          <strong>{run.events.length} events</strong>
-        </div>
+        <div className="monitor-section-heading"><div><span>Live event stream</span><h2 id="agent-events-title">최신 Agent 이벤트</h2></div><strong>{run.events.length} events</strong></div>
         {latestEvents.length > 0 ? (
           <ol className="agent-live-event-list" aria-live="polite">
             {latestEvents.map((event) => (
-              <li key={`${event.sequence}-${event.event_type}`}>
-                <span className="event-sequence">#{event.sequence}</span>
-                <div>
-                  <header><span>{sourceLabels[event.source] ?? event.source}</span><time dateTime={event.created_at}>{eventTimeFormatter.format(new Date(event.created_at))}</time></header>
-                  <strong>{event.event_type}</strong>
-                  <p>{event.message}</p>
-                  {Object.keys(event.payload).length > 0 ? (
-                    <details><summary>payload 보기</summary><pre>{JSON.stringify(event.payload, null, 2)}</pre></details>
-                  ) : null}
-                </div>
-              </li>
+              <li key={`${event.sequence}-${event.event_type}`}><span className="event-sequence">#{event.sequence}</span><div>
+                <header><span>{sourceLabels[event.source] ?? event.source}</span><time dateTime={event.created_at}>{eventTimeFormatter.format(new Date(event.created_at))}</time></header>
+                <strong>{event.event_type}</strong><p>{event.message}</p>
+                {Object.keys(event.payload).length > 0 ? <details><summary>payload 보기</summary><pre>{JSON.stringify(event.payload, null, 2)}</pre></details> : null}
+              </div></li>
             ))}
           </ol>
         ) : <p className="monitor-empty">첫 이벤트를 기다리고 있습니다.</p>}
       </section>
 
-      {!live ? (
-        <section className="agent-final-result" aria-label="완료된 실험 통합 결과">
-          <AgentRunResult run={run} onResume={onResume} isResuming={isResuming} />
-        </section>
-      ) : null}
+      {!live ? <section className="agent-final-result" aria-label="완료된 Campaign 결과"><AgentRunResult run={run} /></section> : null}
     </main>
   );
 }

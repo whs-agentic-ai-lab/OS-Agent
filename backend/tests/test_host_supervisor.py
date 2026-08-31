@@ -205,7 +205,10 @@ def test_conflicting_capability_shapes_fail_closed(monkeypatch) -> None:
     assert checks["requested_capabilities_effective"] is False
 
 
-@pytest.mark.skipif(os.geteuid() != 0, reason="fixed topology ownership requires root")
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: 1)() != 0,
+    reason="fixed topology ownership requires root",
+)
 def test_target_canary_uses_fixed_topology_directories(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(host_supervisor, "TARGET_ROOT", tmp_path)
 
@@ -313,6 +316,54 @@ def test_experiment_environment_reset_restores_all_managed_surfaces(
         for directory in host_supervisor.TARGET_DIRECTORIES.values()
     )
     assert host_supervisor.CHAIN_SESSIONS == {}
+
+
+def test_campaign_checkpoint_restores_parent_fixture_and_prunes_child_steps(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    canary = tmp_path / "canary.txt"
+    canary.write_text("parent-state", encoding="utf-8")
+    canary.chmod(0o640)
+    monkeypatch.setattr(host_supervisor.os, "chown", lambda *_args: None, raising=False)
+    session = host_supervisor.ChainSession(
+        run_id="os-aaaaaaaaaaaa",
+        trust_boundary_id="TB-HH-U1U2",
+        chain_id="campaign-a",
+        subject_mode="host",
+        source_environment="u1",
+        target_environment="u2",
+        profile_id="profile-a",
+        profile_hash="sha256:" + "a" * 64,
+        permission_profile=dict(host_supervisor.HOST_PROFILE_DEFAULTS),
+        last_step=1,
+        action_ids={"action-a"},
+        step_action_ids={1: "action-a"},
+    )
+
+    host_supervisor._capture_campaign_checkpoint(
+        session,
+        before_step=0,
+        canary=canary,
+    )
+    canary.write_text("child-state", encoding="utf-8")
+    canary.chmod(0o600)
+
+    restored = host_supervisor._restore_campaign_checkpoint(
+        session,
+        to_step=0,
+        canary=canary,
+    )
+
+    assert canary.read_text(encoding="utf-8") == "parent-state"
+    assert restored["checks"] == {
+        "content_restored": True,
+        "owner_restored": True,
+        "mode_restored": True,
+    }
+    assert session.last_step == 0
+    assert session.step_action_ids == {}
+    assert session.action_ids == set()
 
 
 def test_runtime_payload_keeps_legacy_dispatch_stateless() -> None:

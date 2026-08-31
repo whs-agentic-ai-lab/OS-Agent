@@ -28,6 +28,9 @@ from .runtime_client import EnvironmentRuntime
 from .schemas import (
     AgentFinding,
     AttackContract,
+    CampaignNode,
+    CampaignSearchState,
+    CampaignTransition,
     ChainSearchProgress,
     DamageScore,
     FrozenAttackStep,
@@ -39,6 +42,7 @@ from .schemas import (
     PermissionTrial,
     RunEvent,
     RuntimeDispatchRequest,
+    RuntimeBacktrackRequest,
     RuntimeResetRequest,
     SubjectMode,
     TbResult,
@@ -50,9 +54,9 @@ from .schemas import (
 
 
 ATTACK_AGENT_MISSION = (
-    "고정된 Host·Container 유효 권한과 Recon 증거만 사용해 EC2 내부 8개 "
-    "Trust Boundary의 공격 가설을 스스로 생성하고, 실행 가능한 최고 위험 "
-    "시나리오를 검증·복구한 뒤 실제 최악 경로를 선정한다."
+    "고정된 Host·Container 유효 권한과 Recon 증거만 사용해 EC2 내부 환경을 "
+    "하나의 Campaign 상태 그래프로 탐색하고, 여러 Trust Boundary를 연쇄 통과하는 "
+    "최고 위험 경로를 검증한 뒤 Resetter로 부모 상태를 복구한다."
 )
 
 
@@ -67,7 +71,7 @@ def permission_profile_hash(profiles: dict[str, dict[str, bool]]) -> str:
 
 
 class AgentOrchestrator:
-    """고정된 두 권한 프로파일로 EC2 내부 8개 TB를 모두 시험합니다."""
+    """EC2 내부 경계를 하나의 상태 그래프로 탐색하는 Campaign Agent."""
 
     def __init__(
         self,
@@ -120,7 +124,7 @@ class AgentOrchestrator:
         if run.status == "CANCELLED":
             return run
         run.status = "RUNNING"
-        self._event(run, "orchestrator", "AGENT_STARTED", "8개 Trust Boundary 전체 실행 Agent를 시작했습니다.")
+        self._event(run, "orchestrator", "AGENT_STARTED", "다중 경계 Campaign 그래프 탐색 Agent를 시작했습니다.")
         self._persist(run)
         if run.status == "CANCELLED":
             run.agent_stage = "finished"
@@ -133,19 +137,19 @@ class AgentOrchestrator:
             if not self._cancel_requested(run):
                 self._collect_infrastructure(run)
             if not self._cancel_requested(run):
-                self._analyze_and_plan(run)
+                self._prepare_campaign(run)
             if not self._cancel_requested(run):
-                self._execute_all(run)
+                self._execute_campaign(run)
+            if run.campaign_search.status == "FAILED":
+                run.status = "FAILED"
             if run.status == "RUNNING":
-                self._compare(run)
-                if self._all_tb_searches_complete(run):
-                    if run.attack_contract is not None:
-                        self._minimize_permissions(run)
-                    if not self._cancel_requested(run):
-                        run.status = "COMPLETED"
-                else:
-                    run.status = "PAUSED"
-                    self._event(run, "orchestrator", "RUN_CHECKPOINTED", "하나 이상의 TB 탐색이 미완료라 전체 최악 경로 확정을 보류했습니다.")
+                self._finalize_campaign(run)
+                if not self._cancel_requested(run):
+                    run.status = (
+                        "COMPLETED"
+                        if run.campaign_search.search_complete
+                        else "PAUSED"
+                    )
         except Exception as exc:
             run.status = "FAILED"
             self._event(
@@ -182,6 +186,31 @@ class AgentOrchestrator:
         return run
 
     def prepare_resume(self, run: AgentRunRecord) -> AgentRunRecord:
+        if (
+            run.campaign_search.status == "PAUSED"
+            and run.campaign_search.frontier_node_ids
+        ):
+            previous_limit = run.budget.max_campaign_nodes
+            run.budget.max_campaign_nodes = min(
+                1024,
+                previous_limit + max(8, previous_limit // 2),
+            )
+            run.status = "RECEIVED"
+            run.agent_stage = "execute"
+            run.completed_at = None
+            self._event(
+                run,
+                "orchestrator",
+                "CAMPAIGN_RESUME_RECEIVED",
+                "보존된 전역 Frontier에서 Campaign 탐색 재개를 준비했습니다.",
+                {
+                    "frontier_nodes": len(run.campaign_search.frontier_node_ids),
+                    "previous_node_limit": previous_limit,
+                    "extended_node_limit": run.budget.max_campaign_nodes,
+                },
+            )
+            self._persist(run)
+            return run
         self._resumable_scenarios(run)
         run.status = "RECEIVED"
         run.agent_stage = "execute"
@@ -214,6 +243,52 @@ class AgentOrchestrator:
         return run
 
     def resume(self, run: AgentRunRecord) -> AgentRunRecord:
+        if (
+            run.campaign_search.status == "PAUSED"
+            and run.campaign_search.frontier_node_ids
+        ):
+            run.status = "RUNNING"
+            run.agent_stage = "execute"
+            run.completed_at = None
+            run.campaign_search.status = "RUNNING"
+            run.campaign_search.termination_reason = None
+            run.campaign_search.termination_explanation = None
+            self._event(
+                run,
+                "orchestrator",
+                "CAMPAIGN_RESUME_STARTED",
+                "복구된 루트에서 보존된 Best-First Frontier 탐색을 재개합니다.",
+            )
+            self._persist(run)
+            try:
+                self._execute_campaign(run)
+                if run.campaign_search.status == "FAILED":
+                    run.status = "FAILED"
+                elif not self._cancel_requested(run):
+                    self._finalize_campaign(run)
+                    run.status = (
+                        "COMPLETED"
+                        if run.campaign_search.search_complete
+                        else "PAUSED"
+                    )
+            except Exception as exc:
+                run.status = "FAILED"
+                self._event(
+                    run,
+                    "orchestrator",
+                    "CAMPAIGN_RESUME_FAILED",
+                    str(exc),
+                )
+            run.agent_stage = "finished"
+            run.completed_at = utc_now()
+            self._event(
+                run,
+                "orchestrator",
+                "CAMPAIGN_RESUME_FINISHED",
+                f"최종 상태: {run.status}",
+            )
+            self._persist(run)
+            return run
         scenarios = self._resumable_scenarios(run)
 
         run.status = "RUNNING"
@@ -475,6 +550,763 @@ class AgentOrchestrator:
         run.agent_stage = "plan"
         self._event(run, "planner", "SCENARIO_SELECTED", "8개 TB에 상태 누적형 자율 탐색 세션을 생성했습니다.")
         self._persist(run)
+
+    def _prepare_campaign(self, run: AgentRunRecord) -> None:
+        """Create one run-level search root instead of eight isolated TB sessions."""
+        run.agent_stage = "analyze"
+        run.findings = []
+        for index, boundary in enumerate(TRUST_BOUNDARIES, start=1):
+            profile = self._profile(run, boundary.source_mode)
+            writable, used = self._expected_file_write(boundary.source_mode, profile)
+            finding = AgentFinding(
+                finding_id=f"campaign-finding-{index:03d}",
+                trust_boundary_id=boundary.id,
+                title=f"{boundary.label} Campaign 전이 후보",
+                preconditions=used,
+                impact="target_data_modification",
+                confidence=0.95 if writable else 0.75,
+                evidence_refs=[f"recon:{boundary.source_mode.value}:identity"],
+                executable=bool(self._candidate_decisions(boundary)),
+                blocked_reason=(
+                    None
+                    if self._candidate_decisions(boundary)
+                    else "현재 검증 Registry에 이 경계를 통과할 수 있는 Tool이 없습니다."
+                ),
+            )
+            run.findings.append(finding)
+            self._event(
+                run,
+                "analyzer",
+                "CAMPAIGN_EDGE_ANALYZED",
+                finding.title,
+                finding.model_dump(mode="json"),
+            )
+
+        root_state = {
+            "profile_hash": run.profile_hash,
+            "controlled_environments": ["u1"],
+            "active_environment": "u1",
+            "effective_identities": {
+                "u1": run.effective_permissions.get("host", {}),
+            },
+            "boundary_path": [],
+        }
+        root = CampaignNode(
+            node_id=f"node-{uuid4().hex[:12]}",
+            active_environment="u1",
+            controlled_environments=["u1"],
+            effective_identities={
+                "u1": run.effective_permissions.get("host", {}),
+            },
+            state_fingerprint=self._state_fingerprint(root_state),
+            priority_score=100,
+        )
+        run.campaign_search = CampaignSearchState(
+            status="PENDING",
+            root_node_id=root.node_id,
+            current_node_id=root.node_id,
+            nodes=[root],
+            frontier_node_ids=[root.node_id],
+        )
+        run.tb_scenarios = []
+        run.tb_results = []
+        run.agent_stage = "plan"
+        self._event(
+            run,
+            "planner",
+            "CAMPAIGN_ROOT_CREATED",
+            "U1 foothold를 루트로 전체 Trust Boundary 그래프 탐색을 준비했습니다.",
+            {"node": root.model_dump(mode="json")},
+        )
+        self._persist(run)
+
+    @staticmethod
+    def _campaign_node(search: CampaignSearchState, node_id: str) -> CampaignNode:
+        return next(node for node in search.nodes if node.node_id == node_id)
+
+    @staticmethod
+    def _campaign_transition(
+        search: CampaignSearchState,
+        transition_id: str,
+    ) -> CampaignTransition:
+        return next(
+            transition
+            for transition in search.transitions
+            if transition.transition_id == transition_id
+        )
+
+    @classmethod
+    def _campaign_ancestry(
+        cls,
+        search: CampaignSearchState,
+        node_id: str,
+    ) -> list[CampaignNode]:
+        path: list[CampaignNode] = []
+        node = cls._campaign_node(search, node_id)
+        while True:
+            path.append(node)
+            if node.parent_node_id is None:
+                break
+            node = cls._campaign_node(search, node.parent_node_id)
+        return list(reversed(path))
+
+    def _campaign_candidates(
+        self,
+        run: AgentRunRecord,
+        node: CampaignNode,
+    ) -> list[tuple[float, TrustBoundaryOption, ToolDecision]]:
+        controlled = {item.value for item in node.controlled_environments}
+        visited = {
+            (
+                transition.trust_boundary_id,
+                transition.tool,
+                transition.action,
+                transition.resource_ref,
+                tuple(sorted(transition.arguments)),
+            )
+            for transition in run.campaign_search.transitions
+            if transition.from_node_id == node.node_id
+        }
+        candidates: list[tuple[float, TrustBoundaryOption, ToolDecision]] = []
+        for boundary in TRUST_BOUNDARIES:
+            if boundary.source_environment.value not in controlled:
+                continue
+            for decision in self._candidate_decisions(boundary):
+                potential = self._candidate_potential_score(run, boundary, decision)
+                signature = (
+                    boundary.id,
+                    decision.name,
+                    decision.action,
+                    decision.resource_ref,
+                    tuple(sorted(decision.arguments)),
+                )
+                if potential <= 0 or signature in visited:
+                    continue
+                new_environment_bonus = (
+                    14
+                    if boundary.target_environment.value not in controlled
+                    else 0
+                )
+                information_bonus = 5 if decision.name == "process.procfs" else 0
+                cost_penalty = node.depth * 1.5 + node.cumulative_cost
+                score = potential + new_environment_bonus + information_bonus - cost_penalty
+                if (
+                    potential < run.campaign_search.best_impact_score
+                    and not new_environment_bonus
+                ):
+                    continue
+                candidates.append((score, boundary, decision))
+        return sorted(candidates, key=lambda item: item[0], reverse=True)
+
+    def _campaign_rank_candidates(
+        self,
+        run: AgentRunRecord,
+        node: CampaignNode,
+        candidates: list[tuple[float, TrustBoundaryOption, ToolDecision]],
+    ) -> list[tuple[float, TrustBoundaryOption, ToolDecision]]:
+        if not candidates:
+            return []
+        beam = candidates[: run.budget.campaign_beam_width]
+        primary_boundary = beam[0][1]
+        same_boundary = [item for item in candidates if item[1].id == primary_boundary.id]
+        context = {
+            "mission": ATTACK_AGENT_MISSION,
+            "campaign_node": node.model_dump(mode="json"),
+            "source": primary_boundary.source_environment.value,
+            "target": primary_boundary.target_environment.value,
+            "highest_verified_impact_score": run.campaign_search.best_impact_score,
+            "impact_verified": False,
+            "executed_steps": [],
+            "untried_candidates": [
+                item[2].model_dump(mode="json")
+                for item in same_boundary[: max(1, run.budget.campaign_beam_width * 2)]
+            ],
+        }
+        preferred: ToolDecision | None = None
+        try:
+            choice = self.model_gateway.next_action(
+                json.dumps(context, ensure_ascii=False, sort_keys=True),
+                primary_boundary,
+                model=run.planner_model,
+            )
+            run.campaign_search.planner_calls_used += 1
+            if choice.kind == "tool":
+                preferred = choice.decision
+        except Exception as exc:
+            self._event(
+                run,
+                "planner",
+                "CAMPAIGN_PLANNER_FALLBACK",
+                "모델 선택 실패로 위험도 기반 정렬을 사용합니다.",
+                {"error": str(exc), "node_id": node.node_id},
+            )
+        if preferred is not None:
+            preferred_signature = self._decision_signature(preferred)
+            beam.sort(
+                key=lambda item: (
+                    self._decision_signature(item[2]) == preferred_signature,
+                    item[0],
+                ),
+                reverse=True,
+            )
+        return beam
+
+    @classmethod
+    def _campaign_child_fingerprint(
+        cls,
+        parent: CampaignNode,
+        result,
+        controlled: list,
+        boundary_path: list[str],
+    ) -> str:
+        return cls._state_fingerprint(
+            {
+                "parent": parent.state_fingerprint,
+                "runtime_state": cls._result_state_fingerprint(result),
+                "controlled_environments": sorted(
+                    item.value if hasattr(item, "value") else str(item)
+                    for item in controlled
+                ),
+                "boundary_path": boundary_path,
+            }
+        )
+
+    def _campaign_backtrack_transition(
+        self,
+        run: AgentRunRecord,
+        transition: CampaignTransition,
+        parent: CampaignNode,
+    ) -> bool:
+        transition.status = "BACKTRACKING"
+        parent.status = "BACKTRACKING"
+        self._event(
+            run,
+            "rollback",
+            "BACKTRACK_STARTED",
+            "Tool별 checkpoint로 부모 Campaign 노드를 복구합니다.",
+            {
+                "transition_id": transition.transition_id,
+                "parent_node_id": parent.node_id,
+            },
+        )
+        boundary = next(item for item in TRUST_BOUNDARIES if item.id == transition.trust_boundary_id)
+        try:
+            backtrack = getattr(self.runtime, "backtrack", None)
+            if callable(backtrack):
+                restored = backtrack(
+                    RuntimeBacktrackRequest(
+                        run_id=run.run_id,
+                        subject_mode=boundary.source_mode,
+                        trust_boundary_id=boundary.id,
+                        target_environment=boundary.target_environment,
+                        chain_id=transition.chain_id,
+                        to_step=0,
+                        expected_fingerprint=parent.state_fingerprint,
+                    )
+                )
+                verified = (
+                    restored.status == "RESTORED"
+                    and restored.state_fingerprint == parent.state_fingerprint
+                )
+                transition.evidence_refs.extend(restored.evidence_refs)
+            else:
+                reset = self._reset(run, boundary)
+                verified = reset.status == "RESET"
+                transition.evidence_refs.extend(reset.evidence_refs)
+            if not verified:
+                raise RuntimeError("부모 state fingerprint가 일치하지 않습니다.")
+        except Exception as exc:
+            transition.rollback_status = "FAILED"
+            transition.status = "FAILED"
+            parent.status = "ERROR"
+            self._event(
+                run,
+                "rollback",
+                "PARENT_STATE_RESTORE_FAILED",
+                "부분 복구 검증 실패로 Harness 전체 reset을 수행합니다.",
+                {"transition_id": transition.transition_id, "error": str(exc)},
+            )
+            try:
+                reset = self._reset(run, boundary)
+            except Exception:
+                return False
+            return reset.status == "RESET" and False
+        transition.rollback_status = "VERIFIED"
+        transition.status = "ROLLED_BACK"
+        parent.status = "EXPLORING"
+        run.campaign_search.backtrack_count += 1
+        self._event(
+            run,
+            "rollback",
+            "PARENT_STATE_RESTORED",
+            "부모 Campaign 노드의 fingerprint 복구를 검증했습니다.",
+            {
+                "transition_id": transition.transition_id,
+                "parent_node_id": parent.node_id,
+                "state_fingerprint": parent.state_fingerprint,
+            },
+        )
+        return True
+
+    def _campaign_replay_transition(
+        self,
+        run: AgentRunRecord,
+        transition: CampaignTransition,
+    ) -> bool:
+        boundary = next(item for item in TRUST_BOUNDARIES if item.id == transition.trust_boundary_id)
+        result = self._dispatch(
+            run,
+            boundary,
+            ToolDecision(
+                name=transition.tool,
+                action=transition.action,
+                resource_ref=transition.resource_ref,
+                arguments=transition.arguments,
+            ),
+            phase="campaign-replay",
+            chain_id=transition.chain_id,
+            chain_step=1,
+            preserve_state=True,
+        )
+        run.campaign_search.tool_calls_used += 1
+        replay_fingerprint = self._result_state_fingerprint(result)
+        if replay_fingerprint != transition.state_after_fingerprint:
+            transition.status = "FAILED"
+            transition.rollback_status = "FAILED"
+            self._event(
+                run,
+                "verifier",
+                "CAMPAIGN_REPLAY_MISMATCH",
+                "Campaign 경로 replay 결과가 원래 상태와 일치하지 않습니다.",
+                {"transition_id": transition.transition_id},
+            )
+            return False
+        transition.status = "VERIFIED"
+        return True
+
+    def _move_campaign_cursor(
+        self,
+        run: AgentRunRecord,
+        target_node_id: str,
+    ) -> bool:
+        search = run.campaign_search
+        current_id = search.current_node_id or search.root_node_id
+        if current_id == target_node_id:
+            return True
+        if current_id is None:
+            return False
+        current_path = self._campaign_ancestry(search, current_id)
+        target_path = self._campaign_ancestry(search, target_node_id)
+        common = 0
+        while (
+            common < min(len(current_path), len(target_path))
+            and current_path[common].node_id == target_path[common].node_id
+        ):
+            common += 1
+        lca_index = common - 1
+        for node in reversed(current_path[lca_index + 1 :]):
+            transition = self._campaign_transition(search, node.incoming_transition_id or "")
+            parent = self._campaign_node(search, node.parent_node_id or "")
+            if not self._campaign_backtrack_transition(run, transition, parent):
+                return False
+            search.current_node_id = parent.node_id
+        for node in target_path[lca_index + 1 :]:
+            transition = self._campaign_transition(search, node.incoming_transition_id or "")
+            if not self._campaign_replay_transition(run, transition):
+                return False
+            search.current_node_id = node.node_id
+        return True
+
+    def _campaign_expand_node(self, run: AgentRunRecord, node: CampaignNode) -> None:
+        search = run.campaign_search
+        node.status = "EXPLORING"
+        node.updated_at = utc_now()
+        search.current_node_id = node.node_id
+        self._event(
+            run,
+            "orchestrator",
+            "SEARCH_NODE_SELECTED",
+            "가장 높은 위험도 우선순위의 Campaign 노드를 선택했습니다.",
+            {"node_id": node.node_id, "priority_score": node.priority_score},
+        )
+        ranked = self._campaign_rank_candidates(
+            run,
+            node,
+            self._campaign_candidates(run, node),
+        )
+        if not ranked:
+            node.status = "IMPACT_VERIFIED" if node.highest_impact_score else "PRUNED"
+            if not node.highest_impact_score:
+                search.pruned_nodes += 1
+            return
+        for priority, boundary, decision in ranked:
+            if len(search.nodes) >= run.budget.max_campaign_nodes:
+                break
+            transition_id = f"transition-{uuid4().hex[:12]}"
+            chain_id = f"camp-{run.run_id}-{uuid4().hex[:8]}"
+            transition = CampaignTransition(
+                transition_id=transition_id,
+                from_node_id=node.node_id,
+                trust_boundary_id=boundary.id,
+                source_environment=boundary.source_environment,
+                target_environment=boundary.target_environment,
+                tool=decision.name,
+                action=decision.action,
+                resource_ref=decision.resource_ref,
+                arguments=decision.arguments,
+                status="RUNNING",
+                state_before_fingerprint=node.state_fingerprint,
+                sequence=len(search.transitions) + 1,
+                chain_id=chain_id,
+            )
+            search.transitions.append(transition)
+            self._event(
+                run,
+                "planner",
+                "TRANSITION_STARTED",
+                f"{boundary.label}에서 {decision.name}:{decision.action}을 실행합니다.",
+                {"transition": transition.model_dump(mode="json")},
+            )
+            result = self._dispatch(
+                run,
+                boundary,
+                decision,
+                phase="campaign",
+                chain_id=chain_id,
+                chain_step=1,
+                preserve_state=True,
+            )
+            search.tool_calls_used += 1
+            impact_score = self._verified_impact_score(result)
+            impact = (
+                "privilege_transition"
+                if impact_score >= 90
+                else "target_data_modification"
+                if impact_score >= 82
+                else "process_information_disclosure"
+                if impact_score >= 58
+                else "none"
+            )
+            transition.runtime_result = result.runtime_result
+            transition.outcome = result.outcome
+            transition.impact_score = impact_score
+            transition.impact = impact
+            transition.state_after_fingerprint = self._result_state_fingerprint(result)
+            transition.state_changes = self._state_changes(result)
+            transition.evidence_refs.extend(result.evidence_refs)
+            controlled = list(node.controlled_environments)
+            crossed = result.runtime_result == "allowed" and impact_score >= 82
+            if crossed and boundary.target_environment not in controlled:
+                controlled.append(boundary.target_environment)
+            active_environment = (
+                boundary.target_environment if crossed else node.active_environment
+            )
+            identities = dict(node.effective_identities)
+            if crossed:
+                target_identity = (
+                    run.effective_permissions.get("container", {})
+                    if boundary.target_environment.value == "c1"
+                    else result.identity_reached
+                    or result.identity_after
+                )
+                identities[boundary.target_environment.value] = target_identity
+            boundary_path = [*node.boundary_path]
+            if crossed:
+                boundary_path.append(boundary.id)
+            child_fingerprint = self._campaign_child_fingerprint(
+                node,
+                result,
+                controlled,
+                boundary_path,
+            )
+            dominated_by = next(
+                (
+                    existing
+                    for existing in search.nodes
+                    if existing.node_id != node.node_id
+                    and set(existing.controlled_environments).issuperset(controlled)
+                    and existing.highest_impact_score >= max(
+                        node.highest_impact_score, impact_score
+                    )
+                    and existing.cumulative_cost <= node.cumulative_cost + 1
+                ),
+                None,
+            )
+            child_status = (
+                "BLOCKED"
+                if result.runtime_result == "denied"
+                else "ERROR"
+                if result.runtime_result == "error"
+                else "PRUNED"
+                if dominated_by is not None
+                else "QUEUED"
+            )
+            child = CampaignNode(
+                node_id=f"node-{uuid4().hex[:12]}",
+                parent_node_id=node.node_id,
+                incoming_transition_id=transition.transition_id,
+                depth=node.depth + 1,
+                status=child_status,
+                active_environment=active_environment,
+                controlled_environments=controlled,
+                effective_identities=identities,
+                state_fingerprint=child_fingerprint,
+                boundary_path=boundary_path,
+                highest_impact=(
+                    impact
+                    if impact_score >= node.highest_impact_score
+                    else node.highest_impact
+                ),
+                highest_impact_score=max(node.highest_impact_score, impact_score),
+                priority_score=priority + max(node.highest_impact_score, impact_score) * 0.2,
+                cumulative_cost=node.cumulative_cost + 1,
+                evidence_refs=list(dict.fromkeys([*node.evidence_refs, *result.evidence_refs])),
+            )
+            transition.to_node_id = child.node_id
+            transition.status = (
+                "BLOCKED"
+                if child_status == "BLOCKED"
+                else "FAILED"
+                if child_status == "ERROR"
+                else "PRUNED"
+                if child_status == "PRUNED"
+                else "VERIFIED"
+            )
+            if dominated_by is not None:
+                transition.prune_reason = f"DOMINATED_BY:{dominated_by.node_id}"
+                search.pruned_nodes += 1
+            search.nodes.append(child)
+            if child_status == "QUEUED" and child.depth < run.budget.max_campaign_depth:
+                search.frontier_node_ids.append(child.node_id)
+            elif child_status == "QUEUED":
+                child.status = "PRUNED"
+                transition.status = "PRUNED"
+                transition.prune_reason = "MAX_CAMPAIGN_DEPTH"
+                search.pruned_nodes += 1
+            if impact_score > search.best_impact_score:
+                search.best_impact_score = impact_score
+                search.best_node_id = child.node_id
+                self._event(
+                    run,
+                    "verifier",
+                    "BEST_PATH_UPDATED",
+                    "더 높은 검증 영향을 가진 Campaign 경로를 발견했습니다.",
+                    {
+                        "node_id": child.node_id,
+                        "impact": impact,
+                        "impact_score": impact_score,
+                        "boundary_path": boundary_path,
+                    },
+                )
+            self._event(
+                run,
+                "verifier",
+                "SEARCH_NODE_CREATED",
+                f"Campaign 자식 노드 상태: {child.status}",
+                {
+                    "node": child.model_dump(mode="json"),
+                    "transition": transition.model_dump(mode="json"),
+                },
+            )
+            if not self._campaign_backtrack_transition(run, transition, node):
+                search.status = "FAILED"
+                search.termination_reason = "RESET_FAILED"
+                search.termination_explanation = "부모 상태 복구 실패로 Campaign 탐색을 중단했습니다."
+                return
+            self._persist(run)
+        node.status = "IMPACT_VERIFIED" if node.highest_impact_score else "ROLLED_BACK"
+        node.updated_at = utc_now()
+
+    def _execute_campaign(self, run: AgentRunRecord) -> None:
+        run.agent_stage = "execute"
+        search = run.campaign_search
+        search.status = "RUNNING"
+        self._event(
+            run,
+            "orchestrator",
+            "CAMPAIGN_SEARCH_STARTED",
+            "위험도 기반 Best-First Campaign 그래프 탐색을 시작했습니다.",
+        )
+        while search.frontier_node_ids and len(search.nodes) < run.budget.max_campaign_nodes:
+            if self._cancel_requested(run):
+                search.status = "PAUSED"
+                search.termination_reason = "CANCELLED"
+                break
+            search.frontier_node_ids.sort(
+                key=lambda node_id: self._campaign_node(search, node_id).priority_score,
+                reverse=True,
+            )
+            node_id = search.frontier_node_ids.pop(0)
+            node = self._campaign_node(search, node_id)
+            if node.status != "QUEUED":
+                continue
+            if not self._move_campaign_cursor(run, node_id):
+                search.status = "FAILED"
+                search.termination_reason = "REPLAY_OR_RESET_FAILED"
+                search.termination_explanation = "선택한 Campaign 노드로 안전하게 이동하지 못했습니다."
+                break
+            self._campaign_expand_node(run, node)
+            search.explored_nodes += 1
+            self._persist(run)
+            if search.status == "FAILED":
+                break
+        if search.status != "FAILED":
+            root_id = search.root_node_id
+            if root_id and not self._move_campaign_cursor(run, root_id):
+                search.status = "FAILED"
+                search.termination_reason = "FINAL_BACKTRACK_FAILED"
+                search.termination_explanation = "Campaign 종료 후 루트 상태 복구에 실패했습니다."
+            elif search.frontier_node_ids:
+                search.status = "PAUSED"
+                search.termination_reason = "CAMPAIGN_NODE_BUDGET_EXHAUSTED"
+                search.termination_explanation = "Campaign 노드 예산을 소진해 재개 가능한 frontier를 보존했습니다."
+            else:
+                search.status = "COMPLETED"
+                search.search_complete = True
+                search.termination_reason = "FRONTIER_EXHAUSTED"
+                search.termination_explanation = "실행 가능한 Campaign 상태 frontier를 모두 평가했습니다."
+
+    def _finalize_campaign(self, run: AgentRunRecord) -> None:
+        run.agent_stage = "compare"
+        search = run.campaign_search
+        verified = [item for item in search.transitions if item.impact_score > 0]
+        blocked = [item for item in search.transitions if item.runtime_result == "denied"]
+        failed = [item for item in search.transitions if item.runtime_result == "error"]
+        run.summary = AgentRunSummary(
+            broken=len(verified),
+            blocked=len(blocked),
+            inconclusive=len(failed),
+        )
+        if search.best_node_id is None:
+            run.permission_minimization = PermissionMinimizationResult(status="SKIPPED")
+            run.rollback_status = (
+                "FAILED"
+                if any(item.rollback_status == "FAILED" for item in search.transitions)
+                else "VERIFIED"
+            )
+            self._event(
+                run,
+                "verifier",
+                "CAMPAIGN_NO_IMPACT",
+                "검증된 Campaign 영향 경로를 찾지 못했습니다.",
+            )
+            return
+        best_node = self._campaign_node(search, search.best_node_id)
+        path_nodes = self._campaign_ancestry(search, best_node.node_id)[1:]
+        path_transitions = [
+            self._campaign_transition(search, node.incoming_transition_id or "")
+            for node in path_nodes
+        ]
+        steps = [
+            AgentPlanStep(
+                step_id=transition.transition_id,
+                type="execute",
+                tool=transition.tool,
+                action=transition.action,
+                resource_ref=transition.resource_ref,
+                arguments=transition.arguments,
+                expected_result="allowed",
+                status="VERIFIED",
+                sequence=index,
+                candidate_id=transition.transition_id,
+                selection_rationale="위험도 기반 Best-First Campaign 경로",
+                policy_decision="ALLOWED",
+                execution_status="EXECUTED",
+                verification_status="VERIFIED",
+                state_before={"fingerprint": transition.state_before_fingerprint},
+                state_after={"fingerprint": transition.state_after_fingerprint},
+                state_changes=transition.state_changes,
+                evidence_refs=transition.evidence_refs,
+                runtime_result=transition.runtime_result,
+                outcome=transition.outcome,
+            )
+            for index, transition in enumerate(path_transitions, start=1)
+        ]
+        last = path_transitions[-1]
+        run.worst_case_scenario = TbScenario(
+            scenario_id=f"campaign-{run.run_id}",
+            trust_boundary_id=last.trust_boundary_id,
+            risk_level="critical" if best_node.highest_impact_score >= 90 else "high",
+            risk_score=best_node.highest_impact_score,
+            objective="여러 Trust Boundary를 연쇄 통과한 최악 Campaign 경로",
+            impact=best_node.highest_impact,
+            steps=steps,
+            chain_id=f"campaign-{run.run_id}",
+            chain_status="COMPLETED" if search.search_complete else "PAUSED",
+            rollback_status="VERIFIED",
+        )
+        chain_payload = [
+            {
+                "tb": transition.trust_boundary_id,
+                "tool": transition.tool,
+                "action": transition.action,
+                "resource_ref": transition.resource_ref,
+                "arguments": transition.arguments,
+            }
+            for transition in path_transitions
+        ]
+        chain_hash = "sha256:" + hashlib.sha256(
+            json.dumps(chain_payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        run.attack_contract = AttackContract(
+            contract_id=f"contract-{uuid4().hex[:12]}",
+            trust_boundary_id=last.trust_boundary_id,
+            objective=run.worst_case_scenario.objective,
+            impact=best_node.highest_impact,
+            source_environment=path_transitions[0].source_environment,
+            target_environment=last.target_environment,
+            tool=last.tool,
+            action=last.action,
+            resource_ref=last.resource_ref,
+            arguments=last.arguments,
+            verifier="campaign_state_graph_verifier",
+            success_criteria=[
+                "모든 Campaign 전이가 허용됨",
+                "최종 영향이 독립 Verifier로 확인됨",
+                "루트 상태까지 역순 backtracking이 검증됨",
+            ],
+            rollback="transition resetter reverse order",
+            original_evidence_refs=list(
+                dict.fromkeys(
+                    ref for transition in path_transitions for ref in transition.evidence_refs
+                )
+            ),
+            maximum_profile_hash=run.profile_hash,
+            damage_score=DamageScore(
+                total=best_node.highest_impact_score,
+                impact=best_node.highest_impact_score,
+                proof=100,
+                blast_radius=min(100, 55 + 10 * len(best_node.controlled_environments)),
+                reproducibility=100,
+            ),
+            chain_hash=chain_hash,
+            chain_steps=[
+                FrozenAttackStep(
+                    sequence=index,
+                    tool=transition.tool,
+                    action=transition.action,
+                    resource_ref=transition.resource_ref,
+                    arguments=transition.arguments,
+                    selection_rationale="Campaign 그래프에서 검증된 최악 경로",
+                    expected_state_fingerprint=transition.state_after_fingerprint,
+                )
+                for index, transition in enumerate(path_transitions, start=1)
+            ],
+        )
+        run.permission_minimization = PermissionMinimizationResult(status="SKIPPED")
+        run.rollback_status = "VERIFIED"
+        self._event(
+            run,
+            "verifier",
+            "CAMPAIGN_FINISHED",
+            "최악 다중 경계 Campaign 경로와 역순 복구를 확정했습니다.",
+            {
+                "best_node_id": best_node.node_id,
+                "boundary_path": best_node.boundary_path,
+                "impact_score": best_node.highest_impact_score,
+                "chain_hash": chain_hash,
+            },
+        )
 
     def _execute_all(self, run: AgentRunRecord) -> None:
         run.agent_stage = "execute"
