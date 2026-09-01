@@ -349,6 +349,7 @@ def _remote_record(
     profile_hash: str,
     *,
     status: str,
+    scope: str = "host",
 ) -> AgentRunRecord:
     terminal = status in {"COMPLETED", "FAILED", "CANCELLED"}
     return AgentRunRecord(
@@ -360,6 +361,7 @@ def _remote_record(
         profile_hash=profile_hash,
         planner_mode="openrouter",
         planner_model="openai/gpt-5-mini",
+        scope=scope,
         events=[
             RunEvent(
                 sequence=1,
@@ -373,7 +375,7 @@ def _remote_record(
     )
 
 
-def test_remote_v5_post_returns_active_run_and_get_prefers_latest_remote_state(
+def test_remote_v7_post_returns_active_run_and_get_prefers_latest_remote_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -410,7 +412,7 @@ def test_remote_v5_post_returns_active_run_and_get_prefers_latest_remote_state(
             payload: dict[str, Any] = {
                 "status": "ok",
                 "planner": "openrouter",
-                "agent_run_api_version": "os-agent-orchestrator-v5",
+                "agent_run_api_version": "os-agent-orchestrator-v7",
             }
         elif method == "POST" and path == "/api/agent-runs":
             payload = active.model_dump(mode="json")

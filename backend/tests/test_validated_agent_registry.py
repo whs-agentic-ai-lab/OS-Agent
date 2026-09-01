@@ -31,7 +31,11 @@ from runtime_agent.validated_actions import (
     validated_action_names,
     validation_provenance,
 )
-from runtime_agent.validated_tool_registry import VALIDATED_ACTION_REGISTRY
+from runtime_agent.validated_tool_registry import (
+    VALIDATED_ACTION_REGISTRY,
+    candidate_arguments,
+    runtime_resource_paths,
+)
 
 
 def _payload(decision: dict, *, action_id: str = "targeted-action") -> dict:
@@ -117,6 +121,46 @@ def test_agent_surfaces_expose_378_attack_and_113_recon_only() -> None:
     assert len(by_name[RECON_FUNCTION_NAME]["x-recon-tools"]) == 113
     assert len(RECON_TOOL_CATALOG) == 113
     assert not NON_PASS_ACTIONS.intersection(VALIDATED_ACTION_REGISTRY)
+
+
+def test_docker_control_uses_disposable_registered_fixture() -> None:
+    registration = VALIDATED_ACTION_REGISTRY["docker.container_create.create"]
+
+    assert registration.resource_kind == "docker_socket"
+    assert registration.resource_refs == frozenset({"docker-engine-socket"})
+    assert candidate_arguments(registration) == {
+        "image_ref": "docker-fixture-image"
+    }
+    resources = runtime_resource_paths()
+    assert resources["docker-engine-socket"] == "/run/docker.sock"
+    assert resources["docker-fixture-image"]
+
+
+@pytest.mark.skipif(
+    not Path("/run/docker.sock").exists(),
+    reason="Docker control fixture requires a mounted engine socket",
+)
+def test_docker_control_fixture_is_verified_and_removed(monkeypatch) -> None:
+    monkeypatch.setenv("OS_AGENT_DOCKER_SOCKET_PATH", "/run/docker.sock")
+    monkeypatch.setenv("OS_AGENT_DOCKER_FIXTURE_IMAGE", "python:3.10-slim")
+
+    result = runtime.run(_payload({
+        "name": "docker.container_create",
+        "action": "create",
+        "resource_ref": "docker-engine-socket",
+        "arguments": {"image_ref": "docker-fixture-image"},
+    }))
+
+    assert result["outcome"] == "ALLOWED"
+    assert result["changed"] is True
+    assert result["temporary_changed"] is True
+    assert result["rollback_status"] == "VERIFIED"
+    assert any(
+        event["event_type"] == "TOOL_CONTRACT_COMPLETED"
+        and event["payload"]["verification_status"] == "VERIFIED"
+        and event["payload"]["rollback_status"] == "VERIFIED"
+        for event in result["events"]
+    )
 
 
 def test_registry_rejects_unknown_action_resource_and_raw_command() -> None:

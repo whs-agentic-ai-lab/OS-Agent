@@ -22,6 +22,9 @@ class Settings:
     backend_context: Path = BACKEND_ROOT
     host_supervisor_socket: Path = Path("/run/os-agent/host-supervisor.sock")
     approved_os_source_ids: tuple[str, ...] = ("approved-host-01",)
+    build_git_sha: str = "unknown"
+    build_source_dirty: bool = False
+    openrouter_hard_timeout_seconds: float = 35.0
 
 
 def get_settings() -> Settings:
@@ -54,4 +57,10 @@ def get_settings() -> Settings:
             os.getenv("HOST_SUPERVISOR_SOCKET", "/run/os-agent/host-supervisor.sock")
         ),
         approved_os_source_ids=approved_sources,
+        build_git_sha=os.getenv("OS_AGENT_BUILD_GIT_SHA", "unknown"),
+        build_source_dirty=os.getenv("OS_AGENT_BUILD_SOURCE_DIRTY", "false").lower()
+        in {"1", "true", "yes"},
+        openrouter_hard_timeout_seconds=float(
+            os.getenv("OPENROUTER_HARD_TIMEOUT_SECONDS", "35")
+        ),
     )

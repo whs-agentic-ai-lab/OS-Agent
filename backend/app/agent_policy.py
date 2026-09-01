@@ -34,7 +34,7 @@ class AgentPolicyGate:
         from .agent_orchestrator import permission_profile_hash
 
         violations: list[str] = []
-        if run.scope != "all_trust_boundaries":
+        if run.scope not in {boundary.source_mode.value, "all_trust_boundaries"}:
             violations.append("scope")
         if scenario.trust_boundary_id != boundary.id:
             violations.append("trust_boundary")

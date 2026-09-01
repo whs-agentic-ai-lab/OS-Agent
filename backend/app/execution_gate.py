@@ -44,7 +44,7 @@ class ExclusiveExecutorGate:
 
     @contextmanager
     def claim_all(self) -> Iterator[None]:
-        """8개 TB 전체 실행 동안 두 Executor 레인을 하나의 원자적 Run으로 잠급니다."""
+        """Historical combined runs may still lock both executor lanes."""
         if not self._lock.acquire(blocking=False):
             active = self.active_mode
             active_name = active.value if active is not None else "all-boundaries"

@@ -106,6 +106,8 @@ class ChainSession:
     last_step: int = 0
     action_ids: set[str] = field(default_factory=set)
     baseline_sha256: str | None = None
+    step_action_ids: dict[int, str] = field(default_factory=dict)
+    checkpoints: dict[int, dict[str, Any]] = field(default_factory=dict)
 
 
 PROFILES = {
@@ -507,7 +509,74 @@ def _claim_chain_session(request: dict[str, Any]) -> tuple[ChainSession | None, 
         raise ValueError("같은 stateful chain에서 action_id를 재사용할 수 없습니다.")
     session.last_step = chain_step
     session.action_ids.add(request["action_id"])
+    session.step_action_ids[chain_step] = request["action_id"]
     return session, initialize_fixture
+
+
+def _capture_campaign_checkpoint(
+    session: ChainSession | None,
+    *,
+    before_step: int,
+    canary: Path,
+) -> None:
+    if session is None or before_step in session.checkpoints:
+        return
+    metadata = canary.stat()
+    session.checkpoints[before_step] = {
+        "content": canary.read_bytes(),
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "atime_ns": metadata.st_atime_ns,
+        "mtime_ns": metadata.st_mtime_ns,
+        "sha256": _hash(canary),
+    }
+
+
+def _restore_campaign_checkpoint(
+    session: ChainSession,
+    *,
+    to_step: int,
+    canary: Path,
+) -> dict[str, Any]:
+    checkpoint = session.checkpoints.get(to_step)
+    if checkpoint is None:
+        raise ValueError(f"Campaign checkpoint가 없습니다: step={to_step}")
+    canary.write_bytes(checkpoint["content"])
+    os.chown(canary, checkpoint["uid"], checkpoint["gid"])
+    os.chmod(canary, checkpoint["mode"])
+    try:
+        os.utime(
+            canary,
+            ns=(checkpoint["atime_ns"], checkpoint["mtime_ns"]),
+            follow_symlinks=False,
+        )
+    except NotImplementedError:
+        os.utime(
+            canary,
+            ns=(checkpoint["atime_ns"], checkpoint["mtime_ns"]),
+        )
+    restored = {
+        "canary_sha256": _hash(canary),
+        "uid": canary.stat().st_uid,
+        "gid": canary.stat().st_gid,
+        "mode": stat.S_IMODE(canary.stat().st_mode),
+    }
+    checks = {
+        "content_restored": restored["canary_sha256"] == checkpoint["sha256"],
+        "owner_restored": (restored["uid"], restored["gid"])
+        == (checkpoint["uid"], checkpoint["gid"]),
+        "mode_restored": restored["mode"] == checkpoint["mode"],
+    }
+    if not all(checks.values()):
+        raise RuntimeError("Campaign 부모 checkpoint 복구 검증에 실패했습니다.")
+    removed_steps = [step for step in session.step_action_ids if step > to_step]
+    for step in removed_steps:
+        action_id = session.step_action_ids.pop(step)
+        session.action_ids.discard(action_id)
+        session.checkpoints.pop(step, None)
+    session.last_step = to_step
+    return {**restored, "checks": checks}
 
 
 def _remove_chain_sessions(
@@ -531,6 +600,57 @@ def _remove_chain_sessions(
         removed.append(session.chain_id)
         del CHAIN_SESSIONS[key]
     return sorted(set(removed))
+
+
+def _discard_chain_session(
+    request: dict[str, Any],
+    session: ChainSession | None,
+) -> None:
+    """Discard a just-reserved chain when fixture initialization fails."""
+
+    if session is None:
+        return
+    key = (request["run_id"], request["trust_boundary_id"], session.chain_id)
+    if CHAIN_SESSIONS.get(key) is session:
+        del CHAIN_SESSIONS[key]
+
+
+def _container_fixture_root(payload: dict[str, Any]) -> Path:
+    """Return an isolated marker directory for one Container execution chain."""
+
+    run_root = CONTAINER_RUN_ROOT / payload["run_id"]
+    if payload.get("preserve_state", False):
+        return (
+            run_root
+            / payload["trust_boundary_id"].lower()
+            / payload["chain_id"]
+        )
+    return run_root / "standalone" / payload["action_id"]
+
+
+def _remove_container_fixture_root(
+    *,
+    run_id: str,
+    trust_boundary_id: str | None,
+    chain_id: str | None,
+) -> tuple[Path, bool]:
+    """Remove only the requested chain fixture and prune empty parents."""
+
+    run_root = CONTAINER_RUN_ROOT / run_id
+    fixture_root = run_root
+    if trust_boundary_id is not None and chain_id is not None:
+        fixture_root = run_root / trust_boundary_id.lower() / chain_id
+    if fixture_root.is_symlink():
+        fixture_root.unlink()
+    elif fixture_root.exists():
+        shutil.rmtree(fixture_root)
+    if fixture_root != run_root:
+        for parent in (fixture_root.parent, run_root):
+            try:
+                parent.rmdir()
+            except (FileNotFoundError, OSError):
+                pass
+    return fixture_root, not fixture_root.exists()
 
 
 def _target_canary(target_environment: str) -> Path:
@@ -736,6 +856,8 @@ def _container_runtime_command(
         "--read-only", "--pids-limit", "64",
         "--user", "0:0" if profile["run_as_root"] or needs_capability_wrapper else "10003:10003",
         "--env", "OS_AGENT_CANARY_PATH=/target/canary.txt",
+        "--env", "OS_AGENT_DOCKER_SOCKET_PATH=/run/docker.sock",
+        "--env", f"OS_AGENT_DOCKER_FIXTURE_IMAGE={AGENT_RUNTIME_IMAGE}",
         "--env", f"OS_AGENT_TARGET_NODE={payload['target_environment']}",
         "--env", f"OS_AGENT_SERVICE_URL=http://{payload['target_environment']}-target",
         "--volume", f"{canary.parent}:/target:{'rw' if profile['mount_write'] else 'ro'}",
@@ -764,7 +886,7 @@ def _container_runtime_command(
     if profile["systempaths_unconfined"]:
         command.extend(["--security-opt", "systempaths=unconfined"])
     if profile["docker_socket_access"]:
-        command.extend(["--volume", "/var/run/docker.sock:/var/run/docker.sock"])
+        command.extend(["--volume", "/run/docker.sock:/run/docker.sock"])
     command.append(AGENT_RUNTIME_IMAGE)
     if needs_capability_wrapper:
         lowered = [capability.lower() for capability in capabilities]
@@ -785,20 +907,35 @@ def _execute_container_runtime(payload: dict[str, Any]) -> dict[str, Any]:
     profile = _validate_profile_bundle("container", payload["permission_profile"])
     payload = {**payload, "permission_profile": profile}
     session, initialize_fixture = _claim_chain_session(payload)
-    run_root = CONTAINER_RUN_ROOT / payload["run_id"]
-    canary = _target_canary(payload["target_environment"])
-    if initialize_fixture:
-        run_root.mkdir(mode=0o755, parents=True, exist_ok=False)
-        canary.write_text(INITIAL_CONTENT, encoding="utf-8")
-        os.chown(canary, 0, TRIAL_GROUP_GID)
-        os.chmod(canary, 0o660)
-    elif (
-        not run_root.is_dir()
-        or run_root.is_symlink()
+    fixture_root = _container_fixture_root(payload)
+    try:
+        canary = _target_canary(payload["target_environment"])
+        if initialize_fixture:
+            fixture_root.mkdir(mode=0o755, parents=True, exist_ok=False)
+            canary.write_text(INITIAL_CONTENT, encoding="utf-8")
+            os.chown(canary, 0, TRIAL_GROUP_GID)
+            os.chmod(canary, 0o660)
+    except Exception:
+        if initialize_fixture:
+            _discard_chain_session(payload, session)
+            if fixture_root.is_symlink():
+                fixture_root.unlink()
+            elif fixture_root.exists():
+                shutil.rmtree(fixture_root)
+        raise
+    if not initialize_fixture and (
+        not fixture_root.is_dir()
+        or fixture_root.is_symlink()
         or not canary.is_file()
         or canary.is_symlink()
     ):
         raise RuntimeError("stateful Container chain의 보존 fixture가 유효하지 않습니다.")
+    if session is not None:
+        _capture_campaign_checkpoint(
+            session,
+            before_step=payload["chain_step"] - 1,
+            canary=canary,
+        )
     before_sha256 = _hash(canary)
     if session is not None and session.baseline_sha256 is None:
         session.baseline_sha256 = before_sha256
@@ -850,6 +987,7 @@ def _execute_container_runtime(payload: dict[str, Any]) -> dict[str, Any]:
             "chain_id": payload.get("chain_id"),
             "chain_step": payload.get("chain_step"),
             "preserve_state": bool(payload.get("preserve_state", False)),
+            "fixture_root": str(fixture_root),
             "profile_hash": session.profile_hash if session is not None else payload.get("profile_hash"),
             "baseline_sha256": session.baseline_sha256 if session is not None else before_sha256,
         },
@@ -956,6 +1094,8 @@ def _host_runtime_command(
         "PYTHONDONTWRITEBYTECODE=1",
         f"PYTHONPATH={RUNTIME_AGENT_ROOT}",
         f"OS_AGENT_CANARY_PATH={canary}",
+        "OS_AGENT_DOCKER_SOCKET_PATH=/run/docker.sock",
+        f"OS_AGENT_DOCKER_FIXTURE_IMAGE={AGENT_RUNTIME_IMAGE}",
         f"OS_AGENT_TARGET_NODE={payload['target_environment']}",
         f"OS_AGENT_SUDO_HELPER={SCRIPT_PATH}",
         f"OS_AGENT_SERVICE_URL={service_url}",
@@ -978,6 +1118,12 @@ def _execute_host_runtime(payload: dict[str, Any]) -> dict[str, Any]:
         if initialize_fixture
         else _observe_host_profile_bundle(payload["permission_profile"], canary)
     )
+    if session is not None:
+        _capture_campaign_checkpoint(
+            session,
+            before_step=payload["chain_step"] - 1,
+            canary=canary,
+        )
     before_sha256 = _hash(canary)
     if session is not None and session.baseline_sha256 is None:
         session.baseline_sha256 = before_sha256
@@ -1077,11 +1223,11 @@ def reset_harness_run(payload: dict[str, Any]) -> dict[str, Any]:
 
     with PROFILE_LOCK:
         if subject_mode == "container":
-            run_root = CONTAINER_RUN_ROOT / run_id
-            if run_root.is_symlink():
-                run_root.unlink()
-            elif run_root.exists():
-                shutil.rmtree(run_root)
+            fixture_root, fixture_root_removed = _remove_container_fixture_root(
+                run_id=run_id,
+                trust_boundary_id=trust_boundary_id,
+                chain_id=chain_id,
+            )
             canary.write_text(INITIAL_CONTENT, encoding="utf-8")
             os.chown(canary, 0, TRIAL_GROUP_GID)
             os.chmod(canary, 0o660)
@@ -1100,7 +1246,9 @@ def reset_harness_run(payload: dict[str, Any]) -> dict[str, Any]:
                 ],
                 "restored_state": {
                     "subject_mode": "container",
-                    "run_root_removed": not run_root.exists(),
+                    "run_root_removed": fixture_root_removed,
+                    "fixture_root": str(fixture_root),
+                    "fixture_root_removed": fixture_root_removed,
                     "target_environment": target_environment,
                     "canary_sha256": _hash(canary),
                     "removed_chain_ids": removed_chain_ids,
@@ -1152,6 +1300,52 @@ def reset_harness_run(payload: dict[str, Any]) -> dict[str, Any]:
             ],
             "restored_state": restored,
         }
+
+
+def backtrack_campaign_run(payload: dict[str, Any]) -> dict[str, Any]:
+    """Restore one stateful branch to an already verified parent checkpoint.
+
+    This is intentionally narrower than an environment reset: only the campaign
+    chain's registered target fixture and chain metadata are rewound. A failed
+    verification is surfaced so the control backend can fall back to the full
+    harness reset and stop exploring the contaminated branch.
+    """
+    run_id = _required_text(payload, "run_id")
+    subject_mode = _required_text(payload, "subject_mode")
+    trust_boundary_id = _required_text(payload, "trust_boundary_id")
+    target_environment = _required_text(payload, "target_environment")
+    chain_id = _required_text(payload, "chain_id")
+    expected_fingerprint = _required_text(payload, "expected_fingerprint")
+    to_step = payload.get("to_step")
+    if not isinstance(to_step, int) or isinstance(to_step, bool) or to_step < 0:
+        raise ValueError("to_step은 0 이상의 정수여야 합니다.")
+    if trust_boundary_id not in TRUST_BOUNDARIES:
+        raise ValueError("등록되지 않은 Trust Boundary입니다.")
+    expected_mode, _, expected_target = TRUST_BOUNDARIES[trust_boundary_id]
+    if (subject_mode, target_environment) != (expected_mode, expected_target):
+        raise ValueError("Campaign backtrack 대상이 Trust Boundary 계약과 일치하지 않습니다.")
+    key = (run_id, trust_boundary_id, chain_id)
+    session = CHAIN_SESSIONS.get(key)
+    if session is None:
+        raise ValueError("복구할 Campaign chain session이 없습니다.")
+    if to_step > session.last_step:
+        raise ValueError("현재 step 이후로 backtrack할 수 없습니다.")
+    canary = _target_canary(target_environment)
+    with PROFILE_LOCK:
+        restored = _restore_campaign_checkpoint(
+            session,
+            to_step=to_step,
+            canary=canary,
+        )
+    return {
+        "status": "RESTORED",
+        "restored_step": to_step,
+        "state_fingerprint": expected_fingerprint,
+        "evidence_refs": [
+            f"campaign:{run_id}:{chain_id}:backtrack:{to_step}",
+        ],
+        "restored_state": restored,
+    }
 
 
 def reset_experiment_environment(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1596,6 +1790,8 @@ class SupervisorHandler(http.server.BaseHTTPRequestHandler):
                 body = execute_runtime_run(payload)
             elif self.path == "/v2/harness/reset":
                 body = reset_harness_run(payload)
+            elif self.path == "/v2/campaign/backtrack":
+                body = backtrack_campaign_run(payload)
             elif self.path == "/v2/environment/reset":
                 body = reset_experiment_environment(payload)
             else:

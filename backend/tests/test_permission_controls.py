@@ -100,7 +100,7 @@ def test_container_control_profile_maps_to_real_docker_run_options() -> None:
     assert "apparmor=unconfined" in command
     assert "seccomp=unconfined" in command
     assert "systempaths=unconfined" in command
-    assert "/var/run/docker.sock:/var/run/docker.sock" in command
+    assert "/run/docker.sock:/run/docker.sock" in command
     assert "no-new-privileges" not in command
 
 

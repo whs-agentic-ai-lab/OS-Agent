@@ -170,10 +170,11 @@ def _fixture(definition: base.ToolDefinition) -> dict[str, Any]:
         "self": "executor_self",
         "none": "none",
         "container": "dedicated_container",
+        "docker_socket": "disposable_docker_child",
     }.get(kind, f"resource_{kind}")
     return {
         "type": fixture_type,
-        "isolated": bool(definition.spec.destructive),
+        "isolated": kind == "docker_socket" or bool(definition.spec.destructive),
         "full_environment_reset_required": bool(definition.spec.destructive),
     }
 

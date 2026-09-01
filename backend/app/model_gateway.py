@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+from queue import Empty, Queue
+from threading import Thread
 from typing import Any
 
 import httpx
@@ -21,6 +23,10 @@ SUPPORTED_OPENROUTER_MODELS = {
     "z-ai/glm-5.3-flash",
     "deepseek/deepseek-v4-flash-0731",
 }
+
+
+class OpenRouterHardTimeoutError(TimeoutError):
+    """Raised by the process-local deadline even if the HTTP client is stuck."""
 
 
 ATTACK_FUNCTION_NAME = "validated_attack"
@@ -115,9 +121,6 @@ FINISH_CHAIN_SCHEMA = {
 }
 
 
-TEAM_CONTRACT_BOUNDARIES = frozenset({"TB-HH-U1U2", "TB-CC-C1C2"})
-
-
 def tool_schemas_for_boundary(boundary: TrustBoundaryOption) -> list[dict[str, Any]]:
     """Return the two generic Agent surfaces; registries do final validation."""
     del boundary
@@ -148,6 +151,34 @@ class ModelGateway:
     def __init__(self, settings: Settings) -> None:
         self.api_key = settings.openrouter_api_key
         self.model = settings.openrouter_model
+        self.hard_timeout_seconds = settings.openrouter_hard_timeout_seconds
+
+    def _post(self, **kwargs: Any) -> httpx.Response:
+        """Run OpenRouter behind a deadline independent from httpx timeouts.
+
+        The request thread is daemonized so a broken transport cannot hold the
+        orchestrator or process shutdown indefinitely. The normal httpx timeout
+        still closes network resources in the common case.
+        """
+        result: Queue[tuple[bool, Any]] = Queue(maxsize=1)
+
+        def invoke() -> None:
+            try:
+                result.put((True, httpx.post(**kwargs)))
+            except BaseException as exc:  # propagate the original client error
+                result.put((False, exc))
+
+        worker = Thread(target=invoke, name="openrouter-request", daemon=True)
+        worker.start()
+        try:
+            succeeded, value = result.get(timeout=self.hard_timeout_seconds)
+        except Empty as exc:
+            raise OpenRouterHardTimeoutError(
+                f"OpenRouter hard timeout exceeded ({self.hard_timeout_seconds:g}s)"
+            ) from exc
+        if succeeded:
+            return value
+        raise value
 
     @property
     def planner_mode(self) -> str:
@@ -164,8 +195,8 @@ class ModelGateway:
 
         selected_model = self.resolve_model(model)
 
-        response = httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+        response = self._post(
+            url="https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -222,8 +253,8 @@ class ModelGateway:
 
         selected_model = self.resolve_model(model)
         try:
-            response = httpx.post(
-                "https://openrouter.ai/api/v1/chat/completions",
+            response = self._post(
+                url="https://openrouter.ai/api/v1/chat/completions",
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
@@ -265,7 +296,14 @@ class ModelGateway:
             arguments = function.get("arguments", {})
             if isinstance(arguments, str):
                 arguments = json.loads(arguments)
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+        except (
+            OpenRouterHardTimeoutError,
+            httpx.HTTPError,
+            KeyError,
+            IndexError,
+            TypeError,
+            json.JSONDecodeError,
+        ):
             return self._frontier_fallback(prompt, "OpenRouter 응답을 구조화된 행동으로 해석할 수 없었습니다.")
 
         if function_name == "finish_attack_chain":
@@ -350,8 +388,8 @@ class ModelGateway:
             return fallback
         selected_model = self.resolve_model(model)
         try:
-            response = httpx.post(
-                "https://openrouter.ai/api/v1/chat/completions",
+            response = self._post(
+                url="https://openrouter.ai/api/v1/chat/completions",
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
@@ -422,7 +460,14 @@ class ModelGateway:
             if not isinstance(selected, list) or any(item not in available_ids for item in selected):
                 raise TypeError("invalid permission ids")
             return list(dict.fromkeys(selected))
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+        except (
+            OpenRouterHardTimeoutError,
+            httpx.HTTPError,
+            KeyError,
+            IndexError,
+            TypeError,
+            json.JSONDecodeError,
+        ):
             return fallback
 
     @classmethod

@@ -28,6 +28,7 @@ _RESOURCE_REFS_BY_KIND: dict[str, frozenset[str]] = {
     "none": frozenset({"executor-self"}),
     "self": frozenset({"executor-self"}),
     "path": frozenset({"target-canary"}),
+    "docker_socket": frozenset({"docker-engine-socket"}),
     "pid": frozenset({"executor-self"}),
     "fd": frozenset({"executor-self"}),
     "service": frozenset({"target-service"}),
@@ -35,7 +36,8 @@ _RESOURCE_REFS_BY_KIND: dict[str, frozenset[str]] = {
 }
 _REGISTERED_REFERENCE_NAMES = frozenset({
     "target-canary", "executor-self", "identity-root",
-    "target-service", "target-container",
+    "target-service", "target-container", "docker-engine-socket",
+    "docker-fixture-image",
 })
 
 
@@ -302,7 +304,9 @@ def candidate_arguments(
                 values[name] = "identity-root"
             elif "service" in name:
                 values[name] = "target-service"
-            elif "container" in name or "image" in name:
+            elif "image" in name:
+                values[name] = "docker-fixture-image"
+            elif "container" in name:
                 values[name] = "target-container"
             else:
                 values[name] = "target-canary"
@@ -332,6 +336,12 @@ def runtime_resource_paths() -> dict[str, str | int]:
         "identity-root": 0,
         "target-service": "os-agent-validation.service",
         "target-container": "os-agent-validation",
+        "docker-engine-socket": os.getenv(
+            "OS_AGENT_DOCKER_SOCKET_PATH", "/run/docker.sock"
+        ),
+        "docker-fixture-image": os.getenv(
+            "OS_AGENT_DOCKER_FIXTURE_IMAGE", "os-agent-backend:latest"
+        ),
     }
     return fixed
 

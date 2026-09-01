@@ -216,6 +216,31 @@ def test_openrouter_gateway_rejects_models_outside_the_dashboard_allowlist(tmp_p
         gateway.resolve_model(None)
 
 
+def test_openrouter_hard_timeout_is_independent_from_httpx(monkeypatch, tmp_path) -> None:
+    import time
+
+    gateway = ModelGateway(
+        Settings(
+            openrouter_api_key="test-key",
+            openrouter_model="openai/gpt-5-mini",
+            allowed_origins=("http://127.0.0.1:5173",),
+            runtime_dir=tmp_path,
+            openrouter_hard_timeout_seconds=0.02,
+        )
+    )
+
+    def blocked_post(**_kwargs):
+        time.sleep(0.2)
+        raise AssertionError("late transport result must not reach the orchestrator")
+
+    monkeypatch.setattr("app.model_gateway.httpx.post", blocked_post)
+    started = time.monotonic()
+    result = gateway.next_action("{}", TRUST_BOUNDARIES[0])
+
+    assert time.monotonic() - started < 0.15
+    assert result.kind == "finish"
+
+
 def test_model_decision_rejects_schema_bypass_arguments() -> None:
     with pytest.raises(RuntimeError, match="outside the ToolDefinition schema"):
         ModelGateway._validate_decision(

@@ -41,6 +41,8 @@ const chainStatusCopy: Record<string, string> = {
 };
 
 const terminationReasonCopy: Record<string, string> = {
+  ALL_TRUST_BOUNDARIES_VERIFIED: "선택한 Trust Boundary의 target 변경과 복구를 모두 검증했습니다.",
+  ALL_TRUST_BOUNDARIES_AND_ENVIRONMENTS_VERIFIED: "선택한 경계 커버리지와 관련 환경을 누적 제어하는 다중 경계 경로를 검증했습니다.",
   MAX_IMPACT_VERIFIED: "등록된 피해 상한을 실제로 검증했습니다.",
   FRONTIER_EXHAUSTED: "새로운 상태로 이어지는 실행 가능 후보가 없습니다.",
   POLICY_FRONTIER_EXHAUSTED: "남은 후보가 모두 정책 검사에서 제외됐습니다.",
@@ -137,7 +139,7 @@ function ChainStepList({ idPrefix, steps }: { idPrefix: string; steps: AgentPlan
                 <div className="scenario-evidence">
                   <span>단계 증거</span>
                   <ul>
-                    {stepEvidence.map((evidence) => <li key={evidence}><code>{evidence}</code></li>)}
+                    {stepEvidence.map((evidence, evidenceIndex) => <li key={`${evidence}-${evidenceIndex}`}><code>{evidence}</code></li>)}
                   </ul>
                 </div>
               ) : null}
@@ -214,20 +216,21 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
     return (
       <section className="result-panel empty-state" aria-labelledby="result-title">
         <span className="section-index">03</span>
-        <h2 id="result-title">8개 TB 통합 판정</h2>
-        <p>권한 최대화부터 공격 목표 고정, 1-minimal 권한 검증까지 실행하면 결과가 표시됩니다.</p>
+        <h2 id="result-title">Campaign 그래프 통합 판정</h2>
+        <p>Recon 이후 전역 Frontier 탐색과 부모 상태 복구가 시작되면 결과가 표시됩니다.</p>
       </section>
     );
   }
 
   const worst = run.worst_case_scenario;
-  const resumeAvailable = run.tb_results.some((result) => result.scenario.search?.resume_available);
+  const resumeAvailable = run.campaign_search.status === "PAUSED"
+    && run.campaign_search.frontier_node_ids.length > 0;
   return (
     <section className="result-panel agent-result" aria-labelledby="result-title">
       <div className="section-heading compact">
         <div>
           <span className="section-index">03</span>
-          <h2 id="result-title">8개 TB 통합 판정</h2>
+          <h2 id="result-title">Campaign 그래프 통합 판정</h2>
         </div>
         <output
           aria-atomic="true"
@@ -249,10 +252,10 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
         <div className="chain-resume-card">
           <div>
             <strong>미완료 Frontier가 남아 있습니다.</strong>
-            <p>복구된 기준 상태에서 검증된 prefix를 replay한 뒤 다음 최적 Tool 선택부터 이어갑니다.</p>
+            <p>복구된 루트에서 보존한 전역 Frontier의 다음 최고 우선순위 노드부터 이어갑니다.</p>
           </div>
           <button type="button" onClick={onResume} disabled={isResuming}>
-            {isResuming ? "체인 재현·재개 중…" : "미완료 공격 체인 재개"}
+            {isResuming ? "Campaign 재개 중…" : "Campaign Frontier 재개"}
           </button>
         </div>
       ) : null}
@@ -260,7 +263,7 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
       <div className="profile-lock-card">
         <span>고정 profile_hash</span>
         <code title={run.profile_hash}>{shortHash(run.profile_hash)}</code>
-        <small>모든 TB 이벤트가 같은 해시를 사용합니다.</small>
+        <small>모든 Campaign 노드와 전이가 같은 권한 프로필을 사용합니다.</small>
       </div>
 
       <div className="planner-selection-card">
@@ -275,9 +278,9 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
 
       <div className="permission-pipeline" aria-label="권한 최소화 파이프라인">
         <div><span>01</span><strong>자동 수집</strong><small>{Object.values(run.fixed_permission_profiles.host).length + Object.values(run.fixed_permission_profiles.container).length} controls</small></div>
-        <div><span>02</span><strong>최대 권한 공격</strong><small>{run.tb_results.length} TB verified</small></div>
+        <div><span>02</span><strong>그래프 탐색</strong><small>{run.campaign_search.nodes.length} nodes</small></div>
         <div><span>03</span><strong>목표 고정</strong><small>{run.attack_contract ? run.attack_contract.trust_boundary_id : "없음"}</small></div>
-        <div><span>04</span><strong>권한 축소</strong><small>{run.permission_minimization.trials.length} trials</small></div>
+        <div><span>04</span><strong>상태 복구</strong><small>{run.campaign_search.backtrack_count} backtracks</small></div>
       </div>
 
       {run.attack_contract ? (
@@ -341,7 +344,11 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
           <>
             <strong>{worst.trust_boundary_id}</strong>
             <p>{worst.objective}</p>
-            <small>{worst.risk_level.toUpperCase()} · Risk {worst.risk_score}</small>
+            <small>
+              {worst.risk_level.toUpperCase()}
+              {` · 잠재 ${worst.potential_risk_score ?? worst.risk_score}`}
+              {` · 검증 ${worst.verified_impact_score ?? 0}`}
+            </small>
           </>
         ) : (
           <p>BROKEN으로 검증된 경로가 없습니다.</p>
@@ -353,39 +360,37 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
           <thead>
             <tr>
               <th>Trust Boundary</th>
-              <th>에이전트 테스트 시나리오</th>
-              <th>판정</th>
-              <th>위험</th>
-              <th>증명</th>
+              <th>실행 전이</th>
+              <th>상태</th>
+              <th>잠재 위험</th>
+              <th>검증 영향</th>
+              <th>순서</th>
               <th>복구</th>
             </tr>
           </thead>
           <tbody>
-            {run.tb_results.map((result) => (
-              <tr key={result.trust_boundary_id}>
+            {run.campaign_search.transitions.map((transition) => (
+              <tr key={transition.transition_id}>
                 <td>
-                  <strong>{result.trust_boundary_id}</strong>
-                  <small>{result.source_environment.toUpperCase()} → {result.target_environment.toUpperCase()}</small>
+                  <strong>{transition.trust_boundary_id}</strong>
+                  <small>{transition.source_environment.toUpperCase()} → {transition.target_environment.toUpperCase()}</small>
                 </td>
                 <td className="tb-scenario-preview">
-                  <strong>{result.scenario.objective}</strong>
-                  <small>
-                    {result.scenario.steps.length}단계
-                    {result.scenario.search ? ` · Frontier ${result.scenario.search.frontier_candidates}` : ""}
-                    {result.scenario.chain_status ? ` · ${readableStatus(result.scenario.chain_status)}` : ` · ${result.scenario.risk_level.toUpperCase()}`}
-                  </small>
+                  <strong>{transition.tool}:{transition.action}</strong>
+                  <small>{transition.resource_ref}</small>
                 </td>
-                <td><span className={`tb-verdict is-${result.verdict.toLowerCase()}`}>{verdictCopy[result.verdict]}</span></td>
-                <td>{result.risk_score}</td>
-                <td>{result.proof_level}</td>
-                <td>{result.rollback_status}</td>
+                <td>{transition.status}</td>
+                <td>{transition.potential_risk_score}</td>
+                <td>{transition.impact} · {transition.impact_score}</td>
+                <td>{transition.sequence}</td>
+                <td>{transition.rollback_status}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
 
-      <section className="scenario-section" aria-labelledby="scenario-title">
+      {run.tb_results.length > 0 ? <section className="scenario-section" aria-labelledby="scenario-title">
         <div className="scenario-section-heading">
           <div>
             <span>Autonomous attack plan</span>
@@ -420,7 +425,8 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
               <div className="scenario-body">
                 <dl className="scenario-metadata">
                   <div><dt>Scenario ID</dt><dd>{result.scenario.scenario_id}</dd></div>
-                  <div><dt>위험도</dt><dd>{result.scenario.risk_level.toUpperCase()} · {result.scenario.risk_score}</dd></div>
+                  <div><dt>잠재 위험</dt><dd>{result.scenario.risk_level.toUpperCase()} · {result.potential_risk_score ?? result.scenario.potential_risk_score ?? result.scenario.risk_score}</dd></div>
+                  <div><dt>검증 영향</dt><dd>{result.verified_impact_score ?? result.scenario.verified_impact_score ?? 0}</dd></div>
                   <div><dt>증명 수준</dt><dd>{result.proof_level}</dd></div>
                   <div><dt>시나리오 전체 복구</dt><dd>{result.scenario.rollback_status ?? result.rollback_status}</dd></div>
                   {result.scenario.chain_id ? <div><dt>Chain ID</dt><dd>{result.scenario.chain_id}</dd></div> : null}
@@ -472,7 +478,7 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
                   <div className="scenario-evidence">
                     <span>증거 참조</span>
                     <ul>
-                      {result.evidence_refs.map((evidence) => <li key={evidence}><code>{evidence}</code></li>)}
+                      {result.evidence_refs.map((evidence, evidenceIndex) => <li key={`${evidence}-${evidenceIndex}`}><code>{evidence}</code></li>)}
                     </ul>
                   </div>
                 ) : null}
@@ -480,7 +486,7 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
             </details>
           ))}
         </div>
-      </section>
+      </section> : null}
 
       {run.profile_warnings.length > 0 ? (
         <ul className="agent-warning-list">

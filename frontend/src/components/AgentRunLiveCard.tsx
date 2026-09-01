@@ -20,20 +20,22 @@ const stageLabels: Record<AgentRunRecord["agent_stage"], string> = {
   maximize: "최대 권한 적용",
   recon: "환경 정찰",
   analyze: "공격면 분석",
-  plan: "시나리오 계획",
-  execute: "누적 공격 체인 실행",
-  compare: "8개 경계 비교",
+  plan: "Campaign 루트 생성",
+  execute: "Campaign 그래프 탐색",
+  compare: "최고 위험 경로 선택",
   contract: "최악 경로 고정",
   minimize: "권한 최소화",
   reverify: "최종 재검증",
   finished: "실험 종료",
 };
 
-function currentBoundary(run: AgentRunRecord): string {
-  const running = run.tb_scenarios.find((scenario) => scenario.chain_status === "RUNNING");
-  if (running) return running.trust_boundary_id;
-  const latest = run.tb_scenarios.at(-1);
-  return latest?.trust_boundary_id ?? "준비 중";
+function currentNode(run: AgentRunRecord): string {
+  const current = run.campaign_search.nodes.find(
+    (node) => node.node_id === run.campaign_search.current_node_id,
+  );
+  return current
+    ? `${current.active_environment.toUpperCase()} · D${current.depth}`
+    : "루트 준비 중";
 }
 
 export function AgentRunLiveCard({ run, monitorError, onOpen }: AgentRunLiveCardProps) {
@@ -50,8 +52,9 @@ export function AgentRunLiveCard({ run, monitorError, onOpen }: AgentRunLiveCard
   const isLive = run.status === "RECEIVED"
     || run.status === "RUNNING"
     || (run.status === "CANCELLED" && run.completed_at === null);
-  const resolvedCount = Math.min(8, run.tb_results.length);
-  const progress = Math.round((resolvedCount / 8) * 100);
+  const nodeCount = run.campaign_search.nodes.length;
+  const nodeBudget = run.budget.max_campaign_nodes || 1;
+  const progress = Math.min(100, Math.round((nodeCount / nodeBudget) * 100));
   const latestEvent = run.events.at(-1);
 
   return (
@@ -71,11 +74,11 @@ export function AgentRunLiveCard({ run, monitorError, onOpen }: AgentRunLiveCard
         <div>
           <span>현재 Agent 단계</span>
           <strong>{stageLabels[run.agent_stage]}</strong>
-          <small>{currentBoundary(run)} · {resolvedCount}/8 TB 판정</small>
+          <small>{currentNode(run)} · {nodeCount} nodes · {run.campaign_search.frontier_node_ids.length} frontier</small>
         </div>
         <b>{progress}%</b>
       </div>
-      <div className="live-run-progress" role="progressbar" aria-label="Trust Boundary 완료율" aria-valuemin={0} aria-valuemax={8} aria-valuenow={resolvedCount}>
+      <div className="live-run-progress" role="progressbar" aria-label="Campaign 노드 예산 사용률" aria-valuemin={0} aria-valuemax={nodeBudget} aria-valuenow={nodeCount}>
         <span style={{ width: `${progress}%` }} />
       </div>
 

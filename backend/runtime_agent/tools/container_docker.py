@@ -822,7 +822,18 @@ def _build_container_object_definition(tool: str, action: str) -> ToolDefinition
     if tool == "docker.commit_export" and action == "export": required.add("output_ref")
     destructive = (tool == "docker.container_lifecycle" and action in {"kill", "remove"})
     return ToolDefinition(name, tool, action, handler, verifier, resetter,
-                          _container_spec(arg_schema=schema, required_args=frozenset(required), reversible=True, destructive=destructive))
+                          _container_spec(
+                              resource_kind=(
+                                  "docker_socket"
+                                  if tool == "docker.container_create"
+                                  and action == "create"
+                                  else _PATH
+                              ),
+                              arg_schema=schema,
+                              required_args=frozenset(required),
+                              reversible=True,
+                              destructive=destructive,
+                          ))
 
 
 def _read_limited(path: str, limit: int = 1 << 20) -> bytes:

@@ -138,6 +138,37 @@ class DeploymentManager:
         # 대시보드가 현재 상태 API를 조회할 때 실제 AWS 인벤토리를 갱신한다.
         self.refresh_prerequisites(discover_aws=False)
 
+    def _source_revision(self) -> tuple[str, bool]:
+        """Return the exact Git revision and whether the image context is dirty."""
+        repository = self.settings.backend_context.parent
+        try:
+            revision = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            status = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=no"],
+                cwd=repository,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return "unknown", False
+        sha = revision.stdout.strip() if revision.returncode == 0 else "unknown"
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            sha = "unknown"
+        return sha, status.returncode == 0 and bool(status.stdout.strip())
+
     def refresh_prerequisites(self, *, discover_aws: bool = True) -> DeploymentStatus:
         with self._lock:
             if self._status.status == "running":
@@ -583,6 +614,11 @@ class DeploymentManager:
                 log_output=False,
             )
             image_digests: dict[str, str] = {}
+            build_git_sha, build_source_dirty = self._source_revision()
+            self._append(
+                f"이미지 source revision: {build_git_sha}"
+                + (" (dirty working tree)" if build_source_dirty else "")
+            )
             for component, dockerfile in self.IMAGE_DOCKERFILES.items():
                 repository_url = str(repository_urls[component])
                 local_image = f"{environment.environment_id}-{component}:{tag}"
@@ -598,6 +634,10 @@ class DeploymentManager:
                         "build",
                         "--platform",
                         "linux/amd64",
+                        "--build-arg",
+                        f"OS_AGENT_BUILD_GIT_SHA={build_git_sha}",
+                        "--build-arg",
+                        "OS_AGENT_BUILD_SOURCE_DIRTY=" + str(build_source_dirty).lower(),
                         *build_context_args,
                         "--file",
                         str(self.settings.backend_context / dockerfile),

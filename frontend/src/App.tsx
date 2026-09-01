@@ -21,6 +21,7 @@ import {
   type ServiceConnection,
 } from './components/ConnectionStatus'
 import { DeploymentPanel } from './components/DeploymentPanel'
+import { EnvironmentSelector } from './components/EnvironmentSelector'
 import { AgentRunLiveCard } from './components/AgentRunLiveCard'
 import { AgentRunMonitorPage } from './components/AgentRunMonitorPage'
 import { ModelSelector } from './components/ModelSelector'
@@ -33,6 +34,7 @@ import type {
   HealthResponse,
   OptionsResponse,
   PlannerModelId,
+  SubjectModeId,
   TunnelStatus,
 } from './types'
 
@@ -98,6 +100,7 @@ export default function App() {
   const [plannerModel, setPlannerModel] = useState<PlannerModelId>(
     'deepseek/deepseek-v4-flash-0731',
   )
+  const [subjectMode, setSubjectMode] = useState<SubjectModeId>('host')
   const [environmentName, setEnvironmentName] = useState('')
   const [run, setRun] = useState<AgentRunRecord | null>(null)
   const [activeAgentRunTarget, setActiveAgentRunTarget] = useState<ActiveAgentRunTarget | null>(
@@ -295,8 +298,11 @@ export default function App() {
     deployment?.instances[0]?.instance_id ??
     null
 
-  const hostPermissionTests = options?.permission_tests.host ?? []
-  const containerPermissionTests = options?.permission_tests.container ?? []
+  const selectedPermissionTests = options?.permission_tests[subjectMode] ?? []
+  const selectedTrustBoundaries = options?.trust_boundaries.filter(
+    (boundary) => boundary.source_mode === subjectMode,
+  ) ?? []
+  const selectedEnvironmentLabel = subjectMode === 'host' ? 'U1 Host' : 'C1 Container'
   const backendConnected = Boolean(health) || Boolean(options)
   const connectionServices: ServiceConnection[] = [
     {
@@ -375,7 +381,7 @@ export default function App() {
     try {
       const result = await createAgentRun(
         {
-          scope: 'all_trust_boundaries',
+          scope: subjectMode,
           planner_model: plannerModel,
         },
         agentRemote,
@@ -388,7 +394,7 @@ export default function App() {
       setRunPollRevision((revision) => revision + 1)
       window.location.hash = agentMonitorHash(target)
     } catch (reason) {
-      setRunError(reason instanceof Error ? reason.message : '8개 TB 통합 실행 요청에 실패했습니다.')
+      setRunError(reason instanceof Error ? reason.message : `${selectedEnvironmentLabel} 경계 실행 요청에 실패했습니다.`)
     } finally {
       setIsRunning(false)
     }
@@ -703,8 +709,8 @@ export default function App() {
           </div>
           <div className="hero-aside">
             <p>
-              하나의 고정 EC2에서 Host·Container 권한을 함께 잠그고,
-              8개 Trust Boundary의 실제 침해 가능성과 최악 경로를 비교합니다.
+              하나의 고정 EC2에서 Host와 Container 실험을 분리하고,
+              선택한 실행 환경의 Trust Boundary만 검증합니다.
             </p>
             <dl>
               <div>
@@ -781,7 +787,7 @@ export default function App() {
             <div className="section-heading">
               <div>
                 <span className="section-index">02</span>
-                <h2 id="control-title">전체 경계 Agent 실험</h2>
+                <h2 id="control-title">{selectedEnvironmentLabel} 경계 Agent 실험</h2>
               </div>
               <span className="planner-mode">
                 {agentRemote ? 'EC2 via SSM' : 'SSM 연결 필요'}
@@ -794,6 +800,12 @@ export default function App() {
               </p>
             ) : options ? (
               <form onSubmit={submitRun}>
+                <EnvironmentSelector
+                  modes={options.subject_modes}
+                  onChange={setSubjectMode}
+                  selected={subjectMode}
+                />
+
                 <div className="runtime-path" aria-label="실제 Agent 실행 경로">
                   <div className={agentRemote ? 'is-ready' : 'is-waiting'}>
                     <span>01</span>
@@ -807,8 +819,8 @@ export default function App() {
                   </div>
                   <div className={agentRemote && health?.host_supervisor === 'connected' ? 'is-ready' : 'is-waiting'}>
                     <span>03</span>
-                    <strong>U1 + C1</strong>
-                    <small>8개 TB 순차 실행</small>
+                    <strong>{selectedEnvironmentLabel}</strong>
+                    <small>{selectedTrustBoundaries.length}개 TB 분리 실행</small>
                   </div>
                   <div className={agentRemote && health?.host_supervisor === 'connected' ? 'is-ready' : 'is-waiting'}>
                     <span>04</span>
@@ -818,11 +830,11 @@ export default function App() {
                 </div>
 
                 <div className="agent-scope-card">
-                  <span>고정 분석 범위</span>
-                  <strong>EC2 내부 Trust Boundary 8개 전체</strong>
-                  <p>등록된 권한을 자동으로 최대화해 공격 후보를 찾고, 성공한 최악 경로 하나를 고정한 뒤 같은 공격으로 최소 권한을 계산합니다.</p>
+                  <span>선택된 분석 범위</span>
+                  <strong>{selectedEnvironmentLabel} 출발 Trust Boundary {selectedTrustBoundaries.length}개</strong>
+                  <p>다른 실행 환경의 출발 경계는 이번 Run에서 제외합니다. 선택한 환경 안에서만 공격 후보와 최악 경로를 비교합니다.</p>
                   <div>
-                    {options.trust_boundaries.map((boundary) => <code key={boundary.id}>{boundary.label}</code>)}
+                    {selectedTrustBoundaries.map((boundary) => <code key={boundary.id}>{boundary.label}</code>)}
                   </div>
                 </div>
 
@@ -850,7 +862,7 @@ export default function App() {
                 <div className="autonomous-agent-card">
                   <span>Autonomous Attack Agent</span>
                   <strong>사용자 Prompt 없이 스스로 공격 가설과 실행 계획을 생성합니다.</strong>
-                  <p>고정 권한과 Recon 증거를 입력으로 받아 8개 TB별 최고 위험 시나리오를 계획하고, 검증 가능한 Tool만 실행합니다.</p>
+                  <p>선택한 {selectedEnvironmentLabel}의 고정 권한과 Recon 증거를 입력으로 받아 {selectedTrustBoundaries.length}개 TB의 최고 위험 시나리오를 계획합니다.</p>
                   <ol>
                     <li>권한 자동 수집·최대화</li>
                     <li>Recon과 공격 후보 생성</li>
@@ -863,7 +875,7 @@ export default function App() {
                 <div className="automatic-permission-card" aria-label="자동 권한 실험">
                   <span>Automatic permission experiment</span>
                   <strong>권한을 직접 고르지 않아도 됩니다.</strong>
-                  <p>프로그램이 Host {hostPermissionTests.length}개와 Container {containerPermissionTests.length}개 통제를 공격 가능 방향으로 합칩니다. 공격 성공 후에는 서비스 묶음 → 분할 → 단일 권한 순서로 자동 축소합니다.</p>
+                  <p>프로그램이 선택한 {selectedEnvironmentLabel}의 {selectedPermissionTests.length}개 통제를 공격 가능 방향으로 합칩니다. 공격 성공 후에는 서비스 묶음 → 분할 → 단일 권한 순서로 자동 축소합니다.</p>
                   <div>
                     <code>MAXIMUM</code>
                     <code>ATTACK CONTRACT</code>
@@ -885,8 +897,8 @@ export default function App() {
                     || health?.host_supervisor !== 'connected'
                     || Boolean(health?.active_executor)
                     || options.planner_mode !== 'openrouter'
-                    || hostPermissionTests.length === 0
-                    || containerPermissionTests.length === 0
+                    || selectedPermissionTests.length === 0
+                    || selectedTrustBoundaries.length === 0
                   }
                   type="submit"
                 >
@@ -901,7 +913,7 @@ export default function App() {
                             ? 'Runtime 준비 상태를 확인하세요'
                             : options.planner_mode !== 'openrouter'
                               ? 'OpenRouter AI 연결이 필요합니다'
-                              : '자율 공격·최소 권한 실험 실행'}
+                              : `${selectedEnvironmentLabel} ${selectedTrustBoundaries.length}개 경계 실험 실행`}
                   </span>
                   <span aria-hidden="true">↗</span>
                 </button>
@@ -964,7 +976,7 @@ export default function App() {
           <strong>OS Agent Minimum Test</strong>
           <p>로컬 대시보드 · 고정 AWS 인프라 · 백엔드 통제 실행</p>
         </div>
-        <span>Agent Orchestrator v3 · OpenRouter AI · EC2 via SSM</span>
+        <span>Agent Orchestrator v7 · OpenRouter AI · EC2 via SSM</span>
       </footer>
     </div>
   )

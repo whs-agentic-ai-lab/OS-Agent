@@ -1,7 +1,7 @@
 {
   "schema_version": "validated-manifest-fingerprint-v1",
   "authority": "validation/tool-manifest.json canonical action contracts",
-  "manifest_inventory_sha256": "sha256:e9ca963cb31a3b0bbaf67d3fa56716428058f8ccc9ba1e3dc7fc1496b51ee22d",
+  "manifest_inventory_sha256": "sha256:dfe2b2f28d97c13b643cebb1c81de5ba8f0f9d5bdc77b5581d3bb043bf88ca6e",
   "action_names_sha256": "sha256:401fd7468888192238905ce5d9949416b1de6d737fca38ad2910f1ddbf4ead53",
   "tools": 129,
   "actions": 383,

@@ -264,6 +264,24 @@ class RuntimeResetResult(BaseModel):
     restored_state: dict[str, Any] = Field(default_factory=dict)
 
 
+class RuntimeBacktrackRequest(BaseModel):
+    run_id: str
+    subject_mode: SubjectMode
+    trust_boundary_id: str
+    target_environment: EnvironmentNode
+    chain_id: str
+    to_step: int = Field(ge=0)
+    expected_fingerprint: str
+
+
+class RuntimeBacktrackResult(BaseModel):
+    status: Literal["RESTORED", "RESTORE_FAILED"]
+    restored_step: int = Field(ge=0)
+    state_fingerprint: str
+    evidence_refs: list[str] = Field(default_factory=list)
+    restored_state: dict[str, Any] = Field(default_factory=dict)
+
+
 class ExperimentEnvironmentResetRequest(BaseModel):
     confirmation: Literal["RESET_EXPERIMENT_ENVIRONMENT"]
 
@@ -422,6 +440,9 @@ class AgentBudget(BaseModel):
     max_changed_targets_per_tb: int = Field(default=1, ge=1, le=1)
     max_output_bytes_per_tool: int = Field(default=65536, ge=1024, le=65536)
     max_minimization_trials: int = Field(default=64, ge=1, le=128)
+    max_campaign_nodes: int = Field(default=96, ge=8, le=1024)
+    max_campaign_depth: int = Field(default=8, ge=1, le=32)
+    campaign_beam_width: int = Field(default=6, ge=1, le=32)
 
 
 class FixedPermissionProfiles(BaseModel):
@@ -451,7 +472,7 @@ class FixedPermissionProfiles(BaseModel):
 class AgentRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    scope: Literal["all_trust_boundaries"] = "all_trust_boundaries"
+    scope: Literal["host", "container"] = "host"
     planner_model: PlannerModel | None = None
     budget: AgentBudget = Field(default_factory=AgentBudget)
 
@@ -467,6 +488,7 @@ class DamageScore(BaseModel):
 class FrozenAttackStep(BaseModel):
     sequence: int = Field(ge=1)
     step_id: str = "contract-step"
+    trust_boundary_id: str = ""
     type: Literal["execute"] = "execute"
     tool: str
     action: str
@@ -476,6 +498,7 @@ class FrozenAttackStep(BaseModel):
     status: str = "FROZEN"
     selection_rationale: str = ""
     expected_state_fingerprint: str | None = None
+    required_impact_score: int = Field(default=1, ge=0, le=100)
 
 
 class AttackContract(BaseModel):
@@ -596,6 +619,8 @@ class TbScenario(BaseModel):
     trust_boundary_id: str
     risk_level: Literal["critical", "high", "medium", "low"]
     risk_score: int = Field(ge=0, le=100)
+    potential_risk_score: int | None = Field(default=None, ge=0, le=100)
+    verified_impact_score: int = Field(default=0, ge=0, le=100)
     objective: str
     impact: str
     tool_implemented: bool = True
@@ -604,6 +629,12 @@ class TbScenario(BaseModel):
     chain_status: Literal["PENDING", "RUNNING", "COMPLETED", "PAUSED", "FAILED"] = "PENDING"
     search: ChainSearchProgress = Field(default_factory=ChainSearchProgress)
     rollback_status: Literal["NOT_REQUIRED", "VERIFIED", "FAILED"] = "NOT_REQUIRED"
+
+    @model_validator(mode="after")
+    def populate_explicit_risk_scores(self) -> "TbScenario":
+        if self.potential_risk_score is None:
+            self.potential_risk_score = self.risk_score
+        return self
 
 
 class TbResult(BaseModel):
@@ -616,6 +647,8 @@ class TbResult(BaseModel):
     fixed_permissions_used: list[str] = Field(default_factory=list)
     effective_identity: dict[str, Any] = Field(default_factory=dict)
     risk_score: int = Field(ge=0, le=100)
+    potential_risk_score: int | None = Field(default=None, ge=0, le=100)
+    verified_impact_score: int = Field(default=0, ge=0, le=100)
     proof_level: Literal[
         "L0_INFERRED",
         "L1_REACHABLE",
@@ -629,6 +662,12 @@ class TbResult(BaseModel):
     runtime_result: Literal["allowed", "denied", "error"] | None = None
     explanation: str
 
+    @model_validator(mode="after")
+    def populate_explicit_risk_scores(self) -> "TbResult":
+        if self.potential_risk_score is None:
+            self.potential_risk_score = self.scenario.potential_risk_score
+        return self
+
 
 class AgentRunSummary(BaseModel):
     broken: int = 0
@@ -636,10 +675,88 @@ class AgentRunSummary(BaseModel):
     inconclusive: int = 0
 
 
+class CampaignNode(BaseModel):
+    node_id: str
+    parent_node_id: str | None = None
+    incoming_transition_id: str | None = None
+    depth: int = Field(default=0, ge=0)
+    status: Literal[
+        "QUEUED", "EXPLORING", "IMPACT_VERIFIED", "BLOCKED", "PRUNED",
+        "BACKTRACKING", "ROLLED_BACK", "ERROR",
+    ] = "QUEUED"
+    active_environment: EnvironmentNode
+    controlled_environments: list[EnvironmentNode] = Field(default_factory=list)
+    effective_identities: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    state_fingerprint: str
+    boundary_path: list[str] = Field(default_factory=list)
+    highest_impact: str = "none"
+    highest_impact_score: int = Field(default=0, ge=0, le=100)
+    priority_score: float = 0
+    cumulative_cost: int = Field(default=0, ge=0)
+    evidence_refs: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class CampaignTransition(BaseModel):
+    transition_id: str
+    from_node_id: str
+    to_node_id: str | None = None
+    trust_boundary_id: str
+    source_environment: EnvironmentNode
+    target_environment: EnvironmentNode
+    tool: str
+    action: str
+    resource_ref: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    status: Literal[
+        "QUEUED", "RUNNING", "VERIFIED", "BLOCKED", "FAILED", "PRUNED",
+        "BACKTRACKING", "ROLLED_BACK",
+    ] = "QUEUED"
+    runtime_result: Literal["allowed", "denied", "error"] | None = None
+    outcome: Literal["ALLOWED", "OS_DENIED", "ERROR", "POLICY_BLOCKED"] | None = None
+    impact: str = "none"
+    potential_risk_score: int = Field(default=0, ge=0, le=100)
+    impact_score: int = Field(default=0, ge=0, le=100)
+    state_before_fingerprint: str = ""
+    state_after_fingerprint: str = ""
+    state_changes: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    rollback_status: Literal["NOT_REQUIRED", "VERIFIED", "FAILED"] = "NOT_REQUIRED"
+    prune_reason: str | None = None
+    sequence: int = Field(default=0, ge=0)
+    chain_id: str = ""
+    chain_step: int = Field(default=1, ge=1)
+
+
+class CampaignSearchState(BaseModel):
+    status: Literal["PENDING", "RUNNING", "PAUSED", "COMPLETED", "FAILED"] = "PENDING"
+    root_node_id: str | None = None
+    current_node_id: str | None = None
+    best_node_id: str | None = None
+    nodes: list[CampaignNode] = Field(default_factory=list)
+    transitions: list[CampaignTransition] = Field(default_factory=list)
+    frontier_node_ids: list[str] = Field(default_factory=list)
+    explored_nodes: int = 0
+    pruned_nodes: int = 0
+    backtrack_count: int = 0
+    tool_calls_used: int = 0
+    planner_calls_used: int = 0
+    best_impact_score: int = Field(default=0, ge=0, le=100)
+    boundary_coverage_complete: bool = False
+    deepest_verified_depth: int = Field(default=0, ge=0)
+    max_controlled_environment_count: int = Field(default=1, ge=1)
+    termination_reason: str | None = None
+    termination_explanation: str | None = None
+    search_complete: bool = False
+
+
 class AgentRunRecord(BaseModel):
     run_id: str
     objective: str
-    scope: Literal["all_trust_boundaries"] = "all_trust_boundaries"
+    # all_trust_boundaries is retained only so historical Supabase rows remain
+    # readable. New AgentRunRequest values must select one executor environment.
+    scope: Literal["host", "container", "all_trust_boundaries"] = "all_trust_boundaries"
     status: Literal[
         "RECEIVED", "RUNNING", "PAUSED", "COMPLETED", "FAILED", "CANCELLED"
     ] = "RECEIVED"
@@ -655,6 +772,7 @@ class AgentRunRecord(BaseModel):
     findings: list[AgentFinding] = Field(default_factory=list)
     tb_scenarios: list[TbScenario] = Field(default_factory=list)
     tb_results: list[TbResult] = Field(default_factory=list)
+    campaign_search: CampaignSearchState = Field(default_factory=CampaignSearchState)
     worst_case_scenario: TbScenario | None = None
     attack_contract: AttackContract | None = None
     permission_minimization: PermissionMinimizationResult = Field(

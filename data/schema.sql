@@ -195,11 +195,11 @@ grant select, insert, update, delete on table public.container_executor_runs to 
 grant select, insert, update, delete on table public.host_executor_run_events to service_role;
 grant select, insert, update, delete on table public.container_executor_run_events to service_role;
 
--- 8개 Trust Boundary 전체를 하나의 고정 profile_hash로 실행하는 AgentRun 저장소.
+-- Host 또는 Container 출발 경계를 분리 실행하는 AgentRun 저장소.
 create table if not exists public.agent_runs (
   run_id text primary key,
   objective text not null,
-  scope text not null check (scope = 'all_trust_boundaries'),
+  scope text not null check (scope in ('host', 'container', 'all_trust_boundaries')),
   status text not null check (status in ('RECEIVED', 'RUNNING', 'PAUSED', 'COMPLETED', 'FAILED', 'CANCELLED')),
   agent_stage text not null check (agent_stage in ('profile', 'maximize', 'recon', 'analyze', 'plan', 'execute', 'compare', 'contract', 'minimize', 'reverify', 'finished')),
   fixed_permission_profiles jsonb not null,
@@ -210,6 +210,7 @@ create table if not exists public.agent_runs (
   findings jsonb not null default '[]'::jsonb,
   tb_scenarios jsonb not null default '[]'::jsonb,
   tb_results jsonb not null default '[]'::jsonb,
+  campaign_search jsonb not null default '{}'::jsonb,
   worst_case_scenario jsonb,
   attack_contract jsonb,
   permission_minimization jsonb not null default '{}'::jsonb,
@@ -224,6 +225,7 @@ create table if not exists public.agent_runs (
   completed_at timestamptz
 );
 alter table public.agent_runs add column if not exists objective text;
+alter table public.agent_runs add column if not exists campaign_search jsonb not null default '{}'::jsonb;
 update public.agent_runs
 set objective = '고정 권한과 Recon 증거를 기반으로 8개 Trust Boundary를 자율 검증한다.'
 where objective is null;
