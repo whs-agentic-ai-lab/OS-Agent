@@ -1,24 +1,7 @@
 {
   "schema_version": "tool-validation-v1",
-  "generated_at": "2026-08-29T14:37:26.551833+00:00",
+  "generated_at": "2026-08-31T14:05:14.484839+00:00",
   "authority": "not-verified-tool branch runtime_agent.tools ToolDefinition registry",
-  "canonical_provenance": {
-    "migration_type": "source_hash_line_ending_normalization",
-    "legacy_validation_hash": "sha256:42c76ab03421f7ff79b9e992bbc2b59e9ea2f290882b0c0b87c77d6b5eb14246",
-    "canonical_source_hash": "sha256:70b4e9e62ce442f539e04675c02fc2c6bf5c9401eab478b4e510fa7ffd8f170f",
-    "manifest_inventory_hash": "sha256:e9ca963cb31a3b0bbaf67d3fa56716428058f8ccc9ba1e3dc7fc1496b51ee22d",
-    "validation_branch": "origin/not-verified-tool",
-    "validation_branch_commit_sha": "07358c1f45579e6acb79961061d9c9fb67f33a99",
-    "recon_branch_commit_sha": "9a00cfc10b4faf0c637c54b8f9ac36d18fcae0b9",
-    "main_commit_sha": "fab08a414f372674238693665b5ae5b68b4fc260",
-    "tool_source_diff_from_validation_branch": false,
-    "recon_source_diff_from_recon_branch": false,
-    "inventory_129_tools_383_actions_matches": true,
-    "non_pass_five_matches": true,
-    "validation_run_id": "tool-validation-3bc32759b2a2",
-    "validation_image_digest": "sha256:de40c307b18defb084caa7baee3f34ca6c327adbcc8df7f229bab9369162d0c6",
-    "reason": "The legacy digest hashed checkout bytes and changed across CRLF/LF. The canonical digest normalizes Git text, uses POSIX relative paths, includes file membership, and sorts deterministically. No new live validation was performed."
-  },
   "summary": {
     "tools": 129,
     "actions": 383,
@@ -2266,7 +2249,7 @@
             "TB-CC-C1C2",
             "TB-HH-U1U2"
           ],
-          "resource_kind": "path",
+          "resource_kind": "docker_socket",
           "argument_schema": {
             "blkio_weight": "_ForbiddenRawArgument",
             "container": "_ForbiddenRawArgument",
@@ -2300,8 +2283,8 @@
           "verifier": "runtime_agent.tools.container_docker._build_container_object_definition.<locals>.verifier",
           "resetter": "runtime_agent.tools.container_docker._build_container_object_definition.<locals>.resetter",
           "required_fixture": {
-            "type": "dedicated_path",
-            "isolated": false,
+            "type": "disposable_docker_child",
+            "isolated": true,
             "full_environment_reset_required": false
           },
           "mutation_class": "state-changing",
@@ -2309,7 +2292,7 @@
             "TB-CC-C1C2",
             "TB-HH-U1U2"
           ],
-          "code_hash": "sha256:33b5edfdf8417fe15f0ca3bc6e9cd10fce0f986974b029dfa384858ea4d4c66b"
+          "code_hash": "sha256:d0e718c39bd5f40801769c79ae52f9f898506aac984665e5eabb0c18f6193352"
         }
       ],
       "certification_status": "DEFINED"
@@ -5115,6 +5098,12 @@
           ],
           "allowed_tbs": [
             "TB-CC-C1C2",
+            "TB-CC-C1C3",
+            "TB-HC-C1U1",
+            "TB-HC-C1U2",
+            "TB-HC-U1C1",
+            "TB-HC-U1C2",
+            "TB-HC-U1C3",
             "TB-HH-U1U2"
           ],
           "resource_kind": "path",
@@ -5145,9 +5134,15 @@
           "mutation_class": "state-changing",
           "effective_allowed_tbs": [
             "TB-CC-C1C2",
+            "TB-CC-C1C3",
+            "TB-HC-C1U1",
+            "TB-HC-C1U2",
+            "TB-HC-U1C1",
+            "TB-HC-U1C2",
+            "TB-HC-U1C3",
             "TB-HH-U1U2"
           ],
-          "code_hash": "sha256:80f87b1ba758faf6cd05ff21b8675b3ddab213ebe065c9dd4190a2f4e3f828ef"
+          "code_hash": "sha256:c6a0642649fbcf64872aee2be19c22390d5a241efee1a48a94966ec0df3b4334"
         }
       ],
       "certification_status": "DEFINED"
@@ -20869,7 +20864,7 @@
         "TB-CC-C1C2",
         "TB-HH-U1U2"
       ],
-      "resource_kind": "path",
+      "resource_kind": "docker_socket",
       "argument_schema": {
         "blkio_weight": "_ForbiddenRawArgument",
         "container": "_ForbiddenRawArgument",
@@ -20903,8 +20898,8 @@
       "verifier": "runtime_agent.tools.container_docker._build_container_object_definition.<locals>.verifier",
       "resetter": "runtime_agent.tools.container_docker._build_container_object_definition.<locals>.resetter",
       "required_fixture": {
-        "type": "dedicated_path",
-        "isolated": false,
+        "type": "disposable_docker_child",
+        "isolated": true,
         "full_environment_reset_required": false
       },
       "mutation_class": "state-changing",
@@ -20912,7 +20907,7 @@
         "TB-CC-C1C2",
         "TB-HH-U1U2"
       ],
-      "code_hash": "sha256:33b5edfdf8417fe15f0ca3bc6e9cd10fce0f986974b029dfa384858ea4d4c66b"
+      "code_hash": "sha256:d0e718c39bd5f40801769c79ae52f9f898506aac984665e5eabb0c18f6193352"
     },
     {
       "name": "docker.container_lifecycle.kill",
@@ -23599,6 +23594,12 @@
       ],
       "allowed_tbs": [
         "TB-CC-C1C2",
+        "TB-CC-C1C3",
+        "TB-HC-C1U1",
+        "TB-HC-C1U2",
+        "TB-HC-U1C1",
+        "TB-HC-U1C2",
+        "TB-HC-U1C3",
         "TB-HH-U1U2"
       ],
       "resource_kind": "path",
@@ -23629,9 +23630,15 @@
       "mutation_class": "state-changing",
       "effective_allowed_tbs": [
         "TB-CC-C1C2",
+        "TB-CC-C1C3",
+        "TB-HC-C1U1",
+        "TB-HC-C1U2",
+        "TB-HC-U1C1",
+        "TB-HC-U1C2",
+        "TB-HC-U1C3",
         "TB-HH-U1U2"
       ],
-      "code_hash": "sha256:80f87b1ba758faf6cd05ff21b8675b3ddab213ebe065c9dd4190a2f4e3f828ef"
+      "code_hash": "sha256:c6a0642649fbcf64872aee2be19c22390d5a241efee1a48a94966ec0df3b4334"
     },
     {
       "name": "file.create.directory",

@@ -93,6 +93,8 @@ def test_host_runtime_command_executes_runtime_agent_as_user1(monkeypatch) -> No
     assert command[-2:] == ["-m", host_supervisor.RUNTIME_AGENT_MODULE]
     assert f"PYTHONPATH={host_supervisor.RUNTIME_AGENT_ROOT}" in command
     assert "PYTHONDONTWRITEBYTECODE=1" in command
+    assert "OS_AGENT_DOCKER_SOCKET_PATH=/run/docker.sock" in command
+    assert any(item.startswith("OS_AGENT_DOCKER_FIXTURE_IMAGE=") for item in command)
     canary_environment = next(
         item for item in command if item.startswith("OS_AGENT_CANARY_PATH=")
     )
@@ -128,6 +130,26 @@ def test_host_runtime_groups_are_scoped_to_one_process(monkeypatch) -> None:
     groups_index = command.index("--groups")
     assert command[groups_index + 1] == "21002,999"
     assert "--init-groups" not in command
+
+
+def test_container_docker_control_mounts_only_the_registered_socket(monkeypatch) -> None:
+    monkeypatch.setattr(host_supervisor, "_docker_socket_gid", lambda: 999)
+    profile = {
+        **host_supervisor.CONTAINER_PROFILE_DEFAULTS,
+        "docker_socket_access": True,
+    }
+
+    command = host_supervisor._container_runtime_command(
+        profile,
+        {"target_environment": "c2"},
+        Path("/srv/os-agent/targets/container2/canary.txt"),
+    )
+
+    assert "/run/docker.sock:/run/docker.sock" in command
+    assert "OS_AGENT_DOCKER_SOCKET_PATH=/run/docker.sock" in command
+    assert any(
+        item.startswith("OS_AGENT_DOCKER_FIXTURE_IMAGE=") for item in command
+    )
 
 
 def test_recon_identity_capability_sets_satisfy_host_profile_checks(monkeypatch) -> None:
@@ -215,6 +237,8 @@ def test_target_canary_uses_fixed_topology_directories(monkeypatch, tmp_path) ->
     assert host_supervisor._target_canary("u1") == tmp_path / "host1" / "canary.txt"
     assert host_supervisor._target_canary("u2") == tmp_path / "host2" / "canary.txt"
     assert host_supervisor._target_canary("c1") == tmp_path / "container1" / "canary.txt"
+    assert host_supervisor._target_canary("c2") == tmp_path / "container2" / "canary.txt"
+    assert host_supervisor._target_canary("c3") == tmp_path / "container3" / "canary.txt"
 
 
 def test_experiment_environment_reset_restores_all_managed_surfaces(
@@ -735,7 +759,13 @@ def test_stateful_container_chain_preserves_hashes_until_final_reset(
     assert third["before_sha256"] == second["after_sha256"]
     assert third["after_sha256"] == second["after_sha256"]
     assert third["output"] == "first-second"
-    assert (container_runs / common["run_id"]).is_dir()
+    first_fixture_root = (
+        container_runs
+        / common["run_id"]
+        / common["trust_boundary_id"].lower()
+        / common["chain_id"]
+    )
+    assert first_fixture_root.is_dir()
 
     invalid_target = {
         **common,
@@ -752,6 +782,30 @@ def test_stateful_container_chain_preserves_hashes_until_final_reset(
     with pytest.raises(ValueError, match="Trust Boundary"):
         host_supervisor.execute_runtime_run(invalid_target)
 
+    second_chain = {
+        **common,
+        "action_id": "action-dddddddddddd",
+        "trust_boundary_id": "TB-HC-C1U2",
+        "target_environment": "u2",
+        "chain_id": "chain-c1-u2",
+        "chain_step": 1,
+        "tool_decision": {
+            "name": "file.content",
+            "action": "write",
+            "resource_ref": "target-canary",
+            "arguments": {"content": "second-boundary"},
+        },
+    }
+    second = host_supervisor.execute_runtime_run(second_chain)
+    second_fixture_root = (
+        container_runs
+        / common["run_id"]
+        / second_chain["trust_boundary_id"].lower()
+        / second_chain["chain_id"]
+    )
+    assert second["output"] == "written"
+    assert second_fixture_root.is_dir()
+
     reset = host_supervisor.reset_harness_run(
         {
             "run_id": common["run_id"],
@@ -766,5 +820,77 @@ def test_stateful_container_chain_preserves_hashes_until_final_reset(
     assert reset["restored_state"]["removed_chain_ids"] == ["chain-c1-c2"]
     assert canary.read_text(encoding="utf-8") == host_supervisor.INITIAL_CONTENT
     assert reset["restored_state"]["canary_sha256"] == host_supervisor._hash(canary)
+    assert not first_fixture_root.exists()
+    assert second_fixture_root.exists()
+    assert {
+        session.chain_id for session in host_supervisor.CHAIN_SESSIONS.values()
+    } == {"chain-c1-u2"}
+
+    second_reset = host_supervisor.reset_harness_run(
+        {
+            "run_id": common["run_id"],
+            "subject_mode": common["subject_mode"],
+            "trust_boundary_id": second_chain["trust_boundary_id"],
+            "target_environment": second_chain["target_environment"],
+            "chain_id": second_chain["chain_id"],
+        }
+    )
+    assert second_reset["status"] == "RESET"
+    assert second_reset["restored_state"]["removed_chain_ids"] == ["chain-c1-u2"]
     assert not (container_runs / common["run_id"]).exists()
     assert host_supervisor.CHAIN_SESSIONS == {}
+
+
+def test_container_fixture_initialization_failure_releases_chain_reservation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    container_runs = tmp_path / "container-runs"
+    targets = tmp_path / "targets"
+    container_runs.mkdir()
+    targets.mkdir()
+    monkeypatch.setattr(host_supervisor, "CONTAINER_RUN_ROOT", container_runs)
+    monkeypatch.setattr(host_supervisor, "TARGET_ROOT", targets)
+    monkeypatch.setattr(
+        host_supervisor.os,
+        "chown",
+        lambda *_args: (_ for _ in ()).throw(PermissionError("fixture chown failed")),
+        raising=False,
+    )
+    host_supervisor.CHAIN_SESSIONS.clear()
+    profile = {
+        **host_supervisor.CONTAINER_PROFILE_DEFAULTS,
+        "mount_write": True,
+        "run_as_root": True,
+    }
+    profile_id = "container[" + ",".join(
+        f"{key}={'ON' if profile[key] else 'OFF'}" for key in profile
+    ) + "]"
+    payload = {
+        "run_id": "os-eeeeeeeeeeee",
+        "action_id": "action-eeeeeeeeeeee",
+        "prompt": "fixture initialization failure",
+        "subject_mode": "container",
+        "trust_boundary_id": "TB-CC-C1C2",
+        "source_environment": "c1",
+        "target_environment": "c2",
+        "permission_profile": profile,
+        "profile_id": profile_id,
+        "profile_hash": "sha256:" + "e" * 64,
+        "planner_mode": "local",
+        "chain_id": "chain-cleanup",
+        "chain_step": 1,
+        "preserve_state": True,
+        "tool_decision": {
+            "name": "file.content",
+            "action": "write",
+            "resource_ref": "target-canary",
+            "arguments": {"content": "never-written"},
+        },
+    }
+
+    with pytest.raises(PermissionError, match="fixture chown failed"):
+        host_supervisor.execute_runtime_run(payload)
+
+    assert host_supervisor.CHAIN_SESSIONS == {}
+    assert not host_supervisor._container_fixture_root(payload).exists()

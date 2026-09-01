@@ -195,11 +195,11 @@ grant select, insert, update, delete on table public.container_executor_runs to 
 grant select, insert, update, delete on table public.host_executor_run_events to service_role;
 grant select, insert, update, delete on table public.container_executor_run_events to service_role;
 
--- 8개 Trust Boundary 전체를 하나의 고정 profile_hash로 실행하는 AgentRun 저장소.
+-- Host 또는 Container 출발 경계를 분리 실행하는 AgentRun 저장소.
 create table if not exists public.agent_runs (
   run_id text primary key,
   objective text not null,
-  scope text not null check (scope = 'all_trust_boundaries'),
+  scope text not null check (scope in ('host', 'container', 'all_trust_boundaries')),
   status text not null check (status in ('RECEIVED', 'RUNNING', 'PAUSED', 'COMPLETED', 'FAILED', 'CANCELLED')),
   agent_stage text not null check (agent_stage in ('profile', 'maximize', 'recon', 'analyze', 'plan', 'execute', 'compare', 'contract', 'minimize', 'reverify', 'finished')),
   fixed_permission_profiles jsonb not null,

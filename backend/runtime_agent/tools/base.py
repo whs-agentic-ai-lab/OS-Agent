@@ -247,6 +247,7 @@ ToolFunc = Callable[[str, dict[str, Any], ToolContext], ToolOutcome]
 # resource_kind별 표준 인자(스키마에 자동 포함되어 handler가 매번 선언하지 않아도 됨)
 _STANDARD_ARGS: dict[str, frozenset[str]] = {
     "path": frozenset({"resource_ref"}),
+    "docker_socket": frozenset({"resource_ref"}),
     "container": frozenset({"resource_ref"}),
     "service": frozenset({"resource_ref"}),
     # pid/fd 직접 값은 legacy family가 전환될 때까지만 허용한다. 새
@@ -258,13 +259,14 @@ _STANDARD_ARGS: dict[str, frozenset[str]] = {
     "none": frozenset(),
 }
 _REQUIRED_STANDARD: dict[str, str] = {
-    "path": "resource_ref", "container": "resource_ref", "service": "resource_ref",
+    "path": "resource_ref", "docker_socket": "resource_ref",
+    "container": "resource_ref", "service": "resource_ref",
 }
 
 
 @dataclass(frozen=True)
 class ToolSpec:
-    resource_kind: str = "none"                                  # path|container|service|pid|fd|self|none
+    resource_kind: str = "none"                                  # path|docker_socket|container|service|pid|fd|self|none
     allowed_executors: frozenset[str] = frozenset({"host", "container"})
     allowed_tbs: frozenset[str] = frozenset()                    # 비어 있으면 모든 TB 허용
     arg_schema: dict[str, Any] = field(default_factory=dict)     # key -> type | (type, ...) (표준 인자 제외)

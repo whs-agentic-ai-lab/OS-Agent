@@ -73,8 +73,10 @@ export interface PlannerModelOption {
 export interface HealthResponse {
   status: string;
   run_api_version?: "permission-control-runtime-v5" | "permission-control-runtime-v6";
-  agent_run_api_version?: "os-agent-orchestrator-v1" | "os-agent-orchestrator-v2" | "os-agent-orchestrator-v3" | "os-agent-orchestrator-v4" | "os-agent-orchestrator-v5";
+  agent_run_api_version?: "os-agent-orchestrator-v1" | "os-agent-orchestrator-v2" | "os-agent-orchestrator-v3" | "os-agent-orchestrator-v4" | "os-agent-orchestrator-v5" | "os-agent-orchestrator-v6" | "os-agent-orchestrator-v7";
   harness_api_version?: "os-harness-v1";
+  build_git_sha?: string;
+  build_source_dirty?: boolean;
   planner: string;
   storage: string;
   host_supervisor: "connected" | "unavailable";
@@ -194,7 +196,7 @@ export interface FixedPermissionProfiles {
 }
 
 export interface AgentRunRequest {
-  scope: "all_trust_boundaries";
+  scope: SubjectModeId;
   planner_model?: PlannerModelId;
 }
 
@@ -324,6 +326,8 @@ export interface TbScenario {
   trust_boundary_id: string;
   risk_level: "critical" | "high" | "medium" | "low";
   risk_score: number;
+  potential_risk_score?: number | null;
+  verified_impact_score?: number;
   objective: string;
   impact: string;
   tool_implemented: boolean;
@@ -344,6 +348,8 @@ export interface TbResult {
   fixed_permissions_used: string[];
   effective_identity: Record<string, unknown>;
   risk_score: number;
+  potential_risk_score?: number | null;
+  verified_impact_score?: number;
   proof_level: "L0_INFERRED" | "L1_REACHABLE" | "L2_EXECUTED" | "L3_IMPACTED" | "L4_RESTORED";
   evidence_refs: string[];
   rollback_status: "NOT_REQUIRED" | "VERIFIED" | "FAILED";
@@ -397,6 +403,7 @@ export interface CampaignTransition {
   runtime_result: "allowed" | "denied" | "error" | null;
   outcome: "ALLOWED" | "OS_DENIED" | "ERROR" | "POLICY_BLOCKED" | null;
   impact: string;
+  potential_risk_score: number;
   impact_score: number;
   state_before_fingerprint: string;
   state_after_fingerprint: string;
@@ -423,6 +430,9 @@ export interface CampaignSearchState {
   tool_calls_used: number;
   planner_calls_used: number;
   best_impact_score: number;
+  boundary_coverage_complete: boolean;
+  deepest_verified_depth: number;
+  max_controlled_environment_count: number;
   termination_reason: string | null;
   termination_explanation: string | null;
   search_complete: boolean;
@@ -431,7 +441,7 @@ export interface CampaignSearchState {
 export interface AgentRunRecord {
   run_id: string;
   objective: string;
-  scope: "all_trust_boundaries";
+  scope: SubjectModeId | "all_trust_boundaries";
   status: "RECEIVED" | "RUNNING" | "PAUSED" | "COMPLETED" | "FAILED" | "CANCELLED";
   agent_stage: "profile" | "maximize" | "recon" | "analyze" | "plan" | "execute" | "compare" | "contract" | "minimize" | "reverify" | "finished";
   fixed_permission_profiles: FixedPermissionProfiles;

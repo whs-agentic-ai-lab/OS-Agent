@@ -119,6 +119,10 @@ export function AgentRunMonitorPage(props: AgentRunMonitorPageProps) {
   const currentStageIndex = stageOrder.indexOf(run.agent_stage);
   const nodeBudget = run.budget.max_campaign_nodes || 1;
   const budgetProgress = Math.min(100, Math.round((search.nodes.length / nodeBudget) * 100));
+  const deepestVerifiedDepth = search.deepest_verified_depth
+    ?? search.nodes.reduce((depth, node) => Math.max(depth, node.depth), 0);
+  const maxControlledEnvironmentCount = search.max_controlled_environment_count
+    ?? search.nodes.reduce((count, node) => Math.max(count, node.controlled_environments.length), 1);
 
   return (
     <main className="agent-monitor-page">
@@ -206,6 +210,7 @@ export function AgentRunMonitorPage(props: AgentRunMonitorPageProps) {
             <div><dt>발견 노드</dt><dd>{search.nodes.length}</dd></div><div><dt>탐색 완료</dt><dd>{search.explored_nodes}</dd></div>
             <div><dt>현재 Frontier</dt><dd>{search.frontier_node_ids.length}</dd></div><div><dt>가지치기</dt><dd>{search.pruned_nodes}</dd></div>
             <div><dt>Tool 호출</dt><dd>{search.tool_calls_used}</dd></div><div><dt>Planner 호출</dt><dd>{search.planner_calls_used}</dd></div>
+            <div><dt>최대 경로 깊이</dt><dd>D{deepestVerifiedDepth}</dd></div><div><dt>누적 제어 환경</dt><dd>{maxControlledEnvironmentCount}/5</dd></div>
             <div><dt>부모 복귀</dt><dd>{search.backtrack_count}</dd></div><div><dt>최고 영향</dt><dd>{search.best_impact_score}</dd></div>
           </dl>
           <div className="live-run-progress" role="progressbar" aria-label="Campaign 노드 예산 사용률" aria-valuemin={0} aria-valuemax={nodeBudget} aria-valuenow={search.nodes.length}><span style={{ width: `${budgetProgress}%` }} /></div>

@@ -900,6 +900,22 @@ def _fd_inherit(action: str, arguments: dict[str, Any], context: ToolContext) ->
 
 _FILE_EXECUTORS = frozenset({"host", "container"})
 _FILE_TBS = frozenset({"TB-HH-U1U2", "TB-CC-C1C2"})
+# target-canary는 Supervisor가 각 Trust Boundary의 target_environment에 맞춰
+# U1/U2/C1/C2/C3의 서로 다른 fixture로 바인딩한다. 경계 통과 증거로 사용하는
+# file.content만 8개 action path 전체에 열고, executor-local File/FD 도구는
+# 기존 대표 경계 범위를 유지한다.
+_TARGET_CANARY_TBS = frozenset(
+    {
+        "TB-HH-U1U2",
+        "TB-HC-U1C1",
+        "TB-HC-U1C2",
+        "TB-HC-U1C3",
+        "TB-HC-C1U1",
+        "TB-HC-C1U2",
+        "TB-CC-C1C2",
+        "TB-CC-C1C3",
+    }
+)
 _DESTRUCTIVE_LIMITS = {"max_restore_bytes": _MAX_RESTORE_BYTES, "max_targets": 1}
 _DESTRUCTIVE_STOPS = frozenset({"timeout", "target_escape", "rollback_failure"})
 F_GETLEASE = 1025
@@ -912,6 +928,7 @@ class _ForbiddenRawArgument:
 def _definition_spec(
     resource_kind: str,
     *,
+    allowed_tbs: frozenset[str] = _FILE_TBS,
     arg_schema: dict[str, Any] | None = None,
     required_args: frozenset[str] = frozenset(),
     reversible: bool = False,
@@ -926,7 +943,7 @@ def _definition_spec(
     return ToolSpec(
         resource_kind=resource_kind,
         allowed_executors=_FILE_EXECUTORS,
-        allowed_tbs=_FILE_TBS,
+        allowed_tbs=allowed_tbs,
         arg_schema=effective_schema,
         required_args=required_args,
         reversible=reversible,
@@ -1544,7 +1561,11 @@ def _build_file_content_definition(action: str) -> ToolDefinition:
         name=name, tool=_FILE_CONTENT_TOOL, action=action,
         handler=handler, verifier=verifier, resetter=resetter,
         spec=_definition_spec(
-            _PATH, arg_schema=schema, required_args=required,
+            _PATH,
+            allowed_tbs=(
+                _TARGET_CANARY_TBS if action == "write" else _FILE_TBS
+            ),
+            arg_schema=schema, required_args=required,
             reversible=changing,
         ),
     )

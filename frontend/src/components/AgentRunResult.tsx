@@ -41,6 +41,8 @@ const chainStatusCopy: Record<string, string> = {
 };
 
 const terminationReasonCopy: Record<string, string> = {
+  ALL_TRUST_BOUNDARIES_VERIFIED: "선택한 Trust Boundary의 target 변경과 복구를 모두 검증했습니다.",
+  ALL_TRUST_BOUNDARIES_AND_ENVIRONMENTS_VERIFIED: "선택한 경계 커버리지와 관련 환경을 누적 제어하는 다중 경계 경로를 검증했습니다.",
   MAX_IMPACT_VERIFIED: "등록된 피해 상한을 실제로 검증했습니다.",
   FRONTIER_EXHAUSTED: "새로운 상태로 이어지는 실행 가능 후보가 없습니다.",
   POLICY_FRONTIER_EXHAUSTED: "남은 후보가 모두 정책 검사에서 제외됐습니다.",
@@ -137,7 +139,7 @@ function ChainStepList({ idPrefix, steps }: { idPrefix: string; steps: AgentPlan
                 <div className="scenario-evidence">
                   <span>단계 증거</span>
                   <ul>
-                    {stepEvidence.map((evidence) => <li key={evidence}><code>{evidence}</code></li>)}
+                    {stepEvidence.map((evidence, evidenceIndex) => <li key={`${evidence}-${evidenceIndex}`}><code>{evidence}</code></li>)}
                   </ul>
                 </div>
               ) : null}
@@ -342,7 +344,11 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
           <>
             <strong>{worst.trust_boundary_id}</strong>
             <p>{worst.objective}</p>
-            <small>{worst.risk_level.toUpperCase()} · Risk {worst.risk_score}</small>
+            <small>
+              {worst.risk_level.toUpperCase()}
+              {` · 잠재 ${worst.potential_risk_score ?? worst.risk_score}`}
+              {` · 검증 ${worst.verified_impact_score ?? 0}`}
+            </small>
           </>
         ) : (
           <p>BROKEN으로 검증된 경로가 없습니다.</p>
@@ -356,7 +362,8 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
               <th>Trust Boundary</th>
               <th>실행 전이</th>
               <th>상태</th>
-              <th>영향</th>
+              <th>잠재 위험</th>
+              <th>검증 영향</th>
               <th>순서</th>
               <th>복구</th>
             </tr>
@@ -373,6 +380,7 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
                   <small>{transition.resource_ref}</small>
                 </td>
                 <td>{transition.status}</td>
+                <td>{transition.potential_risk_score}</td>
                 <td>{transition.impact} · {transition.impact_score}</td>
                 <td>{transition.sequence}</td>
                 <td>{transition.rollback_status}</td>
@@ -417,7 +425,8 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
               <div className="scenario-body">
                 <dl className="scenario-metadata">
                   <div><dt>Scenario ID</dt><dd>{result.scenario.scenario_id}</dd></div>
-                  <div><dt>위험도</dt><dd>{result.scenario.risk_level.toUpperCase()} · {result.scenario.risk_score}</dd></div>
+                  <div><dt>잠재 위험</dt><dd>{result.scenario.risk_level.toUpperCase()} · {result.potential_risk_score ?? result.scenario.potential_risk_score ?? result.scenario.risk_score}</dd></div>
+                  <div><dt>검증 영향</dt><dd>{result.verified_impact_score ?? result.scenario.verified_impact_score ?? 0}</dd></div>
                   <div><dt>증명 수준</dt><dd>{result.proof_level}</dd></div>
                   <div><dt>시나리오 전체 복구</dt><dd>{result.scenario.rollback_status ?? result.rollback_status}</dd></div>
                   {result.scenario.chain_id ? <div><dt>Chain ID</dt><dd>{result.scenario.chain_id}</dd></div> : null}
@@ -469,7 +478,7 @@ export function AgentRunResult({ run, onResume, isResuming = false }: AgentRunRe
                   <div className="scenario-evidence">
                     <span>증거 참조</span>
                     <ul>
-                      {result.evidence_refs.map((evidence) => <li key={evidence}><code>{evidence}</code></li>)}
+                      {result.evidence_refs.map((evidence, evidenceIndex) => <li key={`${evidence}-${evidenceIndex}`}><code>{evidence}</code></li>)}
                     </ul>
                   </div>
                 ) : null}

@@ -602,6 +602,57 @@ def _remove_chain_sessions(
     return sorted(set(removed))
 
 
+def _discard_chain_session(
+    request: dict[str, Any],
+    session: ChainSession | None,
+) -> None:
+    """Discard a just-reserved chain when fixture initialization fails."""
+
+    if session is None:
+        return
+    key = (request["run_id"], request["trust_boundary_id"], session.chain_id)
+    if CHAIN_SESSIONS.get(key) is session:
+        del CHAIN_SESSIONS[key]
+
+
+def _container_fixture_root(payload: dict[str, Any]) -> Path:
+    """Return an isolated marker directory for one Container execution chain."""
+
+    run_root = CONTAINER_RUN_ROOT / payload["run_id"]
+    if payload.get("preserve_state", False):
+        return (
+            run_root
+            / payload["trust_boundary_id"].lower()
+            / payload["chain_id"]
+        )
+    return run_root / "standalone" / payload["action_id"]
+
+
+def _remove_container_fixture_root(
+    *,
+    run_id: str,
+    trust_boundary_id: str | None,
+    chain_id: str | None,
+) -> tuple[Path, bool]:
+    """Remove only the requested chain fixture and prune empty parents."""
+
+    run_root = CONTAINER_RUN_ROOT / run_id
+    fixture_root = run_root
+    if trust_boundary_id is not None and chain_id is not None:
+        fixture_root = run_root / trust_boundary_id.lower() / chain_id
+    if fixture_root.is_symlink():
+        fixture_root.unlink()
+    elif fixture_root.exists():
+        shutil.rmtree(fixture_root)
+    if fixture_root != run_root:
+        for parent in (fixture_root.parent, run_root):
+            try:
+                parent.rmdir()
+            except (FileNotFoundError, OSError):
+                pass
+    return fixture_root, not fixture_root.exists()
+
+
 def _target_canary(target_environment: str) -> Path:
     directory_name = TARGET_DIRECTORIES.get(target_environment)
     if directory_name is None:
@@ -805,6 +856,8 @@ def _container_runtime_command(
         "--read-only", "--pids-limit", "64",
         "--user", "0:0" if profile["run_as_root"] or needs_capability_wrapper else "10003:10003",
         "--env", "OS_AGENT_CANARY_PATH=/target/canary.txt",
+        "--env", "OS_AGENT_DOCKER_SOCKET_PATH=/run/docker.sock",
+        "--env", f"OS_AGENT_DOCKER_FIXTURE_IMAGE={AGENT_RUNTIME_IMAGE}",
         "--env", f"OS_AGENT_TARGET_NODE={payload['target_environment']}",
         "--env", f"OS_AGENT_SERVICE_URL=http://{payload['target_environment']}-target",
         "--volume", f"{canary.parent}:/target:{'rw' if profile['mount_write'] else 'ro'}",
@@ -833,7 +886,7 @@ def _container_runtime_command(
     if profile["systempaths_unconfined"]:
         command.extend(["--security-opt", "systempaths=unconfined"])
     if profile["docker_socket_access"]:
-        command.extend(["--volume", "/var/run/docker.sock:/var/run/docker.sock"])
+        command.extend(["--volume", "/run/docker.sock:/run/docker.sock"])
     command.append(AGENT_RUNTIME_IMAGE)
     if needs_capability_wrapper:
         lowered = [capability.lower() for capability in capabilities]
@@ -854,16 +907,25 @@ def _execute_container_runtime(payload: dict[str, Any]) -> dict[str, Any]:
     profile = _validate_profile_bundle("container", payload["permission_profile"])
     payload = {**payload, "permission_profile": profile}
     session, initialize_fixture = _claim_chain_session(payload)
-    run_root = CONTAINER_RUN_ROOT / payload["run_id"]
-    canary = _target_canary(payload["target_environment"])
-    if initialize_fixture:
-        run_root.mkdir(mode=0o755, parents=True, exist_ok=False)
-        canary.write_text(INITIAL_CONTENT, encoding="utf-8")
-        os.chown(canary, 0, TRIAL_GROUP_GID)
-        os.chmod(canary, 0o660)
-    elif (
-        not run_root.is_dir()
-        or run_root.is_symlink()
+    fixture_root = _container_fixture_root(payload)
+    try:
+        canary = _target_canary(payload["target_environment"])
+        if initialize_fixture:
+            fixture_root.mkdir(mode=0o755, parents=True, exist_ok=False)
+            canary.write_text(INITIAL_CONTENT, encoding="utf-8")
+            os.chown(canary, 0, TRIAL_GROUP_GID)
+            os.chmod(canary, 0o660)
+    except Exception:
+        if initialize_fixture:
+            _discard_chain_session(payload, session)
+            if fixture_root.is_symlink():
+                fixture_root.unlink()
+            elif fixture_root.exists():
+                shutil.rmtree(fixture_root)
+        raise
+    if not initialize_fixture and (
+        not fixture_root.is_dir()
+        or fixture_root.is_symlink()
         or not canary.is_file()
         or canary.is_symlink()
     ):
@@ -925,6 +987,7 @@ def _execute_container_runtime(payload: dict[str, Any]) -> dict[str, Any]:
             "chain_id": payload.get("chain_id"),
             "chain_step": payload.get("chain_step"),
             "preserve_state": bool(payload.get("preserve_state", False)),
+            "fixture_root": str(fixture_root),
             "profile_hash": session.profile_hash if session is not None else payload.get("profile_hash"),
             "baseline_sha256": session.baseline_sha256 if session is not None else before_sha256,
         },
@@ -1031,6 +1094,8 @@ def _host_runtime_command(
         "PYTHONDONTWRITEBYTECODE=1",
         f"PYTHONPATH={RUNTIME_AGENT_ROOT}",
         f"OS_AGENT_CANARY_PATH={canary}",
+        "OS_AGENT_DOCKER_SOCKET_PATH=/run/docker.sock",
+        f"OS_AGENT_DOCKER_FIXTURE_IMAGE={AGENT_RUNTIME_IMAGE}",
         f"OS_AGENT_TARGET_NODE={payload['target_environment']}",
         f"OS_AGENT_SUDO_HELPER={SCRIPT_PATH}",
         f"OS_AGENT_SERVICE_URL={service_url}",
@@ -1158,11 +1223,11 @@ def reset_harness_run(payload: dict[str, Any]) -> dict[str, Any]:
 
     with PROFILE_LOCK:
         if subject_mode == "container":
-            run_root = CONTAINER_RUN_ROOT / run_id
-            if run_root.is_symlink():
-                run_root.unlink()
-            elif run_root.exists():
-                shutil.rmtree(run_root)
+            fixture_root, fixture_root_removed = _remove_container_fixture_root(
+                run_id=run_id,
+                trust_boundary_id=trust_boundary_id,
+                chain_id=chain_id,
+            )
             canary.write_text(INITIAL_CONTENT, encoding="utf-8")
             os.chown(canary, 0, TRIAL_GROUP_GID)
             os.chmod(canary, 0o660)
@@ -1181,7 +1246,9 @@ def reset_harness_run(payload: dict[str, Any]) -> dict[str, Any]:
                 ],
                 "restored_state": {
                     "subject_mode": "container",
-                    "run_root_removed": not run_root.exists(),
+                    "run_root_removed": fixture_root_removed,
+                    "fixture_root": str(fixture_root),
+                    "fixture_root_removed": fixture_root_removed,
                     "target_environment": target_environment,
                     "canary_sha256": _hash(canary),
                     "removed_chain_ids": removed_chain_ids,

@@ -541,7 +541,10 @@ def _execute_contract_tool(
             action,
             contract_arguments,
             context,
-            reset_after=False,
+            # Docker control is proven against an action-scoped child container.
+            # Run its independent verifier, then remove the child immediately so
+            # a campaign backtrack never leaves control-plane state behind.
+            reset_after=(tool == "docker.container_create" and action == "create"),
         )
         result = execution.result
         reset = execution.reset

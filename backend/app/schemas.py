@@ -472,7 +472,7 @@ class FixedPermissionProfiles(BaseModel):
 class AgentRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    scope: Literal["all_trust_boundaries"] = "all_trust_boundaries"
+    scope: Literal["host", "container"] = "host"
     planner_model: PlannerModel | None = None
     budget: AgentBudget = Field(default_factory=AgentBudget)
 
@@ -488,6 +488,7 @@ class DamageScore(BaseModel):
 class FrozenAttackStep(BaseModel):
     sequence: int = Field(ge=1)
     step_id: str = "contract-step"
+    trust_boundary_id: str = ""
     type: Literal["execute"] = "execute"
     tool: str
     action: str
@@ -497,6 +498,7 @@ class FrozenAttackStep(BaseModel):
     status: str = "FROZEN"
     selection_rationale: str = ""
     expected_state_fingerprint: str | None = None
+    required_impact_score: int = Field(default=1, ge=0, le=100)
 
 
 class AttackContract(BaseModel):
@@ -617,6 +619,8 @@ class TbScenario(BaseModel):
     trust_boundary_id: str
     risk_level: Literal["critical", "high", "medium", "low"]
     risk_score: int = Field(ge=0, le=100)
+    potential_risk_score: int | None = Field(default=None, ge=0, le=100)
+    verified_impact_score: int = Field(default=0, ge=0, le=100)
     objective: str
     impact: str
     tool_implemented: bool = True
@@ -625,6 +629,12 @@ class TbScenario(BaseModel):
     chain_status: Literal["PENDING", "RUNNING", "COMPLETED", "PAUSED", "FAILED"] = "PENDING"
     search: ChainSearchProgress = Field(default_factory=ChainSearchProgress)
     rollback_status: Literal["NOT_REQUIRED", "VERIFIED", "FAILED"] = "NOT_REQUIRED"
+
+    @model_validator(mode="after")
+    def populate_explicit_risk_scores(self) -> "TbScenario":
+        if self.potential_risk_score is None:
+            self.potential_risk_score = self.risk_score
+        return self
 
 
 class TbResult(BaseModel):
@@ -637,6 +647,8 @@ class TbResult(BaseModel):
     fixed_permissions_used: list[str] = Field(default_factory=list)
     effective_identity: dict[str, Any] = Field(default_factory=dict)
     risk_score: int = Field(ge=0, le=100)
+    potential_risk_score: int | None = Field(default=None, ge=0, le=100)
+    verified_impact_score: int = Field(default=0, ge=0, le=100)
     proof_level: Literal[
         "L0_INFERRED",
         "L1_REACHABLE",
@@ -649,6 +661,12 @@ class TbResult(BaseModel):
     scenario: TbScenario
     runtime_result: Literal["allowed", "denied", "error"] | None = None
     explanation: str
+
+    @model_validator(mode="after")
+    def populate_explicit_risk_scores(self) -> "TbResult":
+        if self.potential_risk_score is None:
+            self.potential_risk_score = self.scenario.potential_risk_score
+        return self
 
 
 class AgentRunSummary(BaseModel):
@@ -698,6 +716,7 @@ class CampaignTransition(BaseModel):
     runtime_result: Literal["allowed", "denied", "error"] | None = None
     outcome: Literal["ALLOWED", "OS_DENIED", "ERROR", "POLICY_BLOCKED"] | None = None
     impact: str = "none"
+    potential_risk_score: int = Field(default=0, ge=0, le=100)
     impact_score: int = Field(default=0, ge=0, le=100)
     state_before_fingerprint: str = ""
     state_after_fingerprint: str = ""
@@ -724,6 +743,9 @@ class CampaignSearchState(BaseModel):
     tool_calls_used: int = 0
     planner_calls_used: int = 0
     best_impact_score: int = Field(default=0, ge=0, le=100)
+    boundary_coverage_complete: bool = False
+    deepest_verified_depth: int = Field(default=0, ge=0)
+    max_controlled_environment_count: int = Field(default=1, ge=1)
     termination_reason: str | None = None
     termination_explanation: str | None = None
     search_complete: bool = False
@@ -732,7 +754,9 @@ class CampaignSearchState(BaseModel):
 class AgentRunRecord(BaseModel):
     run_id: str
     objective: str
-    scope: Literal["all_trust_boundaries"] = "all_trust_boundaries"
+    # all_trust_boundaries is retained only so historical Supabase rows remain
+    # readable. New AgentRunRequest values must select one executor environment.
+    scope: Literal["host", "container", "all_trust_boundaries"] = "all_trust_boundaries"
     status: Literal[
         "RECEIVED", "RUNNING", "PAUSED", "COMPLETED", "FAILED", "CANCELLED"
     ] = "RECEIVED"

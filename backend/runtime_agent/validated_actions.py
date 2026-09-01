@@ -31,12 +31,14 @@ LEGACY_TOOLS_SOURCE_SHA256 = (
 # Compatibility name retained for older readers of this module.
 EXPECTED_TOOLS_SOURCE_SHA256 = LEGACY_TOOLS_SOURCE_SHA256
 
-# origin/not-verified-tool and origin/main have identical Tool source trees.
+# Historical live-PASS handlers are unchanged. The current canonical tree extends
+# file.content.write's target-canary policy to all eight boundaries and binds the
+# Docker control proof to an isolated socket/image fixture with immediate reset.
 CANONICAL_TOOLS_SOURCE_SHA256 = (
-    "sha256:70b4e9e62ce442f539e04675c02fc2c6bf5c9401eab478b4e510fa7ffd8f170f"
+    "sha256:e2b9759386b7f4f338c927f0747b8800c9068b34743bcf9d84a2d2733466d840"
 )
 VALIDATION_MANIFEST_INVENTORY_SHA256 = (
-    "sha256:e9ca963cb31a3b0bbaf67d3fa56716428058f8ccc9ba1e3dc7fc1496b51ee22d"
+    "sha256:dfe2b2f28d97c13b643cebb1c81de5ba8f0f9d5bdc77b5581d3bb043bf88ca6e"
 )
 VALIDATION_ACTION_NAMES_SHA256 = (
     "sha256:401fd7468888192238905ce5d9949416b1de6d737fca38ad2910f1ddbf4ead53"

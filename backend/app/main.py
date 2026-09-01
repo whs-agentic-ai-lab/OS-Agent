@@ -133,13 +133,15 @@ def create_app(
     application.state.agent_run_jobs = agent_run_jobs
 
     @application.get("/api/health")
-    def health() -> dict[str, str | None]:
+    def health() -> dict[str, str | bool | None]:
         active_executor = executor_gate.active_mode
         return {
             "status": "ok",
             "run_api_version": "permission-control-runtime-v6",
-            "agent_run_api_version": "os-agent-orchestrator-v5",
+            "agent_run_api_version": "os-agent-orchestrator-v7",
             "harness_api_version": "os-harness-v1",
+            "build_git_sha": active_settings.build_git_sha,
+            "build_source_dirty": active_settings.build_source_dirty,
             "planner": model_gateway.planner_mode,
             "storage": repository.storage_name,
             "host_supervisor": (
@@ -453,20 +455,14 @@ def create_app(
                 ),
             )
         remote_agent_version = remote_health_payload.get("agent_run_api_version")
-        if remote_agent_version not in {
-            "os-agent-orchestrator-v1",
-            "os-agent-orchestrator-v2",
-            "os-agent-orchestrator-v3",
-            "os-agent-orchestrator-v4",
-            "os-agent-orchestrator-v5",
-        }:
+        if remote_agent_version != "os-agent-orchestrator-v7":
             raise HTTPException(
                 status_code=409,
-                detail="AWS 백엔드가 8개 TB Agent Orchestrator API를 지원하지 않습니다. 원격 이미지를 갱신하세요.",
+                detail="AWS 백엔드가 Host/Container 분리 실행 API를 지원하지 않습니다. 원격 코드를 갱신하세요.",
             )
         remote_payload = build_remote_agent_payload(request, remote_agent_version)
         try:
-            if remote_agent_version == "os-agent-orchestrator-v5":
+            if remote_agent_version == "os-agent-orchestrator-v7":
                 remote_run_payload = remote_request(
                     "POST",
                     "/api/agent-runs",
@@ -533,7 +529,7 @@ def create_app(
         remote_health_payload = remote_request("GET", "/api/health")
         remote_agent_version = remote_health_payload.get("agent_run_api_version")
         try:
-            if remote_agent_version == "os-agent-orchestrator-v5":
+            if remote_agent_version == "os-agent-orchestrator-v7":
                 run = AgentRunRecord.model_validate(
                     remote_request(
                         "POST",
@@ -559,14 +555,17 @@ def create_app(
 
     @application.post("/api/agent-runs", response_model=AgentRunRecord)
     def create_agent_run(request: AgentRunRequest) -> AgentRunRecord:
-        if not all(active_runtime.is_available(mode) for mode in SubjectMode):
-            raise HTTPException(status_code=409, detail="U1과 C1 Runtime이 모두 준비되어야 전체 8개 TB를 실행할 수 있습니다.")
+        selected_mode = SubjectMode(request.scope)
+        if not active_runtime.is_available(selected_mode):
+            label = "U1 Host" if selected_mode == SubjectMode.host else "C1 Container"
+            raise HTTPException(status_code=409, detail=f"선택한 {label} Runtime이 준비되어야 실행할 수 있습니다.")
         prepared = agent_orchestrator.prepare_run(request)
         response_snapshot = prepared.model_copy(deep=True)
         worker_run = prepared.model_copy(deep=True)
         try:
             agent_run_jobs.start(
                 prepared.run_id,
+                selected_mode,
                 lambda: agent_orchestrator.run(request, prepared_run=worker_run),
                 on_error=lambda exc: agent_orchestrator.mark_failed(prepared.run_id, exc),
             )
@@ -629,9 +628,15 @@ def create_app(
 
     @application.post("/api/agent-runs/{run_id}/rollback", response_model=AgentRunRecord)
     def rollback_agent_run(run_id: str) -> AgentRunRecord:
+        run = get_agent_record(run_id)
         try:
-            with executor_gate.claim_all():
-                return agent_orchestrator.rollback(get_agent_record(run_id))
+            claim = (
+                executor_gate.claim(SubjectMode(run.scope))
+                if run.scope in {"host", "container"}
+                else executor_gate.claim_all()
+            )
+            with claim:
+                return agent_orchestrator.rollback(run)
         except ExecutorBusyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -645,6 +650,11 @@ def create_app(
             worker_run = prepared.model_copy(deep=True)
             agent_run_jobs.start(
                 run_id,
+                (
+                    SubjectMode(prepared.scope)
+                    if prepared.scope in {"host", "container"}
+                    else None
+                ),
                 lambda: agent_orchestrator.resume(worker_run),
                 on_error=lambda exc: agent_orchestrator.mark_failed(run_id, exc),
             )
@@ -715,7 +725,6 @@ def agent_orchestrator_hash(request: AgentRunRequest) -> str:
     from .agent_orchestrator import permission_profile_hash
     from .permission_minimizer import collect_maximum_permission_profiles
 
-    del request
     return permission_profile_hash(collect_maximum_permission_profiles().model_dump())
 
 
